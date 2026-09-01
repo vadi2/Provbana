@@ -1,4 +1,4 @@
-"""Tests for the EPS Connectathon service.
+"""Tests for the Nordic Hackathon 2026 service.
 
 Matchbox is monkeypatched with canned OperationOutcomes; DATA_DIR points at a
 pytest tmp dir so every test gets a fresh SQLite database and audit log.
@@ -934,7 +934,7 @@ def test_leaderboard_interop_points_math(client, monkeypatch):
 def test_index_serves_html(client):
     res = client.get("/")
     assert res.status_code == 200
-    assert "EPS Connectathon" in res.text
+    assert "Nordic Hackathon 2026" in res.text
     assert res.headers["content-type"].startswith("text/html")
 
 

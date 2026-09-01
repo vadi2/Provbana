@@ -1,4 +1,6 @@
-# EPS Connectathon
+# Nordic Hackathon 2026
+
+Service for the [Nordic Hackathon 2026](https://nordichackathon2026.blogs.dsv.su.se), 18-20 November in Kista.
 
 Gamified FHIR hackathon service: teams register, submit European Patient Summary bundles,
 a local [Matchbox](https://github.com/ahdis/matchbox) validates them against HL7 EU EPS, and a live leaderboard keeps score.

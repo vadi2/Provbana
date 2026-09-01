@@ -1,4 +1,4 @@
-"""EPS Connectathon - gamified FHIR European Patient Summary validation service.
+"""Nordic Hackathon 2026 - gamified FHIR European Patient Summary validation service.
 
 Teams register, submit EPS bundles, Matchbox validates, leaderboard keeps score.
 Stdlib sqlite3 + FastAPI, no other runtime deps.
@@ -1063,7 +1063,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="EPS Connectathon", lifespan=lifespan)
+app = FastAPI(title="Nordic Hackathon 2026", lifespan=lifespan)
 
 
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
@@ -1786,7 +1786,7 @@ try {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700;800&display=swap">
-<title>EPS Connectathon</title>
+<title>Nordic Hackathon 2026</title>
 <style>
 /* Nordic Hackathon 2026 - palette taken from the event site
    (nordichackathon2026.blogs.dsv.su.se): base #FFFFFF, contrast #111111,
@@ -2134,7 +2134,7 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 <body>
 <header>
   <div class="head-row">
-    <h1>EPS Connectathon - Patient Summary Challenge</h1>
+    <h1>Nordic Hackathon 2026 - Patient Summary Challenge</h1>
     <div class="theme-toggle" role="group" aria-label="Colour theme">
       <button class="th-btn" data-theme-set="system">System</button>
       <button class="th-btn" data-theme-set="light">Light</button>
@@ -2325,6 +2325,8 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 
 </main>
 <footer>
+  <p>Part of the <a href="https://nordichackathon2026.blogs.dsv.su.se" target="_blank" rel="noopener">Nordic Hackathon
+  2026</a>, 18-20 November in Kista.</p>
   <p>Bundles are validated by <a href="https://github.com/ahdis/matchbox"
   target="_blank" rel="noopener">Matchbox</a>, the open-source FHIR validation and
   mapping server from <a href="https://ahdis.ch/" target="_blank" rel="noopener">ahdis</a>,
