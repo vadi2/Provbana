@@ -39,6 +39,13 @@ registration is open; set it to require `{"code": "..."}` on `/api/register`).
 `DATA_DIR` must be writable by the user running the service; it holds
 `connectathon.db` and the raw submission audit log.
 
+`VALIDATION_IGS` (default `hl7se.fhir.base#1.1.0`, comma-separated) names extra
+packages to load into the validation engine. Matchbox scopes an engine to the IG
+that defines `PROFILE`, so a `meta.profile` claim from any other package is
+reported as "has not been checked" rather than validated. The named packages
+must also be listed in `matchbox/config/application.yaml`, or Matchbox has
+nothing to load.
+
 Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest -q test_app.py`
 
 ## Scoring
@@ -57,6 +64,22 @@ A team's score is its best submission. The first team ever to go valid keeps a o
 consumed and **+10** per team that consumed the team's own, capped at **+100** together;
 registration is open by design, so the cap is what stops a team farming the track with
 throwaway partners. Set `REGISTER_CODE` if you want registration closed as well.
+
+## Swedish base profiles
+
+The bundles in `samples/` claim the HL7 Sweden base profiles
+([hl7se.fhir.base](https://hl7.se/fhir/ig/base/)) alongside the European ones:
+`SEBasePatient`, `SEBasePractitioner`, `SEBaseOrganization` and
+`SEBasePractitionerRole`. In practice that means Swedish identifiers go in the
+namespaces those profiles slice on - `http://electronichealth.se/identifier/personnummer`
+rather than the `urn:oid:1.2.752.129.2.1.3.1` OID, HSA-id under
+`urn:oid:1.2.752.29.4.19`, organisation number under `urn:oid:2.5.4.97`. An OID
+personnummer still validates; it just matches no slice, so nothing Swedish is
+checked.
+
+Teams are not required to claim these profiles, but the validator is configured
+to resolve them (see `VALIDATION_IGS`), so a team that does gets real feedback
+instead of a "not checked" warning.
 
 ## API
 

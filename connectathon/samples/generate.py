@@ -8,6 +8,12 @@ Every SNOMED CT code used here was verified against a live Snowstorm terminology
 server; ATC codes are WHO ATC 2025. Both bundles validate against
 bundle-eu-eps with zero errors.
 
+The people and places also claim the HL7 Sweden base profiles (hl7se.fhir.base),
+so the Swedish shape of the data - personnummer namespace, HSA-id, organisation
+number - is checked rather than merely asserted. Those identifier values are
+placeholders in the real national namespaces, in the same way the personnummer
+and phone numbers here are.
+
     python3 samples/generate.py
 """
 import json, uuid, html, os
@@ -19,6 +25,14 @@ UCUM = "http://unitsofmeasure.org"
 EPS = "http://hl7.eu/fhir/eps/StructureDefinition/"
 EUBASE = "http://hl7.eu/fhir/base/StructureDefinition/"
 THL7 = "http://terminology.hl7.org/CodeSystem/"
+SEBASE = "http://hl7.se/fhir/ig/base/StructureDefinition/"
+
+# Namespaces the Swedish base profiles slice their identifiers on. Using the
+# OID for personnummer instead of this URI still validates, but it misses the
+# SEBasePatient slice, so nothing Swedish is actually checked.
+SE_PERSONNUMMER = "http://electronichealth.se/identifier/personnummer"
+SE_HSAID = "urn:oid:1.2.752.29.4.19"
+SE_ORGNR = "urn:oid:2.5.4.97"
 
 def cc(system, code, display, text=None):
     return {"coding": [{"system": system, "code": code, "display": display}],
@@ -147,7 +161,8 @@ class BundleBuilder:
         prac_ref = self.add(author["practitioner"], "practitioner")
         self.role_ref = self.add({
             "resourceType": "PractitionerRole",
-            "meta": {"profile": [EUBASE + "practitionerRole-eu"]},
+            "meta": {"profile": [EUBASE + "practitionerRole-eu",
+                                 SEBASE + "SEBasePractitionerRole"]},
             "practitioner": {"reference": prac_ref},
             "organization": {"reference": self.org_ref},
         }, "role")
@@ -418,12 +433,10 @@ def build_andrea():
         doc_uuid="andrea-cross-border",
         patient={
             "resourceType": "Patient",
-            "meta": {"profile": [EPS + "patient-eu-eps"]},
+            "meta": {"profile": [EPS + "patient-eu-eps",
+                                 SEBASE + "SEBasePatient"]},
             "identifier": [{
-                "type": cc(THL7 + "v2-0203", "NI",
-                                "National unique individual identifier",
-                                "Personnummer"),
-                "system": "urn:oid:1.2.752.129.2.1.3.1",
+                "system": SE_PERSONNUMMER,
                 "value": "20020317-0000",
             }],
             "name": [{"text": "Andrea Lindqvist", "family": "Lindqvist",
@@ -445,12 +458,17 @@ def build_andrea():
         },
         author={"practitioner": {
             "resourceType": "Practitioner",
-            "meta": {"profile": [EUBASE + "practitioner-eu"]},
+            "meta": {"profile": [EUBASE + "practitioner-eu",
+                                 SEBASE + "SEBasePractitioner"]},
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-2001"}],
             "name": [{"family": "Sundström", "given": ["Åsa"], "prefix": ["Dr"]}],
         }},
         org={
             "resourceType": "Organization",
-            "meta": {"profile": [EUBASE + "organization-eu"]},
+            "meta": {"profile": [EUBASE + "organization-eu",
+                                 SEBASE + "SEBaseOrganization"]},
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-1001"},
+                           {"system": SE_ORGNR, "value": "232100-0000"}],
             "name": "Vårdcentralen Norrskogen",
             "address": [{"city": "Uppsala", "postalCode": "752 28", "country": "SE"}],
         },
@@ -601,12 +619,10 @@ def build_arne():
         doc_uuid="arne-complex-care",
         patient={
             "resourceType": "Patient",
-            "meta": {"profile": [EPS + "patient-eu-eps"]},
+            "meta": {"profile": [EPS + "patient-eu-eps",
+                                 SEBASE + "SEBasePatient"]},
             "identifier": [{
-                "type": cc(THL7 + "v2-0203", "NI",
-                                "National unique individual identifier",
-                                "Personnummer"),
-                "system": "urn:oid:1.2.752.129.2.1.3.1",
+                "system": SE_PERSONNUMMER,
                 "value": "19430211-0000",
             }],
             "name": [{"text": "Arne Bergström", "family": "Bergström",
@@ -630,12 +646,17 @@ def build_arne():
         },
         author={"practitioner": {
             "resourceType": "Practitioner",
-            "meta": {"profile": [EUBASE + "practitioner-eu"]},
+            "meta": {"profile": [EUBASE + "practitioner-eu",
+                                 SEBASE + "SEBasePractitioner"]},
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-2002"}],
             "name": [{"family": "Lövgren", "given": ["Märta"], "prefix": ["Dr"]}],
         }},
         org={
             "resourceType": "Organization",
-            "meta": {"profile": [EUBASE + "organization-eu"]},
+            "meta": {"profile": [EUBASE + "organization-eu",
+                                 SEBASE + "SEBaseOrganization"]},
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-1002"},
+                           {"system": SE_ORGNR, "value": "232100-0001"}],
             "name": "Vårdcentralen Kvarnängen",
             "address": [{"city": "Falkenberg", "postalCode": "311 32",
                          "country": "SE"}],

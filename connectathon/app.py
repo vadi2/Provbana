@@ -22,6 +22,17 @@ MATCHBOX_URL = os.environ.get("MATCHBOX_URL", "http://matchbox:8080/matchboxv3/f
 PROFILE = os.environ.get(
     "PROFILE", "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
 )
+# Extra packages to load into the validation engine alongside PROFILE's own.
+# Matchbox scopes an engine to the IG that defines the requested profile, so a
+# meta.profile claim from anywhere else comes back "not checked" unless its
+# package is named here. The Swedish base profiles are in by default because
+# this is a Swedish event and teams will claim them on Patient.
+VALIDATION_IGS = [
+    ig.strip()
+    for ig in os.environ.get("VALIDATION_IGS", "hl7se.fhir.base#1.1.0").split(",")
+    if ig.strip()
+]
+
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 SAMPLES_DIR = os.environ.get(
     "SAMPLES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
@@ -1012,10 +1023,8 @@ def validate_with_matchbox(body: bytes) -> dict:
     Raises MatchboxError when the validator is unreachable or unusable.
     Monkeypatched in tests.
     """
-    url = (
-        f"{MATCHBOX_URL}/$validate?profile="
-        f"{urllib.parse.quote(PROFILE, safe='')}"
-    )
+    query = [("profile", PROFILE)] + [("igs", ig) for ig in VALIDATION_IGS]
+    url = f"{MATCHBOX_URL}/$validate?{urllib.parse.urlencode(query)}"
     req = urllib.request.Request(
         url,
         data=body,

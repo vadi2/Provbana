@@ -1320,6 +1320,23 @@ def test_validate_posts_the_bundle_to_the_profile_endpoint(monkeypatch):
     assert timeout == app_module.MATCHBOX_TIMEOUT
 
 
+def test_validate_asks_matchbox_for_the_extra_packages(monkeypatch):
+    """Without igs, a Swedish profile claim comes back "not checked"."""
+    captured = []
+    fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
+    monkeypatch.setattr(app_module, "VALIDATION_IGS", ["hl7se.fhir.base#1.1.0"])
+    app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}')
+    assert "igs=hl7se.fhir.base%231.1.0" in captured[0][0].full_url
+
+
+def test_validate_omits_igs_when_none_are_configured(monkeypatch):
+    captured = []
+    fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
+    monkeypatch.setattr(app_module, "VALIDATION_IGS", [])
+    app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}')
+    assert "igs=" not in captured[0][0].full_url
+
+
 def test_validate_keeps_the_outcome_from_an_http_error(monkeypatch):
     """Matchbox answers 4xx with a real OperationOutcome; that is the verdict."""
     body = json.dumps(outcome(errors=3)).encode()
