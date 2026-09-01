@@ -1655,6 +1655,13 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+/* Runs before first paint so a stored choice never flashes the other theme. */
+try {
+  var t = localStorage.getItem("theme");
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+} catch (e) { /* site data blocked - fall back to the system theme */ }
+</script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700;800&display=swap">
@@ -1664,32 +1671,42 @@ INDEX_HTML = r"""<!doctype html>
    (nordichackathon2026.blogs.dsv.su.se): base #FFFFFF, contrast #111111,
    accent-3 #503AA8, accent-4 #686868, accent-5 #FBFAF3, accent-1 #FFEE58,
    set in Manrope with Fira Code for code. Semantic colours (pass/fail/warn)
-   are deepened beyond the event palette so abnormal results stay obvious. */
+   are deepened beyond the event palette so abnormal results stay obvious.
+   Each token carries its light and dark value as a pair, so the two themes
+   cannot drift apart; the theme picker only has to set color-scheme. */
+:root { color-scheme: light dark; }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 :root {
   --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   --r-card: 4px; --r-ctl: 3px;
-  --bg: #fbfaf3; --card: #ffffff; --text: #111111; --muted: #5f5f5f;
-  --border: #d8d5c7; --field-border: #8d8878;
-  --accent: #503aa8; --accent-soft: #efebfa;
-  --accent-fill: #503aa8; --accent-on: #ffffff;
-  --pass: #16704a; --pass-bg: #e2f1e8; --fail: #b3261e; --fail-bg: #fbe7e4;
-  --warn: #7d5300; --warn-bg: #fbf0cf; --info: #12628f; --info-bg: #e2eff7;
-  --gold: #6f5a00; --gold-bg: #fdf6c4; --silver: #5f5f5f; --silver-bg: #eeece2;
-  --bronze: #8a4b1f; --bronze-bg: #f6e9dc; --code-bg: #f3f1e6;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #15141a; --card: #1e1c26; --text: #f3f1e7; --muted: #a7a2b3;
-    --border: #322e3d; --field-border: #6e6880;
-    --accent: #b9a8f7; --accent-soft: #292340;
-    --accent-fill: #b9a8f7; --accent-on: #15141a;
-    --pass: #58cf94; --pass-bg: #123522; --fail: #ff8a80; --fail-bg: #401d1a;
-    --warn: #f0cb4e; --warn-bg: #3a3110; --info: #6fc3ef; --info-bg: #10303f;
-    --gold: #ffee58; --gold-bg: #33300f; --silver: #b6b1a6; --silver-bg: #26242e;
-    --bronze: #d68f5f; --bronze-bg: #30211a; --code-bg: #131119;
-  }
+  --bg: light-dark(#fbfaf3, #15141a);
+  --card: light-dark(#ffffff, #1e1c26);
+  --text: light-dark(#111111, #f3f1e7);
+  --muted: light-dark(#5f5f5f, #a7a2b3);
+  --border: light-dark(#d8d5c7, #322e3d);
+  --field-border: light-dark(#8d8878, #6e6880);
+  --accent: light-dark(#503aa8, #b9a8f7);
+  --accent-soft: light-dark(#efebfa, #292340);
+  --accent-fill: light-dark(#503aa8, #b9a8f7);
+  --accent-on: light-dark(#ffffff, #15141a);
+  --pass: light-dark(#16704a, #58cf94);
+  --pass-bg: light-dark(#e2f1e8, #123522);
+  --fail: light-dark(#b3261e, #ff8a80);
+  --fail-bg: light-dark(#fbe7e4, #401d1a);
+  --warn: light-dark(#7d5300, #f0cb4e);
+  --warn-bg: light-dark(#fbf0cf, #3a3110);
+  --info: light-dark(#12628f, #6fc3ef);
+  --info-bg: light-dark(#e2eff7, #10303f);
+  --gold: light-dark(#6f5a00, #ffee58);
+  --gold-bg: light-dark(#fdf6c4, #33300f);
+  --silver: light-dark(#5f5f5f, #b6b1a6);
+  --silver-bg: light-dark(#eeece2, #26242e);
+  --bronze: light-dark(#8a4b1f, #d68f5f);
+  --bronze-bg: light-dark(#f6e9dc, #30211a);
+  --code-bg: light-dark(#f3f1e6, #131119);
 }
 * { box-sizing: border-box; }
 code, pre, textarea, .cv-mode, .tab-btn { font-variant-ligatures: none; }
@@ -1701,6 +1718,18 @@ body {
 }
 main { max-width: 1060px; margin: 0 auto; padding: 26px 16px 72px; }
 header { max-width: 1060px; margin: 0 auto; padding: 48px 16px 6px; }
+.head-row { display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 14px 24px; flex-wrap: wrap; }
+.theme-toggle { display: flex; flex: none; margin-top: 5px;
+  border: 1px solid var(--field-border); border-radius: var(--r-ctl);
+  overflow: hidden; }
+.th-btn { font: inherit; font-size: 0.75rem; font-weight: 600;
+  letter-spacing: -0.01em; background: transparent; color: var(--muted);
+  border: none; border-left: 1px solid var(--field-border); border-radius: 0;
+  padding: 5px 12px; cursor: pointer; }
+.th-btn:first-child { border-left: none; }
+.th-btn:hover { color: var(--accent); filter: none; }
+.th-btn[aria-pressed="true"] { background: var(--accent-fill); color: var(--accent-on); }
 h1 { margin: 0; font-size: 1.95rem; font-weight: 700; letter-spacing: -0.035em;
   line-height: 1.15; }
 .sub { margin: 8px 0 0; color: var(--muted); font-size: 1.02rem;
@@ -1981,7 +2010,14 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 </head>
 <body>
 <header>
-  <h1>EPS Connectathon - Patient Summary Challenge</h1>
+  <div class="head-row">
+    <h1>EPS Connectathon - Patient Summary Challenge</h1>
+    <div class="theme-toggle" role="group" aria-label="Colour theme">
+      <button class="th-btn" data-theme-set="system">System</button>
+      <button class="th-btn" data-theme-set="light">Light</button>
+      <button class="th-btn" data-theme-set="dark">Dark</button>
+    </div>
+  </div>
   <p class="sub">Submit your European Patient Summary (FHIR R4 Bundle) and get it
   validated against the HL7 EU EPS 1.0.0-ballot profile. Validity is the gate -
   richness wins the game.</p>
@@ -3050,7 +3086,35 @@ async function confirmPartner(card, btn) {
   }
 }
 
+/* ---- theme picker ---- */
+/* localStorage throws outright where site data is blocked, so reads and writes
+   are both guarded; the picker still works, the choice just does not persist. */
+function storedTheme() {
+  try { return localStorage.getItem("theme"); } catch (e) { return null; }
+}
+function storeTheme(mode) {
+  try {
+    if (mode === "system") localStorage.removeItem("theme");
+    else localStorage.setItem("theme", mode);
+  } catch (e) {}
+}
+function initTheme() {
+  const btns = [...document.querySelectorAll(".th-btn")];
+  const show = (mode) => btns.forEach((b) =>
+    b.setAttribute("aria-pressed", String(b.dataset.themeSet === mode)));
+  const stored = storedTheme();
+  show(stored === "light" || stored === "dark" ? stored : "system");
+  btns.forEach((b) => b.addEventListener("click", () => {
+    const mode = b.dataset.themeSet;
+    if (mode === "system") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = mode;
+    storeTheme(mode);
+    show(mode);
+  }));
+}
+
 /* initial state for the clinician panel */
+initTheme();
 renderCvList();
 initSamples();
 </script>
