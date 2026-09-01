@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite id="eps_ts" xmlns="http://www.gitb.com/tdl/v1/" xmlns:gitb="http://www.gitb.com/core/v1/">
+  <metadata>
+    <gitb:name>European Patient Summary conformance</gitb:name>
+    <gitb:description>Validate that an uploaded document is a conformant European Patient Summary (HL7 EU EPS 1.0.0-ballot).</gitb:description>
+    <gitb:version>1.1</gitb:version>
+  </metadata>
+  <actors>
+    <gitb:actor id="PS-Producer">
+      <gitb:name>Patient Summary Producer</gitb:name>
+      <gitb:desc>System that produces a conformant European Patient Summary.</gitb:desc>
+    </gitb:actor>
+    <gitb:actor id="Validator">
+      <gitb:name>EPS Validator</gitb:name>
+      <gitb:desc>Matchbox FHIR validation service validating against EPS 1.0.0-ballot.</gitb:desc>
+    </gitb:actor>
+  </actors>
+  <testcase id="eps_upload_validate"/>
+</testsuite>

@@ -1,0 +1,77 @@
+name: itb
+
+volumes:
+  gitb-repo:
+  gitb-dbdata:
+
+services:
+  gitb-redis:
+    image: isaitb/gitb-redis:latest
+    restart: unless-stopped
+
+  gitb-mysql:
+    image: isaitb/gitb-mysql:latest
+    restart: unless-stopped
+    environment:
+      - MYSQL_ROOT_PASSWORD=root
+      - MYSQL_DATABASE=gitb
+      - MYSQL_USER=gitb
+      - MYSQL_PASSWORD=gitb
+    volumes:
+      - gitb-dbdata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  gitb-srv:
+    image: isaitb/gitb-srv:latest
+    restart: unless-stopped
+    environment:
+      - CALLBACK_ROOT_URL=http://localhost:8080/itbsrv
+    ports:
+      - "8080:8080"
+
+  gitb-ui:
+    image: isaitb/gitb-ui:latest
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+    environment:
+      - SELF_REGISTRATION_ENABLED=true
+      - THEME=ec
+      - AUTHENTICATION_SSO_ENABLED=false
+      - AUTOMATION_API_ENABLED=true
+      - AUTOMATION_API_MASTER_KEY=hackathon-master-key
+      - TESTBED_SERVICE_URL=http://gitb-srv:8080/itbsrv/TestbedService
+      - TESTBED_CLIENT_URL_INTERNAL=http://0.0.0.0:9090/TestbedClient
+      - TESTBED_CLIENT_URL=http://gitb-ui:9090/TestbedClient
+      - DB_DEFAULT_URL=jdbc:mysql://gitb-mysql/gitb?characterEncoding=UTF-8&useUnicode=true&autoReconnect=true&useSSL=false&verifyServerCertificate=false&allowPublicKeyRetrieval=true
+      - DB_DEFAULT_ROOTURL=jdbc:mysql://gitb-mysql/
+      - REDIS_HOST=gitb-redis
+    depends_on:
+      gitb-mysql:
+        condition: service_healthy
+      gitb-redis:
+        condition: service_started
+      gitb-srv:
+        condition: service_started
+
+  matchbox:
+    image: europe-west6-docker.pkg.dev/ahdis-ch/ahdis/matchbox:latest
+    restart: unless-stopped
+    ports:
+      - "8090:8080"
+    volumes:
+      - ../matchbox/config:/config
+
+  connectathon:
+    build: ../connectathon
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    volumes:
+      - ../connectathon/data:/data
+    depends_on:
+      - matchbox

@@ -1,0 +1,9 @@
+server:
+  servlet:
+    context-path: /matchboxv3
+hapi:
+  fhir:
+    implementationguides:
+      eps:
+        name: hl7.fhir.eu.eps
+        version: 1.0.0-ballot
