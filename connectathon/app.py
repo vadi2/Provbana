@@ -60,12 +60,6 @@ RESOURCE_POINTS = 2    # per clinical resource (not Composition/Patient)
 RESOURCE_CAP = 60      # max points from clinical resources
 SECTION_CAP = 160      # max points from sections (the IPS set is ~16 sections)
 FIRST_PASS_BONUS = 20  # one-time, to the first company that submits a valid bundle
-INTEROP_CONSUMER_POINTS = 25   # per distinct partner whose document you consumed
-INTEROP_PRODUCER_POINTS = 10   # per distinct team that consumed your document
-# Registration is deliberately open, so a team could stand up throwaway partners
-# and exchange with itself. Capping the track bounds that to what four honest
-# partnerships are worth, which is more than any real hackathon reaches.
-INTEROP_CAP = 100
 
 # Set REGISTER_CODE to require a shared secret on /api/register. Left empty the
 # endpoint stays open, which is what you want on a closed event network.
@@ -115,14 +109,6 @@ def init_db() -> None:
                 sections  INTEGER NOT NULL DEFAULT 0,
                 resources INTEGER NOT NULL DEFAULT 0,
                 filename  TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS interop_confirmations (
-                id            INTEGER PRIMARY KEY,
-                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
-                producer_id   INTEGER NOT NULL REFERENCES teams(id),
-                submission_id INTEGER NOT NULL REFERENCES submissions(id),
-                ts            TEXT NOT NULL,
-                UNIQUE(consumer_id, producer_id)
             );
             """
         )
@@ -963,37 +949,6 @@ def summarize_bundle(bundle) -> dict:
 # ---------------------------------------------------------------- interop
 
 
-def interop_ground_truth(bundle) -> dict:
-    """Receipt ground truth for an exchange bundle: the (first) Patient's
-    family names (casefold+strip), exact birthDate string, and the counts of
-    medication and allergy resources among the bundle entries."""
-    truth: dict = {"families": set(), "birth_date": None, "medications": 0, "allergies": 0}
-    if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
-        return truth
-    patient_seen = False
-    for entry in bundle["entry"]:
-        resource = entry.get("resource") if isinstance(entry, dict) else None
-        if not isinstance(resource, dict):
-            continue
-        rtype = resource.get("resourceType")
-        if rtype == "Patient" and not patient_seen:
-            patient_seen = True
-            names = resource.get("name")
-            if isinstance(names, list):
-                for name in names:
-                    if isinstance(name, dict) and isinstance(name.get("family"), str):
-                        family = name["family"].strip().casefold()
-                        if family:
-                            truth["families"].add(family)
-            if isinstance(resource.get("birthDate"), str):
-                truth["birth_date"] = resource["birthDate"]
-        elif rtype in MEDICATION_TYPES:
-            truth["medications"] += 1
-        elif rtype == "AllergyIntolerance":
-            truth["allergies"] += 1
-    return truth
-
-
 def best_valid_submission(conn: sqlite3.Connection, team_id: int) -> sqlite3.Row | None:
     """The team's published exchange document: its best valid submission
     (highest score, earliest ts tiebreak - mirrors the leaderboard pick)."""
@@ -1168,22 +1123,6 @@ async def bundle_body(
     return await read_limited_body(request, MAX_BODY_BYTES, "Bundle")
 
 
-def optional_team_from_token(
-    x_team_token: str | None, authorization: str | None
-) -> sqlite3.Row | None:
-    """team_from_token, but an absent credential is anonymous rather than 401.
-
-    A credential that is present but wrong still raises: quietly downgrading a
-    mistyped token to anonymous would drop the team's own confirmations from
-    the response without telling them why.
-    """
-    if not x_team_token and not (
-        authorization and authorization.lower().startswith("bearer ")
-    ):
-        return None
-    return team_from_token(x_team_token, authorization)
-
-
 @app.post("/api/register",
     tags=["Companies"],
     summary="Register a company and get its token",
@@ -1317,8 +1256,7 @@ def submit_eps(
     summary="Current standings",
     description=(
         "One row per registered company, best score first. Companies that have "
-        "never submitted still appear, because interop points need no "
-        "submission."
+        "registered but never submitted appear at the bottom with no score."
     ),
 )
 def leaderboard() -> list[dict]:
@@ -1330,20 +1268,6 @@ def leaderboard() -> list[dict]:
             "SELECT team_id, ts, pass, errors, score, sections, resources "
             "FROM submissions ORDER BY ts"
         ).fetchall()
-        consumed = {
-            row["team_id"]: row["n"]
-            for row in conn.execute(
-                "SELECT consumer_id AS team_id, COUNT(DISTINCT producer_id) AS n "
-                "FROM interop_confirmations GROUP BY consumer_id"
-            )
-        }
-        produced = {
-            row["team_id"]: row["n"]
-            for row in conn.execute(
-                "SELECT producer_id AS team_id, COUNT(DISTINCT consumer_id) AS n "
-                "FROM interop_confirmations GROUP BY producer_id"
-            )
-        }
 
     by_team: dict[int, list[sqlite3.Row]] = {}
     for sub in subs:
@@ -1353,30 +1277,18 @@ def leaderboard() -> list[dict]:
     for team in teams:
         team_subs = by_team.get(team["id"], [])
         first_pass = bool(team["first_pass"])
-        # Interop track: points for consuming distinct partners' documents
-        # plus points for each distinct team that consumed this team's own.
-        interop = min(
-            INTEROP_CAP,
-            INTEROP_CONSUMER_POINTS * consumed.get(team["id"], 0)
-            + INTEROP_PRODUCER_POINTS * produced.get(team["id"], 0),
-        )
         if team_subs:
             # Highest-scoring submission drives the team score and the
             # richness columns; its timestamp is the moment the team first
             # achieved its current best score (used as ranking tiebreak, so
             # re-submitting never hurts).
             best = min(team_subs, key=lambda s: (-s["score"], s["ts"]))
-            score = (
-                best["score"]
-                + (FIRST_PASS_BONUS if first_pass else 0)
-                + interop
-            )
+            score = best["score"] + (FIRST_PASS_BONUS if first_pass else 0)
             rows.append(
                 {
                     "team": team["name"],
                     "team_slug": team["slug"],
                     "score": score,
-                    "interop": interop,
                     "passed": any(s["pass"] for s in team_subs),
                     "attempts": len(team_subs),
                     "best_errors": min(s["errors"] for s in team_subs),
@@ -1392,8 +1304,7 @@ def leaderboard() -> list[dict]:
                 {
                     "team": team["name"],
                     "team_slug": team["slug"],
-                    "score": interop,  # consuming others needs no submission
-                    "interop": interop,
+                    "score": 0,
                     "passed": False,
                     "attempts": 0,
                     "best_errors": None,
@@ -1642,34 +1553,17 @@ def sample_bundle(sample_id: str) -> Response:
     tags=["Interop"],
     summary="Documents published for exchange",
     description=(
-        "Each company's best valid submission is published automatically. "
-        "Reading the list needs no token; supply one to hide yourself and to "
-        "see which partners you have already consumed."
+        "Each company's best valid submission is published automatically. The "
+        "list is open - the documents are the event's shared test corpus."
     ),
 )
-def exchange_list(
-    x_team_token: str | None = Header(default=None),
-    authorization: str | None = Header(default=None),
-) -> list[dict]:
-    me = optional_team_from_token(x_team_token, authorization)
+def exchange_list() -> list[dict]:
     out = []
     with connect() as conn:
         teams = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
         ).fetchall()
-        confirmed = set()
-        if me is not None:
-            confirmed = {
-                row["producer_id"]
-                for row in conn.execute(
-                    "SELECT producer_id FROM interop_confirmations "
-                    "WHERE consumer_id = ?",
-                    (me["id"],),
-                )
-            }
         for team in teams:
-            if me is not None and team["id"] == me["id"]:
-                continue
             best = best_valid_submission(conn, team["id"])
             if best is None:
                 continue
@@ -1681,7 +1575,6 @@ def exchange_list(
                     "ts": best["ts"],
                     "sections": best["sections"],
                     "resources": best["resources"],
-                    "consumed_by_you": team["id"] in confirmed,
                 }
             )
     return out
@@ -1690,19 +1583,9 @@ def exchange_list(
 @app.get("/api/exchange/{team_slug}",
     tags=["Interop"],
     summary="Fetch a partner's document",
-    description=(
-        "The published bundle, ready to load into your own system. Open to "
-        "anonymous callers - a token is validated when supplied."
-    ),
+    description="The published bundle, ready to load into your own system.",
 )
-def exchange_fetch(
-    team_slug: str,
-    x_team_token: str | None = Header(default=None),
-    authorization: str | None = Header(default=None),
-) -> Response:
-    # Published documents are the shared test corpus - anyone may fetch one. A
-    # token is still checked when supplied so a mistyped one is not ignored.
-    optional_team_from_token(x_team_token, authorization)
+def exchange_fetch(team_slug: str) -> Response:
     with connect() as conn:
         producer = conn.execute(
             "SELECT id, name, slug FROM teams WHERE slug = ?", (team_slug,)
@@ -1720,162 +1603,6 @@ def exchange_fetch(
         "%s-eps.json" % producer["slug"],
         **{"X-Exchange-Id": str(best["id"]), "X-Producer": producer["slug"]},
     )
-
-
-def receipt_mismatches(
-    bundle, family: str, birth: str, medications: int, allergies: int
-) -> list[str]:
-    """Which declared receipt fields disagree with the document."""
-    truth = interop_ground_truth(bundle)
-    out = []
-    if family.strip().casefold() not in truth["families"]:
-        out.append("patient_family")
-    if truth["birth_date"] is None or birth.strip() != truth["birth_date"]:
-        out.append("birth_date")
-    if medications != truth["medications"]:
-        out.append("medications")
-    if allergies != truth["allergies"]:
-        out.append("allergies")
-    return out
-
-
-@app.post("/api/interop/confirm",
-    tags=["Interop"],
-    summary="Prove you consumed a document",
-    description=(
-        "Post back four facts read out of the partner's bundle. A mismatch "
-        "returns 422 with the fields that disagree, so you can see what your "
-        "parser got wrong. Add `exchange_id` to pin a specific submission."
-    ),
-)
-def interop_confirm(
-    payload: dict = Depends(small_json_body),
-    x_team_token: str | None = Header(default=None),
-    authorization: str | None = Header(default=None),
-) -> JSONResponse:
-    me = team_from_token(x_team_token, authorization)
-    partner_slug = payload.get("partner")
-    if not isinstance(partner_slug, str) or not partner_slug.strip():
-        raise HTTPException(400, detail='Body must include "partner": "<team-slug>"')
-    with connect() as conn:
-        partner = conn.execute(
-            "SELECT id, name, slug FROM teams WHERE slug = ?",
-            (partner_slug.strip(),),
-        ).fetchone()
-        if partner is None:
-            raise HTTPException(404, detail="Unknown partner team")
-        if partner["id"] == me["id"]:
-            raise HTTPException(400, detail="You cannot confirm your own document")
-        exchange_id = payload.get("exchange_id")
-        if exchange_id is not None:
-            if isinstance(exchange_id, bool) or not isinstance(exchange_id, int):
-                raise HTTPException(400, detail="exchange_id must be an integer")
-            sub = conn.execute(
-                "SELECT * FROM submissions WHERE id = ?", (exchange_id,)
-            ).fetchone()
-            if sub is None or sub["team_id"] != partner["id"] or not sub["pass"]:
-                raise HTTPException(
-                    400, detail="exchange_id is not a valid submission of that partner"
-                )
-            candidates = [sub]
-        else:
-            candidates = conn.execute(
-                "SELECT * FROM submissions WHERE team_id = ? AND pass = 1 "
-                "ORDER BY score DESC, ts ASC, id ASC",
-                (partner["id"],),
-            ).fetchall()
-            if not candidates:
-                raise HTTPException(404, detail="Partner has no valid submission yet")
-            sub = candidates[0]
-
-    family = payload.get("patient_family")
-    birth = payload.get("birth_date")
-    medications = payload.get("medications")
-    allergies = payload.get("allergies")
-    counts_ok = all(
-        isinstance(v, int) and not isinstance(v, bool)
-        for v in (medications, allergies)
-    )
-    if not isinstance(family, str) or not isinstance(birth, str) or not counts_ok:
-        raise HTTPException(
-            400,
-            detail="Receipt must include patient_family (str), birth_date (str), "
-            "medications (int) and allergies (int)",
-        )
-
-    # A partner who re-submits changes which document is "theirs", so a receipt
-    # is checked against every valid submission they hold, best first - otherwise
-    # a consumer who read the document correctly is failed for the producer's
-    # timing. Mismatches are reported against the current best.
-    mismatched = None
-    for candidate in candidates:
-        raw = read_submission_bytes(partner["slug"], candidate["filename"])
-        if raw is None:
-            continue
-        try:
-            bundle = json.loads(raw)
-        except (ValueError, UnicodeDecodeError, RecursionError):
-            continue
-        fields = receipt_mismatches(bundle, family, birth, medications, allergies)
-        if not fields:
-            sub = candidate
-            mismatched = []
-            break
-        if mismatched is None:
-            mismatched = fields
-    if mismatched is None:
-        raise HTTPException(404, detail="Exchange document file missing")
-    if mismatched:
-        # Deliberately do not echo the expected values - consuming teams must
-        # extract them from the document themselves.
-        return JSONResponse(
-            {"result": "mismatch", "fields": mismatched}, status_code=422
-        )
-
-    with connect() as conn:
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO interop_confirmations "
-            "(consumer_id, producer_id, submission_id, ts) VALUES (?, ?, ?, ?)",
-            (
-                me["id"],
-                partner["id"],
-                sub["id"],
-                datetime.now(timezone.utc).isoformat(),
-            ),
-        )
-        inserted = cur.rowcount == 1
-    if inserted:
-        return JSONResponse(
-            {
-                "result": "confirmed",
-                "partner": partner["slug"],
-                "exchange_id": sub["id"],
-                "consumer_points": INTEROP_CONSUMER_POINTS,
-                "producer_points": INTEROP_PRODUCER_POINTS,
-            }
-        )
-    return JSONResponse(
-        {"result": "already_confirmed", "partner": partner["slug"]}
-    )
-
-
-@app.get("/api/interop/matrix",
-    tags=["Interop"],
-    summary="Who has consumed whose document",
-    description="One row per confirmed consumer/producer pair.",
-)
-def interop_matrix() -> list[dict]:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT c.name AS consumer, p.name AS producer, ic.ts "
-            "FROM interop_confirmations ic "
-            "JOIN teams c ON c.id = ic.consumer_id "
-            "JOIN teams p ON p.id = ic.producer_id ORDER BY ic.ts"
-        ).fetchall()
-    return [
-        {"consumer": r["consumer"], "producer": r["producer"], "ts": r["ts"]}
-        for r in rows
-    ]
 
 
 @app.get("/api/health",
@@ -2265,22 +1992,11 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .meter.mid > span { background: var(--warn); }
 .meter.low > span { background: var(--fail); }
 /* interop */
-ol.steps { margin: 8px 0 14px; padding-left: 22px; }
-ol.steps li { margin: 6px 0; }
-ol.steps code, p.muted code { background: var(--code-bg); border: 1px solid var(--border);
+p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   border-radius: var(--r-ctl); padding: 1px 5px; font-size: 0.8rem;
   font-family: var(--font-mono); }
 .io-partner { border: 1px solid var(--border); border-radius: var(--r-card);
   padding: 14px 16px; margin-top: 12px; }
-.io-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 10px; margin-top: 8px; align-items: end; }
-.io-form label { margin: 0 0 3px; }
-.io-result { margin-top: 8px; font-size: 0.9rem; display: none; }
-.io-result.ok { display: block; color: var(--pass); font-weight: 600; }
-.io-result.bad { display: block; color: var(--fail); font-weight: 600; }
-table.matrix td, table.matrix th { text-align: center; }
-table.matrix td.mx-name, table.matrix th.mx-name { text-align: left; }
-table.matrix td.yes { color: var(--pass); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -2322,7 +2038,7 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   <div class="table-wrap">
   <table id="lb">
     <thead><tr>
-      <th>#</th><th>Company</th><th>Score</th><th>Interop</th><th>Status</th>
+      <th>#</th><th>Company</th><th>Score</th><th>Status</th>
       <th>Sections</th><th>Resources</th><th>Errors (best)</th><th>Last submission</th>
     </tr></thead>
     <tbody id="lb-body"></tbody>
@@ -2330,15 +2046,6 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   </div>
   <p class="muted" id="lb-empty" style="display:none">No companies yet - be the
   first to <a href="#submit">register</a>.</p>
-</section>
-
-<section class="card">
-  <h2>Interop matrix</h2>
-  <p class="muted" style="margin:0 0 10px">A check mark means the row company
-  fetched the column company's exchange document and posted back a correct
-  extraction receipt (see the Interop testing tab).</p>
-  <div class="table-wrap" id="matrix-wrap"></div>
-  <p class="muted" id="matrix-empty">No interop confirmations yet.</p>
 </section>
 
 <section class="card">
@@ -2351,9 +2058,7 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
     +60). Sections only count once - repeating a section or padding the bundle
     will not make it richer. Your company score is your best submission, plus a
     one-time +20 "first pass" bonus for the first company to submit a valid
-    document. Interop adds on top, up to +100 in total: +25 for every partner
-    document your company proves it consumed, and +10 for each company that
-    consumes yours.
+    document. Interop testing is not scored.
   </p>
 </section>
 
@@ -2443,37 +2148,24 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 <section class="card">
   <h2>Interop testing</h2>
   <p class="muted" style="margin:0 0 8px">Compliance proves you can produce a
-  valid patient summary, while interoperability testing proves another system
-  can consume it. Your team's best valid submission is automatically published
-  as its exchange document.</p>
-  <ol class="steps">
-    <li>Pick a partner below and load their document into <strong>your</strong>
-      system - view it here, or download the bundle. No token needed to read
-      one; every published document is open.</li>
-    <li>Read four facts back out of <strong>your</strong> system: the patient's
-      family name, birth date, and how many medication and allergy entries the
-      document carries.</li>
-    <li>Type them into that partner's card and press <strong>Confirm</strong>.
-      All four must match: you earn <strong>+25</strong>, the producer earns
-      <strong>+10</strong>.</li>
-  </ol>
+  valid patient summary; interoperability testing proves another system can
+  consume it. Every company's best valid submission is published below as its
+  exchange document - load one into your own system and see what breaks.</p>
+  <p class="muted" style="margin:0">Nothing here is scored or tracked. Take a
+  partner's document, test it, and tell them what you found: the useful output
+  of this track is a defect the producer can go and fix.</p>
 </section>
 
 <section class="card">
-  <h2>Partners</h2>
-  <label for="io-token">Team token</label>
-  <input type="text" id="io-token" placeholder="paste your team token"
-    autocomplete="off" spellcheck="false">
-  <p class="muted" id="io-hint" style="margin:8px 0 0"></p>
+  <h2>Published documents</h2>
+  <p class="muted" id="io-hint" style="margin:0"></p>
   <div id="io-partners"></div>
 </section>
 
 <details class="card">
   <summary>Or use the API</summary>
-  <p class="muted">Fetch a partner's exchange document:</p>
+  <p class="muted">Fetch a company's exchange document:</p>
   <pre class="curl" id="curl-exchange"></pre>
-  <p class="muted">Post your extraction receipt:</p>
-  <pre class="curl" id="curl-confirm"></pre>
 </details>
 
 </div>
@@ -2496,13 +2188,11 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
 /* ---- leaderboard ---- */
-let lbTeams = [];
 async function refreshLeaderboard() {
   try {
     const res = await fetch("/api/leaderboard");
     if (!res.ok) return;
     const rows = await res.json();
-    lbTeams = rows.map((r) => r.team);
     $("#lb-empty").style.display = rows.length ? "none" : "block";
     $("#lb").style.display = rows.length ? "table" : "none";
     $("#lb-body").innerHTML = rows.map((r) => `
@@ -2515,7 +2205,6 @@ async function refreshLeaderboard() {
           ? ' <span title="First pass: first company to submit a valid document">'
             + '\u{1F525}</span>' : ""}</td>
         <td><strong>${r.score}</strong></td>
-        <td>${r.interop || 0}</td>
         <td>${r.passed ? '<span class="badge pass">VALID</span>'
                        : '<span class="badge fail">NOT YET</span>'}</td>
         <td>${r.best_sections === null ? "-" : r.best_sections}</td>
@@ -2526,41 +2215,8 @@ async function refreshLeaderboard() {
       </tr>`).join("");
   } catch (e) { /* transient network error - retry on next tick */ }
 }
-refreshLeaderboard().then(refreshMatrix);
+refreshLeaderboard();
 setInterval(refreshLeaderboard, 5000);
-setInterval(refreshMatrix, 5000);
-
-/* ---- interop matrix ---- */
-async function refreshMatrix() {
-  try {
-    const res = await fetch("/api/interop/matrix");
-    if (!res.ok) return;
-    const pairs = await res.json();
-    const wrap = $("#matrix-wrap");
-    const teams = lbTeams.length ? lbTeams
-      : [...new Set(pairs.flatMap((p) => [p.consumer, p.producer]))];
-    if (!pairs.length || teams.length < 2) {
-      wrap.innerHTML = "";
-      $("#matrix-empty").style.display = "block";
-      return;
-    }
-    $("#matrix-empty").style.display = "none";
-    const done = new Set(pairs.map((p) => p.consumer + "\u0000" + p.producer));
-    let html = '<table class="matrix"><thead><tr>'
-      + '<th class="mx-name">Consumer ↓ / Producer →</th>'
-      + teams.map((t) => "<th>" + esc(t) + "</th>").join("") + "</tr></thead><tbody>";
-    for (const c of teams) {
-      html += '<tr><td class="mx-name"><strong>' + esc(c) + "</strong></td>"
-        + teams.map((p) => {
-            if (p === c) return '<td class="muted">-</td>';
-            return done.has(c + "\u0000" + p)
-              ? '<td class="yes" title="' + esc(c) + " consumed " + esc(p) + '">✓</td>'
-              : "<td></td>";
-          }).join("") + "</tr>";
-    }
-    wrap.innerHTML = html + "</tbody></table>";
-  } catch (e) { /* transient network error - retry on next tick */ }
-}
 
 /* ---- routing ----
    The hash is this app's address bar: #<tab>[/<kind>/<id>/<view>]. Tabs are
@@ -2753,12 +2409,10 @@ function renderIssues(issues) {
 }
 
 /* ---- submit ---- */
-/* One token, two places to type it: the submit form and the interop tab.
-   Mirroring on input stops the two drifting apart, and localStorage carries it
-   across reloads. */
+/* The token is only typed in one place, but localStorage carries it across
+   reloads so a participant pastes it once for the event. */
 function syncToken(value, from) {
   if (from !== "token") $("#token").value = value;
-  if (from !== "io") $("#io-token").value = value;
   try { localStorage.setItem("eps_token", value); } catch (e) { /* site data blocked */ }
 }
 syncToken(localStorage.getItem("eps_token") || "");
@@ -3433,141 +3087,37 @@ $("#cv-doc").addEventListener("click", (ev) => {
 
 /* ---- interop testing ---- */
 function interopCurls() {
-  const tok = $("#token").value.trim() || "YOUR_TOKEN";
   $("#curl-exchange").textContent =
     "curl -s " + origin + "/api/exchange/PARTNER_SLUG -o partner-eps.json\n" +
     "# list every published document first:\n" +
     "curl -s " + origin + "/api/exchange";
-  $("#curl-confirm").textContent =
-    "curl -s -X POST " + origin + "/api/interop/confirm \\\n" +
-    "  -H 'Content-Type: application/json' \\\n" +
-    "  -H 'X-Team-Token: " + tok + "' \\\n" +
-    "  -d '{\"partner\": \"PARTNER_SLUG\", \"patient_family\": \"...\"," +
-    " \"birth_date\": \"YYYY-MM-DD\", \"medications\": 0, \"allergies\": 0}'";
 }
-$("#token").addEventListener("input", (ev) => {
-  syncToken(ev.target.value, "token");
-  interopCurls();
-});
-$("#io-token").addEventListener("input", (ev) => {
-  syncToken(ev.target.value, "io");
-  interopCurls();
-});
-// on change, not input: reloading the partner list per keystroke is a fetch
-// per character, and the token is only usable once it is complete anyway
-$("#io-token").addEventListener("change", initInterop);
+$("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
-function partnerCard(p, canConfirm) {
-  return '<div class="io-partner" data-slug="' + esc(p.team_slug)
-    + '" data-exid="' + p.exchange_id + '">'
-    + '<div class="row" style="justify-content:space-between;flex-wrap:wrap">'
+function partnerCard(p) {
+  return '<div class="io-partner">'
     + "<strong>" + esc(p.team) + "</strong>"
-    + (canConfirm
-        ? (p.consumed_by_you ? '<span class="badge pass">CONFIRMED</span>'
-                             : '<span class="muted">not confirmed yet</span>')
-        : "")
-    + "</div>"
     + '<p class="muted" style="margin:6px 0 0">Document #' + p.exchange_id
-    + " · " + p.sections + " sections · " + p.resources + " resources · "
-    + '<a href="#clinical/submission/' + p.exchange_id + '">View document</a>'
-    + ' · <a href="/api/submissions/' + p.exchange_id
-    + '/bundle" download>download bundle</a></p>'
-    + (canConfirm
-        ? '<div class="io-form">'
-          + '<div><label>Patient family name</label><input type="text" class="io-family"></div>'
-          + '<div><label>Birth date</label><input type="text" class="io-birth" placeholder="YYYY-MM-DD"></div>'
-          + '<div><label>Medication entries</label><input type="number" class="io-meds" min="0"></div>'
-          + '<div><label>Allergy entries</label><input type="number" class="io-alls" min="0"></div>'
-          + '<div><button class="io-confirm">Confirm</button></div>'
-          + "</div>"
-        : "")
-    + '<div class="io-result"></div></div>';
+    + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
+    + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
+    + ' \u00b7 <a href="/api/submissions/' + p.exchange_id
+    + '/bundle" download>download the FHIR bundle</a></p></div>';
 }
 
 async function initInterop() {
   interopCurls();
-  const token = $("#token").value.trim();
   const hint = $("#io-hint");
   const box = $("#io-partners");
   try {
-    const res = await fetch("/api/exchange",
-      token ? { headers: { "X-Team-Token": token } } : undefined);
-    if (res.status === 401) {
-      hint.textContent = "That token was not recognised - check the Submit tab.";
-      box.innerHTML = "";
-      return;
-    }
+    const res = await fetch("/api/exchange");
     if (!res.ok) return;
     const partners = await res.json();
     hint.textContent = partners.length
-      ? (token
-          ? "These companies have published a valid exchange document. Load one"
-            + " into your system, then type back what you extracted."
-          : "Every published exchange document, free to download and test"
-            + " against. Paste your team token above to confirm the ones your"
-            + " system can consume.")
+      ? "Every published exchange document, free to download and test against."
       : "No company has a valid submission yet - check back soon.";
-    box.innerHTML = partners.map((p) => partnerCard(p, !!token)).join("");
+    box.innerHTML = partners.map(partnerCard).join("");
   } catch (e) {
     hint.textContent = "Network error: " + e.message;
-  }
-}
-
-$("#io-partners").addEventListener("click", (ev) => {
-  const btn = ev.target.closest(".io-confirm");
-  if (btn) confirmPartner(btn.closest(".io-partner"), btn);
-});
-
-async function confirmPartner(card, btn) {
-  const token = $("#token").value.trim();
-  const out = card.querySelector(".io-result");
-  out.className = "io-result";
-  const body = {
-    partner: card.dataset.slug,
-    exchange_id: parseInt(card.dataset.exid, 10),
-    patient_family: card.querySelector(".io-family").value.trim(),
-    birth_date: card.querySelector(".io-birth").value.trim(),
-    medications: parseInt(card.querySelector(".io-meds").value, 10),
-    allergies: parseInt(card.querySelector(".io-alls").value, 10),
-  };
-  if (!body.patient_family || !body.birth_date
-      || isNaN(body.medications) || isNaN(body.allergies)) {
-    out.textContent = "Fill in all four receipt fields first.";
-    out.className = "io-result bad";
-    return;
-  }
-  btn.disabled = true;
-  try {
-    const res = await fetch("/api/interop/confirm", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Team-Token": token },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => ({}));
-    if (res.ok && data.result === "confirmed") {
-      out.textContent = "✓ Confirmed! +" + data.consumer_points
-        + " for you, +" + data.producer_points + " for the producer.";
-      out.className = "io-result ok";
-      const slot = card.querySelector(".row span");
-      if (slot) slot.outerHTML = '<span class="badge pass">CONFIRMED</span>';
-      refreshLeaderboard().then(refreshMatrix);
-    } else if (res.ok && data.result === "already_confirmed") {
-      out.textContent = "Already confirmed - no new points.";
-      out.className = "io-result ok";
-    } else if (res.status === 422 && data.result === "mismatch") {
-      out.textContent = "✗ Mismatch on: " + (data.fields || []).join(", ")
-        + ". Re-check your extraction and try again.";
-      out.className = "io-result bad";
-    } else {
-      out.textContent = (data.detail || "Request failed")
-        + " (HTTP " + res.status + ")";
-      out.className = "io-result bad";
-    }
-  } catch (e) {
-    out.textContent = "Network error: " + e.message;
-    out.className = "io-result bad";
-  } finally {
-    btn.disabled = false;
   }
 }
 
@@ -3609,7 +3159,7 @@ applyRoute(false);
 
 # ---------------------------------------------------------------- OpenAPI
 
-# Three endpoints read their body straight off the request (a raw FHIR bundle,
+# Two endpoints read their body straight off the request (a raw FHIR bundle,
 # or a small dict validated by hand) rather than through a Pydantic model, so
 # FastAPI has nothing to introspect and generates an empty requestBody for
 # them. The shapes are described here instead. Handwriting the whole document
@@ -3653,44 +3203,6 @@ OPENAPI_BODIES = {
             "application/json": {"schema": {"type": "object"}},
         },
     },
-    ("/api/interop/confirm", "post"): {
-        "required": True,
-        "content": {
-            "application/json": {
-                "schema": {
-                    "type": "object",
-                    "required": [
-                        "partner",
-                        "patient_family",
-                        "birth_date",
-                        "medications",
-                        "allergies",
-                    ],
-                    "properties": {
-                        "partner": {
-                            "type": "string",
-                            "description": "team_slug from /api/exchange.",
-                        },
-                        "exchange_id": {
-                            "type": "integer",
-                            "description": "Pin a specific submission of the partner's.",
-                        },
-                        "patient_family": {"type": "string"},
-                        "birth_date": {"type": "string", "format": "date"},
-                        "medications": {"type": "integer"},
-                        "allergies": {"type": "integer"},
-                    },
-                },
-                "example": {
-                    "partner": "my-partner",
-                    "patient_family": "Musterfrau",
-                    "birth_date": "1961-12-24",
-                    "medications": 3,
-                    "allergies": 1,
-                },
-            }
-        },
-    },
 }
 
 # Score and verdict ride on headers so a client can act on them without parsing
@@ -3704,14 +3216,7 @@ SUBMIT_RESPONSE_HEADERS = {
 }
 
 # Endpoints that read X-Team-Token. Anything else is open.
-TOKEN_REQUIRED = {
-    ("/api/eps", "post"),
-    ("/api/interop/confirm", "post"),
-}
-TOKEN_OPTIONAL = {
-    ("/api/exchange", "get"),
-    ("/api/exchange/{team_slug}", "get"),
-}
+TOKEN_REQUIRED = {("/api/eps", "post")}
 
 
 def custom_openapi() -> dict:
@@ -3724,8 +3229,8 @@ def custom_openapi() -> dict:
         summary="Validate and score European Patient Summary bundles.",
         description=(
             "Register a company, submit FHIR R4 EPS bundles for validation "
-            "against `%s`, and exchange documents with other companies to "
-            "score the interop track.\n\n"
+            "against `%s`, and fetch other companies' documents to test "
+            "against.\n\n"
             "Team endpoints take the token from `POST /api/register`, sent as "
             "`X-Team-Token: TOKEN` or `Authorization: Bearer TOKEN`."
         ) % PROFILE,
@@ -3754,8 +3259,6 @@ def custom_openapi() -> dict:
                 del op["parameters"]
             if key in TOKEN_REQUIRED:
                 op["security"] = [{"TeamToken": []}]
-            elif key in TOKEN_OPTIONAL:
-                op["security"] = [{"TeamToken": []}, {}]
             if key in OPENAPI_BODIES:
                 op["requestBody"] = OPENAPI_BODIES[key]
     submit = schema["paths"]["/api/eps"]["post"]["responses"]["200"]

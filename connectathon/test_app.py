@@ -704,10 +704,6 @@ def test_submission_404s(client, monkeypatch):
 
 # ---------------------------------------------------------------- interop
 
-RECEIPT = {"partner": "producer", "patient_family": "Schwartz",
-           "birth_date": "1950-04-19", "medications": 2, "allergies": 1}
-
-
 def interop_setup(client, monkeypatch):
     """Producer with a valid rich doc + a consumer team; returns both tokens."""
     tok_p = register(client, "Producer")
@@ -716,34 +712,23 @@ def interop_setup(client, monkeypatch):
     return tok_p, tok_c
 
 
-def confirm(client, token, **overrides):
-    return client.post("/api/interop/confirm", json=dict(RECEIPT, **overrides),
-                       headers={"X-Team-Token": token})
-
-
-def test_confirming_requires_auth_but_reading_does_not(client):
-    assert client.post("/api/interop/confirm", json=RECEIPT).status_code == 401
+def test_the_exchange_corpus_needs_no_token_at_all(client):
+    """Interop testing is unscored, so there is nobody to authenticate."""
     assert client.get("/api/exchange").status_code == 200
     assert client.get("/api/exchange/anyone").status_code == 404  # unknown team
+    # a token is neither required nor rejected - it is simply not read
+    register(client, "Alpha")
+    for headers in ({"X-Team-Token": "not-a-real-token"}, {}):
+        assert client.get("/api/exchange", headers=headers).status_code == 200
 
 
-def test_a_wrong_token_is_still_rejected_on_read(client):
-    register(client, "Alpha")   # a valid token exists; this one is still wrong
-    bad = {"X-Team-Token": "not-a-real-token"}
-    assert client.get("/api/exchange", headers=bad).status_code == 401
-    assert client.get("/api/exchange/anyone", headers=bad).status_code == 401
-
-
-def test_anonymous_readers_see_every_published_document(client, monkeypatch):
+def test_every_reader_sees_every_published_document(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     submit(client, tok_c, outcome(), monkeypatch, body=CLINICAL_BODY)
-    # A team's own document is hidden from them but not from a bystander.
-    assert [p["team"] for p in
-            client.get("/api/exchange", headers={"X-Team-Token": tok_c}).json()] \
-        == ["Producer"]
+    # Nothing is hidden from anyone, including a company's own document: with
+    # no points at stake there is no reason to tailor the list per caller.
     listing = client.get("/api/exchange").json()
     assert [p["team"] for p in listing] == ["Consumer", "Producer"]
-    assert all(p["consumed_by_you"] is False for p in listing)
 
 
 def test_anyone_can_download_a_published_bundle(client, monkeypatch):
@@ -770,163 +755,53 @@ def test_bundles_download_under_a_named_file(client, monkeypatch):
         assert res.headers["content-disposition"] == disposition, url
 
 
-def test_exchange_lists_other_teams_with_valid_docs_only(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
+def test_exchange_lists_valid_docs_only(client, monkeypatch):
+    interop_setup(client, monkeypatch)
     tok_f = register(client, "Failing")
     submit(client, tok_f, outcome(errors=2), monkeypatch)  # invalid -> unpublished
-    listing = client.get("/api/exchange", headers={"X-Team-Token": tok_c}).json()
-    assert [p["team"] for p in listing] == ["Producer"]    # no Failing, no self
+    listing = client.get("/api/exchange").json()
+    assert [p["team"] for p in listing] == ["Producer"]    # no Failing
     partner = listing[0]
     assert partner["team_slug"] == "producer"
-    assert partner["consumed_by_you"] is False
     assert isinstance(partner["exchange_id"], int)
     assert partner["sections"] == 2 and partner["resources"] == 5
-    # producer sees nobody: consumer and Failing have no valid submission
-    assert client.get("/api/exchange", headers={"X-Team-Token": tok_p}).json() == []
-    # bearer auth works too
-    assert client.get(
-        "/api/exchange", headers={"Authorization": f"Bearer {tok_c}"}
-    ).status_code == 200
 
 
 def test_exchange_fetch_bundle_headers_and_404s(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    res = client.get("/api/exchange/producer", headers={"X-Team-Token": tok_c})
+    interop_setup(client, monkeypatch)
+    res = client.get("/api/exchange/producer")
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("application/fhir+json")
     assert res.headers["X-Producer"] == "producer"
     assert int(res.headers["X-Exchange-Id"]) > 0
     assert res.json()["resourceType"] == "Bundle"
-    # fetching your own document is allowed (for testing)
-    own = client.get("/api/exchange/producer", headers={"X-Team-Token": tok_p})
-    assert own.status_code == 200
-    assert client.get("/api/exchange/ghost",
-                      headers={"X-Team-Token": tok_c}).status_code == 404
-    assert client.get("/api/exchange/consumer",
-                      headers={"X-Team-Token": tok_p}).status_code == 404
+    assert client.get("/api/exchange/ghost").status_code == 404
+    # registered, but nothing valid to publish
+    assert client.get("/api/exchange/consumer").status_code == 404
 
 
-def test_interop_confirm_success_points_and_matrix(client, monkeypatch):
+def test_the_receipt_endpoints_are_gone(client, monkeypatch):
+    """Interop is untracked, so nothing claims a consumption or records one."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    receipt = {"partner": "producer", "patient_family": "Schwartz",
+               "birth_date": "1950-04-19", "medications": 2, "allergies": 1}
+    gone = client.post("/api/interop/confirm", json=receipt,
+                       headers={"X-Team-Token": tok_c})
+    assert gone.status_code == 404
+    assert client.get("/api/interop/matrix").status_code == 404
+
+
+def test_the_leaderboard_does_not_score_interop(client, monkeypatch):
     consume_first_pass(client, monkeypatch)
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    res = confirm(client, tok_c)
-    assert res.status_code == 200, res.text
-    data = res.json()
-    assert data["result"] == "confirmed"
-    assert data["consumer_points"] == 25
-    assert data["producer_points"] == 10
+    tok_p = register(client, "Producer2")
+    register(client, "Consumer2")            # registered, never submits
+    submit(client, tok_p, outcome(), monkeypatch, body=CLINICAL_BODY)
     lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
-    assert lb["Producer"]["interop"] == 10
-    assert lb["Producer"]["score"] == 90       # 80 best submission + 10
-    assert lb["Consumer"]["interop"] == 25
-    assert lb["Consumer"]["score"] == 25       # no submission, interop only
-    assert lb["Consumer"]["passed"] is False
-    matrix = client.get("/api/interop/matrix").json()
-    assert [(m["consumer"], m["producer"]) for m in matrix] == [
-        ("Consumer", "Producer")]
-    assert matrix[0]["ts"]
-    listing = client.get("/api/exchange", headers={"X-Team-Token": tok_c}).json()
-    producer = next(p for p in listing if p["team_slug"] == "producer")
-    assert producer["consumed_by_you"] is True
-
-
-def test_interop_confirm_idempotent(client, monkeypatch):
-    consume_first_pass(client, monkeypatch)
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    assert confirm(client, tok_c).json()["result"] == "confirmed"
-    again = confirm(client, tok_c)
-    assert again.status_code == 200
-    assert again.json()["result"] == "already_confirmed"
-    assert "consumer_points" not in again.json()
-    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
-    assert lb["Consumer"]["interop"] == 25     # not stacked
-    assert lb["Producer"]["interop"] == 10
-    assert len(client.get("/api/interop/matrix").json()) == 1
-
-
-def test_interop_confirm_mismatch_422_and_no_ground_truth_leak(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    res = confirm(client, tok_c, patient_family="Wrong", medications=99)
-    assert res.status_code == 422
-    data = res.json()
-    assert data["result"] == "mismatch"
-    assert sorted(data["fields"]) == ["medications", "patient_family"]
-    # correct values must not be revealed anywhere in the response
-    assert "Schwartz" not in res.text
-    assert "1950" not in res.text
-    assert client.get("/api/interop/matrix").json() == []  # nothing recorded
-    # birth date is an exact string match; family is casefold+strip
-    ok = confirm(client, tok_c, patient_family="  schwartz  ")
-    assert ok.status_code == 200
-    bad = confirm(client, tok_c, birth_date="19/04/1950")
-    assert bad.status_code == 422
-    assert bad.json()["fields"] == ["birth_date"]
-
-
-def test_interop_self_confirm_400(client, monkeypatch):
-    tok_p, _ = interop_setup(client, monkeypatch)
-    assert confirm(client, tok_p).status_code == 400
-
-
-def test_interop_confirm_receipt_field_validation(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    res = client.post("/api/interop/confirm", json={"partner": "producer"},
-                      headers={"X-Team-Token": tok_c})
-    assert res.status_code == 400
-    assert confirm(client, tok_c, medications="2").status_code == 400
-    assert confirm(client, tok_c, allergies=True).status_code == 400
-    assert client.post("/api/interop/confirm", json={},
-                       headers={"X-Team-Token": tok_c}).status_code == 400
-
-
-def test_interop_unknown_partner_and_no_valid_doc(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    assert confirm(client, tok_c, partner="ghost").status_code == 404
-    tok_n = register(client, "NoDoc")
-    submit(client, tok_n, outcome(errors=1), monkeypatch)
-    assert confirm(client, tok_c, partner="nodoc").status_code == 404
-
-
-def test_interop_exchange_id_validation(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    submit(client, tok_p, outcome(errors=1), monkeypatch)  # a failed one too
-    subs = client.get("/api/submissions", params={"team": "producer"}).json()
-    failed_id = next(s["id"] for s in subs if not s["pass"])
-    good_id = next(s["id"] for s in subs if s["pass"])
-    # a failed submission may not be targeted
-    assert confirm(client, tok_c, exchange_id=failed_id).status_code == 400
-    # another team's submission id may not be passed off as the partner's
-    tok_o = register(client, "Other")
-    submit(client, tok_o, outcome(), monkeypatch, body=CLINICAL_BODY)
-    other_id = client.get("/api/submissions", params={"team": "other"}).json()[0]["id"]
-    assert confirm(client, tok_c, exchange_id=other_id).status_code == 400
-    assert confirm(client, tok_c, exchange_id="abc").status_code == 400
-    assert confirm(client, tok_c, exchange_id=999999).status_code == 400
-    res = confirm(client, tok_c, exchange_id=good_id)
-    assert res.status_code == 200
-    assert res.json()["result"] == "confirmed"
-    assert res.json()["exchange_id"] == good_id
-
-
-def test_leaderboard_interop_points_math(client, monkeypatch):
-    consume_first_pass(client, monkeypatch)
-    tok_a = register(client, "Aaa")
-    tok_b = register(client, "Bbb")
-    tok_c = register(client, "Ccc")
-    submit(client, tok_a, outcome(), monkeypatch, body=CLINICAL_BODY)   # 80
-    submit(client, tok_b, outcome(), monkeypatch, body=CLINICAL_BODY)   # 80
-    # Ccc consumes Aaa and Bbb; Bbb consumes Aaa
-    assert confirm(client, tok_c, partner="aaa").json()["result"] == "confirmed"
-    assert confirm(client, tok_c, partner="bbb").json()["result"] == "confirmed"
-    assert confirm(client, tok_b, partner="aaa").json()["result"] == "confirmed"
-    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
-    assert lb["Aaa"]["interop"] == 20          # consumed by two teams x10
-    assert lb["Aaa"]["score"] == 100           # 80 + 20
-    assert lb["Bbb"]["interop"] == 35          # 25 consumed + 10 consumed-by
-    assert lb["Bbb"]["score"] == 115           # 80 + 35
-    assert lb["Ccc"]["interop"] == 50          # consumed two producers x25
-    assert lb["Ccc"]["score"] == 50            # no submission of its own
-    assert len(client.get("/api/interop/matrix").json()) == 3
+    assert "interop" not in lb["Producer2"]
+    assert lb["Producer2"]["score"] == 80    # the submission, and nothing else
+    # a company with no submission has no other way to earn points
+    assert lb["Consumer2"]["score"] == 0
+    assert lb["Consumer2"]["passed"] is False
 
 
 # ---------------------------------------------------------------- misc
@@ -945,7 +820,12 @@ def test_index_has_tabs_and_company_copy(client):
     assert "One registration per company" in text
     assert "Register your company" in text
     assert "<th>Company</th>" in text
-    assert "<th>Interop</th>" in text
+    # interop is unscored, so it has no leaderboard column and no receipt form
+    assert "<th>Interop</th>" not in text
+    assert "Interop testing is not scored." in text
+    for leftover in ("io-form", "io-result", "interop/confirm", "interop/matrix",
+                     "Interop matrix", "io-token"):
+        assert leftover not in text, leftover
     # a team is formed between companies at the event, so no copy may equate
     # the two - a company registers once, and teams are built on top of that
     assert "One team per company" not in text
@@ -1282,48 +1162,6 @@ def test_registration_code_gates_when_set(client, monkeypatch):
     assert res.status_code == 200
 
 
-# ------------------------------------------------------------- interop bounds
-
-def test_interop_points_are_capped(client, monkeypatch):
-    consume_first_pass(client, monkeypatch)
-    tok_c = register(client, "Consumer")
-    for i in range(6):
-        tok_p = register(client, f"Prod{i}")
-        submit(client, tok_p, outcome(), monkeypatch, body=CLINICAL_BODY)
-        res = confirm(client, tok_c, partner=f"prod{i}")
-        assert res.json()["result"] == "confirmed", res.text
-    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
-    # 6 x 25 = 150 uncapped; a team standing up throwaway partners gains nothing
-    # past the cap
-    assert lb["Consumer"]["interop"] == app_module.INTEROP_CAP
-
-
-def test_a_receipt_survives_the_partner_resubmitting(client, monkeypatch):
-    """The consumer read the document correctly; the producer moved it."""
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    original = client.get("/api/submissions", params={"team": "producer"}
-                          ).json()[0]["id"]
-    # a richer bundle, which now becomes the producer's published document
-    submit(client, tok_p, outcome(), monkeypatch,
-           body=bundle(sections=6, resources=10))
-    listing = client.get("/api/exchange", headers={"X-Team-Token": tok_c}).json()
-    assert listing[0]["exchange_id"] != original
-    res = confirm(client, tok_c)          # receipt taken from the original
-    assert res.status_code == 200, res.text
-    assert res.json()["result"] == "confirmed"
-    assert res.json()["exchange_id"] == original
-
-
-def test_a_wrong_receipt_is_still_rejected_after_a_resubmission(client, monkeypatch):
-    tok_p, tok_c = interop_setup(client, monkeypatch)
-    submit(client, tok_p, outcome(), monkeypatch,
-           body=bundle(sections=6, resources=10))
-    res = confirm(client, tok_c, patient_family="Nobody")
-    assert res.status_code == 422
-    assert "patient_family" in res.json()["fields"]
-    assert "Schwartz" not in res.text
-
-
 # --------------------------------------------------------- unreadable document
 
 def test_a_document_that_no_longer_parses_says_so(client, monkeypatch):
@@ -1475,7 +1313,7 @@ def test_health_reports_matchbox_up_and_down(client, monkeypatch):
 # ---------------------------------------------------------------- OpenAPI
 
 def test_openapi_describes_the_bodies_fastapi_cannot_see(client):
-    """Three endpoints read the request body by hand, so FastAPI has no model
+    """Two endpoints read the request body by hand, so FastAPI has no model
     to introspect and would publish them as taking nothing at all."""
     spec = client.get("/openapi.json").json()
     register_body = spec["paths"]["/api/register"]["post"]["requestBody"]
@@ -1483,10 +1321,7 @@ def test_openapi_describes_the_bodies_fastapi_cannot_see(client):
     assert set(props) == {"team", "code"}
     eps_body = spec["paths"]["/api/eps"]["post"]["requestBody"]
     assert "application/fhir+json" in eps_body["content"]
-    receipt = spec["paths"]["/api/interop/confirm"]["post"]["requestBody"]
-    required = receipt["content"]["application/json"]["schema"]["required"]
-    assert required == ["partner", "patient_family", "birth_date",
-                        "medications", "allergies"]
+    assert "/api/interop/confirm" not in spec["paths"]
 
 
 def test_openapi_documents_the_score_headers(client):
@@ -1502,10 +1337,11 @@ def test_openapi_declares_the_team_token_as_a_security_scheme(client):
     spec = client.get("/openapi.json").json()
     scheme = spec["components"]["securitySchemes"]["TeamToken"]
     assert scheme["in"] == "header" and scheme["name"] == "X-Team-Token"
-    # required where a token is required, optional where it only adds context
+    # submitting is the only endpoint that authenticates; the exchange corpus
+    # is open, so it carries no security requirement at all
     assert spec["paths"]["/api/eps"]["post"]["security"] == [{"TeamToken": []}]
-    assert {} in spec["paths"]["/api/exchange"]["get"]["security"]
-    # ...and the raw header parameters are not also listed alongside it
+    assert "security" not in spec["paths"]["/api/exchange"]["get"]
+    # ...and the raw header parameters are not listed anywhere either
     names = [p["name"].lower()
              for p in spec["paths"]["/api/exchange"]["get"].get("parameters", [])]
     assert "x-team-token" not in names and "authorization" not in names

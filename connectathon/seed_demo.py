@@ -9,10 +9,9 @@ event instance.
     .venv/bin/python seed_demo.py [--url http://localhost:8095] [--reset]
 
 The team list below is chosen to cover the states the UI can be in: teams that
-pass, teams that only ever fail, teams that never submit, a team that scores on
-interop alone, a score tie that exercises the ranking tiebreak, and a consumer
-with enough partners to hit the interop cap. Bundles come from ../examples and
-./samples, so no patient data is invented here.
+pass, teams that only ever fail, teams that never submit, and a score tie that
+exercises the ranking tiebreak. Bundles come from ../examples and ./samples, so
+no patient data is invented here.
 """
 
 import argparse
@@ -58,28 +57,8 @@ PLAN = [
     ("Aarhus MedTech", ["broken", "broken"]),
     # Registered, never submitted: every richness column falls back to "-".
     ("Helsinki HealthOS", []),
-    # Also never submits, but consumes partners below - the leaderboard branch
-    # where a team scores on interop alone.
     ("Uppsala Vardsystem", []),
 ]
-
-# consumer -> producers. Karolinska consumes four partners (4 x 25 = 100), which
-# lands on the interop cap; the rest are spread so the matrix has gaps as well
-# as ticks, and so some teams score as producers only.
-INTEROP = {
-    "Karolinska Interop Lab": [
-        "Sahlgrenska Digital",
-        "Rigshospitalet EHR",
-        "Oulu Health Tech",
-        "Reykjavik Care Systems",
-    ],
-    "Sahlgrenska Digital": ["Karolinska Interop Lab", "Rigshospitalet EHR"],
-    "Rigshospitalet EHR": ["Karolinska Interop Lab"],
-    "Tromso Journal AS": ["Sahlgrenska Digital"],
-    "Uppsala Vardsystem": ["Karolinska Interop Lab", "Sahlgrenska Digital"],
-}
-
-MEDICATION_TYPES = {"MedicationStatement", "MedicationRequest", "MedicationAdministration"}
 
 
 def lower(headers):
@@ -107,28 +86,6 @@ def call(url, method="GET", body=None, token=None, ctype="application/json"):
         return status, json.loads(raw), headers
     except ValueError:
         return status, raw, headers
-
-
-def receipt_facts(bundle):
-    """The four facts /api/interop/confirm checks, read the way the server
-    reads them: first Patient wins, medications and allergies are counts."""
-    facts = {"patient_family": None, "birth_date": None, "medications": 0, "allergies": 0}
-    seen_patient = False
-    for entry in bundle.get("entry", []):
-        resource = entry.get("resource") or {}
-        rtype = resource.get("resourceType")
-        if rtype == "Patient" and not seen_patient:
-            seen_patient = True
-            for name in resource.get("name") or []:
-                if name.get("family"):
-                    facts["patient_family"] = name["family"]
-                    break
-            facts["birth_date"] = resource.get("birthDate")
-        elif rtype in MEDICATION_TYPES:
-            facts["medications"] += 1
-        elif rtype == "AllergyIntolerance":
-            facts["allergies"] += 1
-    return facts
 
 
 def main():
@@ -168,7 +125,7 @@ def main():
         with open(path, "rb") as fh:
             bundles[key] = fh.read()
 
-    tokens, slugs = {}, {}
+    tokens = {}
     for name, submissions in PLAN:
         status, body, _ = call(
             base + "/api/register",
@@ -198,42 +155,12 @@ def main():
                   % (key, headers.get("x-pass"), headers.get("x-score"),
                      headers.get("x-sections"), headers.get("x-resources")))
 
-    # Slugs come from the server so this never drifts from its slugify rule.
-    status, published, _ = call(base + "/api/exchange")
-    if status == 200:
-        slugs = {row["team"]: row["team_slug"] for row in published}
-
-    for consumer, producers in INTEROP.items():
-        token = tokens.get(consumer)
-        if not token:
-            continue
-        for producer in producers:
-            slug = slugs.get(producer)
-            if not slug:
-                print("  interop %-26s -> %-26s SKIP (nothing published)"
-                      % (consumer, producer))
-                continue
-            status, doc, _ = call(base + "/api/exchange/" + slug, token=token)
-            if status != 200:
-                print("  interop fetch %s FAILED (%s)" % (slug, status))
-                continue
-            payload = dict(receipt_facts(doc), partner=slug)
-            status, body, _ = call(
-                base + "/api/interop/confirm",
-                "POST",
-                json.dumps(payload).encode(),
-                token,
-            )
-            print("  interop %-26s -> %-26s %s"
-                  % (consumer, producer,
-                     "ok" if status == 200 else "FAILED (%s %s)" % (status, body)))
-
     status, rows, _ = call(base + "/api/leaderboard")
     if status == 200:
-        print("\n%-4s %-26s %-6s %-8s %s" % ("#", "team", "score", "interop", "status"))
+        print("\n%-4s %-26s %-6s %s" % ("#", "team", "score", "status"))
         for row in rows:
-            print("%-4s %-26s %-6s %-8s %s"
-                  % (row["rank"], row["team"], row["score"], row["interop"],
+            print("%-4s %-26s %-6s %s"
+                  % (row["rank"], row["team"], row["score"],
                      "VALID" if row["passed"] else "not yet"))
     print("\nopen %s/ to preview" % base)
     return 0

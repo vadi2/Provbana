@@ -60,10 +60,8 @@ neither collapse into one. Repeating a section or padding the bundle therefore e
 nothing - richness has to be real.
 
 A team's score is its best submission. The first company ever to go valid keeps a one-time
-**+20 first pass** bonus. Interop adds **+25** per partner document the team proved it
-consumed and **+10** per team that consumed the team's own, capped at **+100** together;
-registration is open by design, so the cap is what stops a team farming the track with
-throwaway partners. Set `REGISTER_CODE` if you want registration closed as well.
+**+20 first pass** bonus. Nothing else scores - interop testing is deliberately unscored,
+so there is nothing to farm. Set `REGISTER_CODE` if you want registration closed as well.
 
 ## Swedish base profiles
 
@@ -115,23 +113,17 @@ curl localhost:8095/api/submissions/12/bundle -o submitted.json
 
 ### Exchange / interop
 
-Every team's best passing submission is published as the shared test corpus. Consume a
-partner's document, extract four facts from it, and post a receipt to claim interop points.
+Every team's best passing submission is published as the shared test corpus. Load a
+partner's document into your own system and see what breaks. Nothing here needs a token
+and nothing is scored or recorded - the output of the track is a defect the producer can
+go and fix, reported to them directly.
 
 ```
-# who has published something (add your token to hide yourself and see what you consumed)
+# who has published something
 curl localhost:8095/api/exchange
 # download a partner's document
 curl localhost:8095/api/exchange/TEAM_SLUG -o partner-eps.json
-# prove you parsed it - 422 {"result":"mismatch","fields":[...]} tells you which facts are wrong
-curl -X POST localhost:8095/api/interop/confirm -H 'X-Team-Token: TOKEN' \
-     -H 'Content-Type: application/json' \
-     -d '{"partner":"TEAM_SLUG","patient_family":"Musterfrau","birth_date":"1961-12-24","medications":3,"allergies":1}'
-# who has consumed whose document
-curl localhost:8095/api/interop/matrix
 ```
-
-`exchange_id` may be added to the receipt body to pin a specific submission.
 
 ### Leaderboard
 
