@@ -492,6 +492,115 @@ def test_summarize_bundle_empty_reason_and_unreferenced():
     assert "2026-01-01" in orphan["detail"]
 
 
+def test_item_annotation_category_date_and_coding():
+    s = app_module.summarize_bundle(CLINICAL_BUNDLE)
+    simvastatin = s["sections"][0]["items"][0]
+    assert simvastatin["category"] == "medication"
+    assert simvastatin["flags"] == ["active"]
+    assert simvastatin["code"] is None          # contained Medication, text only
+    assert "not coded" in simvastatin["gaps"]
+    allergy = s["sections"][1]["items"][0]
+    assert allergy["category"] == "allergy"
+    assert allergy["flags"] == ["high risk"]    # criticality high
+    assert "no reaction recorded" not in allergy["gaps"]
+    orphan = s["unreferenced"][0]
+    assert orphan["category"] == "result"
+    assert orphan["date"] == "2026-01-01"
+    assert orphan["gaps"] == ["not coded"]      # code.text only, no coding
+
+
+def test_item_gaps_flag_missing_dose_and_date():
+    bundle = {"resourceType": "Bundle", "entry": [
+        {"fullUrl": "urn:uuid:c",
+         "resource": {"resourceType": "Composition", "title": "T",
+                      "section": [{"title": "Meds",
+                                   "entry": [{"reference": "urn:uuid:m"}]},
+                                  {"title": "Problems",
+                                   "entry": [{"reference": "urn:uuid:p"}]}]}},
+        {"fullUrl": "urn:uuid:m",
+         "resource": {"resourceType": "MedicationStatement", "status": "active",
+                      "medicationCodeableConcept": {
+                          "coding": [{"system": "http://www.whocc.no/atc",
+                                      "code": "C10AA01"}],
+                          "text": "Simvastatin"}}},
+        {"fullUrl": "urn:uuid:p",
+         "resource": {"resourceType": "Condition",
+                      "code": {"text": "Chest pain"}}},
+    ]}
+    s = app_module.summarize_bundle(bundle)
+    med = s["sections"][0]["items"][0]
+    assert med["code_system"] == "ATC" and med["code"] == "C10AA01"
+    assert med["gaps"] == ["no date", "no dose"]
+    problem = s["sections"][1]["items"][0]
+    assert problem["gaps"] == ["not coded", "no date"]
+
+
+def test_observation_abnormal_flag_and_missing_value():
+    bundle = {"resourceType": "Bundle", "entry": [
+        {"fullUrl": "urn:uuid:c",
+         "resource": {"resourceType": "Composition", "title": "T",
+                      "section": [{"title": "Results",
+                                   "entry": [{"reference": "urn:uuid:o1"},
+                                             {"reference": "urn:uuid:o2"}]}]}},
+        {"fullUrl": "urn:uuid:o1",
+         "resource": {"resourceType": "Observation", "status": "final",
+                      "code": {"coding": [{"system": "http://loinc.org",
+                                           "code": "718-7"}], "text": "Hb"},
+                      "effectiveDateTime": "2025-01-02",
+                      "valueQuantity": {"value": 9, "unit": "g/dL"},
+                      "interpretation": [{"coding": [{"code": "L"}]}]}},
+        {"fullUrl": "urn:uuid:o2",
+         "resource": {"resourceType": "Observation", "status": "final",
+                      "code": {"text": "Mood"}}},
+    ]}
+    s = app_module.summarize_bundle(bundle)
+    hb, mood = s["sections"][0]["items"]
+    assert hb["flags"] == ["abnormal"] and hb["code_system"] == "LOINC"
+    assert hb["gaps"] == []
+    assert set(mood["gaps"]) == {"not coded", "no date", "no value"}
+
+
+def test_summary_quality_block():
+    q = app_module.summarize_bundle(CLINICAL_BUNDLE)["quality"]
+    assert q["items"] == 4                  # 2 meds + 1 allergy + 1 orphan
+    assert q["sections_populated"] == 2 and q["sections_empty"] == 1
+    assert q["categories"] == {"medication": 2, "allergy": 1, "result": 1}
+    assert q["earliest"] == "2026-01-01" and q["latest"] == "2026-01-01"
+    assert q["gaps"]["no dose"] == 1         # ms2 has no dosage
+    # gap counts are ordered by frequency, so the UI can show the worst first
+    assert list(q["gaps"].values()) == sorted(q["gaps"].values(), reverse=True)
+
+
+def test_section_kind_from_loinc_code():
+    kind = app_module._section_kind
+    assert kind({"code": {"coding": [{"system": "http://loinc.org",
+                                      "code": "48765-2"}]}}, "Allergien") == "allergy"
+    assert kind({"code": {"coding": [{"code": "10160-0"}]}}, "Medikationsliste") \
+        == "medication"
+    assert kind({}, "Untitled section") == "other"
+
+
+def test_section_kind_falls_back_to_title_in_any_language():
+    # EPS documents are written in the local language, so an uncoded German
+    # section still has to reach the right clinician view.
+    kind = app_module._section_kind
+    assert kind({}, "Medikationsliste") == "medication"
+    assert kind({}, "Allergien und Intoleranzen") == "allergy"
+    assert kind({}, "Gesundheitsprobleme und Risiken") == "problem"
+    assert kind({}, "Implantate, medizinische Ger\u00e4te") == "device"
+
+
+def test_sections_expose_kind():
+    kinds = [s["kind"] for s in
+             app_module.summarize_bundle(CLINICAL_BUNDLE)["sections"]]
+    assert "medication" in kinds and "allergy" in kinds
+
+
+def test_summary_quality_empty_for_malformed():
+    q = app_module.summarize_bundle(None)["quality"]
+    assert q["items"] == 0 and q["gaps"] == {} and q["earliest"] is None
+
+
 def test_summarize_bundle_malformed_never_raises():
     sb = app_module.summarize_bundle
     for garbage in (
@@ -506,7 +615,8 @@ def test_summarize_bundle_malformed_never_raises():
     ):
         result = sb(garbage)
         assert isinstance(result, dict)
-        assert set(result) == {"patient", "composition", "sections", "unreferenced"}
+        assert set(result) == {"patient", "composition", "sections",
+                               "unreferenced", "quality"}
 
 
 # ---------------------------------------------------------------- submissions API
@@ -759,6 +869,16 @@ def test_index_has_tabs_and_company_copy(client):
     assert "Register your company" in text
     assert "<th>Company</th>" in text
     assert "<th>Interop</th>" in text
+
+
+def test_index_offers_three_clinician_visualisations(client):
+    text = client.get("/").text
+    for mode in ("compare", "narrative", "timeline", "dashboard", "document"):
+        assert 'data-mode="%s"' % mode in text
+    for fn in ("function viewNarrative(", "function viewTimeline(",
+               "function viewDashboard(", "function viewDocument("):
+        assert fn in text
+    assert "cmp-grid" in text
 
 
 def test_register_returns_company_note(client):

@@ -375,6 +375,275 @@ def _humanize_type(rtype: str) -> str:
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", rtype)
 
 
+# Code systems a clinician recognises by name; anything else falls back to the
+# system's host so provenance is still visible.
+CODE_SYSTEM_LABELS = {
+    "http://snomed.info/sct": "SNOMED CT",
+    "http://loinc.org": "LOINC",
+    "http://www.whocc.no/atc": "ATC",
+    "http://hl7.org/fhir/sid/icd-10": "ICD-10",
+    "http://hl7.org/fhir/sid/icd-10-cm": "ICD-10-CM",
+    "http://hl7.org/fhir/sid/icd-11": "ICD-11",
+    "http://www.nlm.nih.gov/research/umls/rxnorm": "RxNorm",
+    "http://hl7.org/fhir/sid/ndc": "NDC",
+    "http://unitsofmeasure.org": "UCUM",
+    "http://hl7.org/fhir/sid/cvx": "CVX",
+    "http://ec.europa.eu/tools/mdr": "EU MDR",
+}
+
+# Clinical grouping shared by every clinician view.
+ITEM_CATEGORIES = {
+    "AllergyIntolerance": "allergy",
+    "Condition": "problem",
+    "MedicationStatement": "medication",
+    "MedicationRequest": "medication",
+    "MedicationDispense": "medication",
+    "Observation": "result",
+    "Procedure": "procedure",
+    "Immunization": "immunization",
+    "CarePlan": "plan",
+    "Device": "device",
+    "DeviceUseStatement": "device",
+}
+
+# Categories where a missing date makes the item clinically hard to use. An
+# allergy without an onset is normal; a lab result without one is not.
+DATE_EXPECTED = ("problem", "procedure", "immunization", "result", "medication")
+
+# v3-ObservationInterpretation codes that mean "look at this".
+ABNORMAL_INTERPRETATIONS = {
+    "A", "AA", "H", "HH", "HU", "L", "LL", "LU", "POS", "R", "RR", "W",
+}
+
+EVENT_DATE_FIELDS = {
+    "Condition": ("onsetDateTime", "onsetPeriod", "recordedDate"),
+    "AllergyIntolerance": ("onsetDateTime", "recordedDate"),
+    "Procedure": ("performedDateTime", "performedPeriod"),
+    "Immunization": ("occurrenceDateTime", "recorded"),
+    "Observation": ("effectiveDateTime", "effectivePeriod", "issued"),
+    "MedicationStatement": ("effectiveDateTime", "effectivePeriod", "dateAsserted"),
+    "MedicationRequest": ("authoredOn",),
+    "MedicationDispense": ("whenHandedOver", "whenPrepared"),
+    "CarePlan": ("period", "created"),
+    "DeviceUseStatement": ("timingDateTime", "timingPeriod", "recordedOn"),
+}
+DEFAULT_DATE_FIELDS = ("date", "effectiveDateTime", "recordedDate")
+
+
+def _code_system_label(system) -> str | None:
+    if not isinstance(system, str) or not system.strip():
+        return None
+    system = system.strip()
+    known = CODE_SYSTEM_LABELS.get(system.rstrip("/"))
+    if known:
+        return known
+    if system.startswith("urn:oid:"):
+        return "OID " + system[len("urn:oid:") :]
+    return urllib.parse.urlparse(system).netloc or system
+
+
+def _concept_coding(cc) -> tuple[str | None, str | None]:
+    """(system label, code) of the first usable coding in a CodeableConcept."""
+    if not isinstance(cc, dict) or not isinstance(cc.get("coding"), list):
+        return (None, None)
+    for coding in cc["coding"]:
+        if not isinstance(coding, dict):
+            continue
+        code = coding.get("code")
+        if isinstance(code, str) and code.strip():
+            return (_code_system_label(coding.get("system")), code.strip())
+    return (None, None)
+
+
+def _primary_concept(resource, rtype, by_ref):
+    """The CodeableConcept that carries the resource's clinical meaning."""
+    if rtype in MEDICATION_TYPES:
+        cc = resource.get("medicationCodeableConcept")
+        if isinstance(cc, dict):
+            return cc
+        ref = resource.get("medicationReference")
+        target = None
+        if isinstance(ref, dict):
+            raw = ref.get("reference")
+            if isinstance(raw, str) and raw.startswith("#"):
+                target = _contained_resource(resource, raw[1:])
+            else:
+                target = _resolve_reference(raw, by_ref)
+        return target.get("code") if isinstance(target, dict) else None
+    if rtype == "Immunization":
+        return resource.get("vaccineCode")
+    if rtype == "Device":
+        return resource.get("type")
+    if rtype == "DeviceUseStatement":
+        ref = resource.get("device")
+        if isinstance(ref, dict):
+            raw = ref.get("reference")
+            target = (
+                _contained_resource(resource, raw[1:])
+                if isinstance(raw, str) and raw.startswith("#")
+                else _resolve_reference(raw, by_ref)
+            )
+            if isinstance(target, dict):
+                return target.get("type")
+        return None
+    if rtype == "CarePlan":
+        categories = resource.get("category")
+        if isinstance(categories, list) and categories:
+            return categories[0]
+        return None
+    return resource.get("code")
+
+
+def _event_date(resource, rtype) -> str | None:
+    """Sortable ISO date for the item, taking a period's start."""
+    for key in EVENT_DATE_FIELDS.get(rtype, DEFAULT_DATE_FIELDS):
+        val = resource.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+        if isinstance(val, dict):
+            start = val.get("start")
+            if isinstance(start, str) and start.strip():
+                return start.strip()
+    return None
+
+
+def _observation_abnormal(resource) -> bool:
+    interpretations = resource.get("interpretation")
+    if not isinstance(interpretations, list):
+        return False
+    for cc in interpretations:
+        code = _concept_coding(cc)[1]
+        if isinstance(code, str) and code.upper() in ABNORMAL_INTERPRETATIONS:
+            return True
+        text = _cc_display(cc)
+        if isinstance(text, str) and text.strip().lower() in (
+            "abnormal", "high", "low", "critical", "positive",
+        ):
+            return True
+    return False
+
+
+def _annotate_item(item, resource, rtype, by_ref) -> None:
+    """Add what the clinician views need beyond label/detail/status: clinical
+    category, sortable date, coding provenance, salience flags, and the
+    missing-information gaps that decide whether the item is actually usable."""
+    category = ITEM_CATEGORIES.get(rtype, "other")
+    system, code = _concept_coding(_primary_concept(resource, rtype, by_ref))
+    date = _event_date(resource, rtype)
+    status = (item.get("status") or "").strip().lower()
+    flags: list = []
+    gaps: list = []
+    if not code:
+        gaps.append("not coded")
+    if not date and category in DATE_EXPECTED:
+        gaps.append("no date")
+    if category == "allergy":
+        criticality = _first_str(resource, "criticality")
+        if criticality == "high":
+            flags.append("high risk")
+        elif not criticality:
+            gaps.append("no criticality")
+        reactions = resource.get("reaction")
+        if not isinstance(reactions, list) or not reactions:
+            gaps.append("no reaction recorded")
+    elif category == "medication":
+        if not _dosage_detail(resource):
+            gaps.append("no dose")
+        if status == "active":
+            flags.append("active")
+    elif category == "problem":
+        if status == "active":
+            flags.append("active")
+        severity = _cc_display(resource.get("severity"))
+        if isinstance(severity, str) and severity.strip().lower() == "severe":
+            flags.append("severe")
+    elif category == "result":
+        if _observation_value(resource) is None:
+            gaps.append("no value")
+        if _observation_abnormal(resource):
+            flags.append("abnormal")
+    item["category"] = category
+    item["date"] = date
+    item["code"] = code
+    item["code_system"] = system
+    item["flags"] = flags
+    item["gaps"] = gaps
+
+
+def _summary_quality(summary) -> dict:
+    """Document-level answer to "can a clinician trust and use this?"."""
+    items = [i for sec in summary["sections"] for i in sec["items"]]
+    items += summary["unreferenced"]
+    gap_counts: dict = {}
+    categories: dict = {}
+    dates = []
+    for item in items:
+        for gap in item.get("gaps") or []:
+            gap_counts[gap] = gap_counts.get(gap, 0) + 1
+        category = item.get("category") or "other"
+        categories[category] = categories.get(category, 0) + 1
+        if item.get("date"):
+            dates.append(item["date"])
+    populated = sum(1 for sec in summary["sections"] if sec["items"])
+    return {
+        "items": len(items),
+        "coded": sum(1 for i in items if i.get("code")),
+        "dated": len(dates),
+        "with_gaps": sum(1 for i in items if i.get("gaps")),
+        "gaps": dict(sorted(gap_counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "categories": categories,
+        "sections_populated": populated,
+        "sections_empty": len(summary["sections"]) - populated,
+        "earliest": min(dates) if dates else None,
+        "latest": max(dates) if dates else None,
+    }
+
+
+# IPS/EPS section identity. The LOINC code is the reliable signal - EPS documents
+# are written in the local language, so titles alone cannot be matched.
+SECTION_LOINC_KINDS = {
+    "48765-2": "allergy",
+    "10160-0": "medication",
+    "11450-4": "problem",
+    "11348-0": "problem",
+    "47519-4": "procedure",
+    "30954-2": "result",
+    "8716-3": "result",
+    "11369-6": "immunization",
+    "46264-8": "device",
+    "18776-5": "plan",
+    "42348-3": "plan",
+}
+
+SECTION_TITLE_KINDS = (
+    ("allergy", "allerg|intoleran"),
+    ("medication", "medicat|medikat|medicin|pharma"),
+    ("problem", "problem|condition|diagnos|krankheit"),
+    ("procedure", "procedur|eingriff|therapien"),
+    ("immunization", "immunis|immuniz|vaccin|impf"),
+    ("device", "device|implantat|ger.te|hilfsmittel"),
+    ("result", "result|befund|labor|ergebnis"),
+    ("plan", "plan of care|care plan|behandlungsplan"),
+)
+
+
+def _section_kind(section: dict, title: str) -> str:
+    """What clinical section this is, independent of its language."""
+    code = section.get("code")
+    if isinstance(code, dict):
+        for coding in code.get("coding") or []:
+            if not isinstance(coding, dict):
+                continue
+            kind = SECTION_LOINC_KINDS.get(str(coding.get("code") or ""))
+            if kind:
+                return kind
+    lowered = (title or "").lower()
+    for kind, pattern in SECTION_TITLE_KINDS:
+        if re.search(pattern, lowered):
+            return kind
+    return "other"
+
+
 def _render_resource(resource, by_ref) -> dict:
     """One clinical resource as a reader-friendly {label, detail, status}."""
     rtype = resource.get("resourceType")
@@ -463,7 +732,9 @@ def _render_resource(resource, by_ref) -> dict:
             label, detail = display, _humanize_type(rtype)
         else:
             label = _humanize_type(rtype)
-    return {"label": label, "detail": detail, "status": status}
+    item = {"label": label, "detail": detail, "status": status}
+    _annotate_item(item, resource, rtype, by_ref)
+    return item
 
 
 def _patient_summary(patient) -> dict:
@@ -539,6 +810,7 @@ def summarize_bundle(bundle) -> dict:
         "composition": None,
         "sections": [],
         "unreferenced": [],
+        "quality": _summary_quality({"sections": [], "unreferenced": []}),
     }
     if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
         return summary
@@ -590,7 +862,12 @@ def summarize_bundle(bundle) -> dict:
                             empty_reason, empty_reason
                         )
                 summary["sections"].append(
-                    {"title": title, "items": items, "empty_reason": empty_reason}
+                    {
+                        "title": title,
+                        "kind": _section_kind(section, title),
+                        "items": items,
+                        "empty_reason": empty_reason,
+                    }
                 )
         # Everything reachable from the Composition (section entries, authors,
         # and transitively from referenced resources) counts as referenced.
@@ -612,6 +889,7 @@ def summarize_bundle(bundle) -> dict:
         if id(resource) in reachable:
             continue
         summary["unreferenced"].append(_render_resource(resource, by_ref))
+    summary["quality"] = _summary_quality(summary)
     return summary
 
 
@@ -1425,6 +1703,100 @@ h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
   margin: 0 0 14px; font-weight: 600; }
 tr.cv-row { cursor: pointer; }
 tr.cv-row:hover td { background: var(--accent-soft); }
+/* clinician view modes */
+.cv-modes { display: flex; gap: 6px; flex-wrap: wrap; margin: 14px 0 0; }
+.cv-mode { background: transparent; color: var(--muted); border: 1px solid var(--border);
+  border-radius: 999px; padding: 5px 13px; font-size: 0.82rem; font-weight: 600;
+  cursor: pointer; }
+.cv-mode:hover { color: var(--accent); filter: none; }
+.cv-mode.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.cv-hint { margin: 8px 0 0; font-size: 0.8rem; }
+.chip.cvc { margin-left: 5px; text-transform: none; letter-spacing: 0; }
+.chip.risk { color: var(--fail); background: var(--fail-bg); }
+.chip.warn { color: var(--warn); background: var(--warn-bg); }
+.chip.ok { color: var(--pass); background: var(--pass-bg); }
+.chip.gap { color: var(--muted); background: var(--code-bg); border: 1px solid var(--border); }
+/* category colours, shared by timeline dots and legend */
+.c-allergy { --cat: #d64545; }
+.c-problem { --cat: #c77d11; }
+.c-medication { --cat: #3f7fd6; }
+.c-result { --cat: #1f9d6b; }
+.c-procedure { --cat: #8a5cd6; }
+.c-immunization { --cat: #12a3a3; }
+.c-device { --cat: #a05a2c; }
+.c-plan { --cat: #6e7685; }
+.c-other { --cat: #8b93a1; }
+.cdot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+  background: var(--cat, var(--accent)); margin-right: 5px; vertical-align: middle; }
+/* A - narrative */
+.nv { max-width: 64ch; }
+.nv p { margin: 0 0 12px; font-size: 0.98rem; line-height: 1.62; }
+.nv p.lede { font-size: 1.14rem; font-weight: 600; line-height: 1.45; margin-bottom: 14px; }
+.nv .nv-risk { color: var(--fail); font-weight: 700; }
+.nv .nv-key { background: var(--accent-soft); border-radius: 4px; padding: 0 3px; font-weight: 600; }
+.nv h4 { margin: 20px 0 6px; font-size: 0.74rem; text-transform: uppercase;
+  letter-spacing: 0.07em; color: var(--muted); }
+.nv ul.nv-unknown { margin: 0; padding-left: 20px; font-size: 0.88rem; color: var(--muted); }
+.nv ul.nv-unknown li { margin: 3px 0; }
+/* B - timeline */
+.tl-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.78rem;
+  color: var(--muted); margin-top: 10px; }
+.tl { position: relative; margin: 10px 0 0; padding-left: 22px; }
+.tl::before { content: ""; position: absolute; left: 5px; top: 6px; bottom: 6px;
+  width: 2px; background: var(--border); }
+.tl-year { position: relative; font-weight: 700; font-size: 0.9rem; margin: 16px 0 4px;
+  font-variant-numeric: tabular-nums; }
+.tl-year::before { content: ""; position: absolute; left: -21px; top: 5px;
+  width: 12px; height: 12px; border-radius: 50%; background: var(--muted);
+  border: 2px solid var(--card); }
+.tl-row { position: relative; padding: 7px 0; border-bottom: 1px solid var(--border); }
+.tl-row:last-child { border-bottom: none; }
+.tl-row::before { content: ""; position: absolute; left: -20px; top: 13px;
+  width: 10px; height: 10px; border-radius: 50%; background: var(--cat, var(--accent));
+  border: 2px solid var(--card); }
+.tl-date { font-size: 0.74rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+.tl-label { font-weight: 600; }
+.tl-detail { font-size: 0.83rem; color: var(--muted); }
+.tl-undated { border: 1px dashed var(--warn); border-radius: 10px; padding: 10px 14px;
+  margin-top: 18px; background: var(--warn-bg); }
+/* C - dashboard */
+.db-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 12px; margin-top: 12px; }
+.db-card { border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
+  background: var(--bg); }
+.db-card.alert { border-color: var(--fail); background: var(--fail-bg); }
+.db-card.good { border-color: var(--pass); }
+.db-card h4 { margin: 0 0 8px; font-size: 0.72rem; text-transform: uppercase;
+  letter-spacing: 0.07em; color: var(--muted); }
+.db-big { font-size: 1.55rem; font-weight: 700; line-height: 1.15; }
+.db-sub { font-size: 0.8rem; color: var(--muted); }
+.db-list { list-style: none; margin: 6px 0 0; padding: 0; font-size: 0.87rem; }
+.db-list li { padding: 4px 0; border-bottom: 1px solid var(--border); }
+.db-list li:last-child { border-bottom: none; }
+.db-more { font-size: 0.76rem; color: var(--muted); margin-top: 5px; }
+.mt { margin-top: 9px; }
+.mt-top { display: flex; justify-content: space-between; font-size: 0.78rem;
+  font-weight: 600; }
+.meter { height: 7px; border-radius: 999px; background: var(--border);
+  overflow: hidden; margin: 4px 0 0; }
+.meter > span { display: block; height: 100%; background: var(--pass); }
+.meter.mid > span { background: var(--warn); }
+.meter.low > span { background: var(--fail); }
+/* side-by-side compare */
+.cmp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px; margin-top: 14px; }
+@media (max-width: 1150px) { .cmp-grid { grid-template-columns: 1fr; } }
+.cmp-col { border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  min-width: 0; }
+.cmp-col > h3 { margin: 0; font-size: 0.95rem; }
+.cmp-col > p.cmp-why { margin: 2px 0 10px; font-size: 0.78rem; color: var(--muted);
+  line-height: 1.45; }
+.cmp-body { max-height: 68vh; overflow-y: auto; padding-right: 4px; }
+.cmp-col .db-grid { grid-template-columns: 1fr; }
+.cmp-col .nv { max-width: none; }
+.cmp-col .nv p { font-size: 0.9rem; }
+.cmp-col .nv p.lede { font-size: 1rem; }
+body.cmp-wide main, body.cmp-wide header { max-width: 1560px; }
 /* interop */
 ol.steps { margin: 8px 0 14px; padding-left: 22px; }
 ol.steps li { margin: 6px 0; }
@@ -1572,6 +1944,16 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   patient summaries - what a clinician would actually see.</p>
   <label for="cv-team">Company</label>
   <select id="cv-team"><option value="">Select a company...</option></select>
+  <div class="cv-modes" id="cv-modes">
+    <button class="cv-mode active" data-mode="compare">Compare all 3</button>
+    <button class="cv-mode" data-mode="narrative">A &middot; Narrative note</button>
+    <button class="cv-mode" data-mode="timeline">B &middot; Timeline</button>
+    <button class="cv-mode" data-mode="dashboard">C &middot; Safety dashboard</button>
+    <button class="cv-mode" data-mode="document">Document</button>
+  </div>
+  <p class="muted cv-hint">Three candidate renderings of the same EPS data, so a
+  clinician can judge whether what the profile captures is clinically usable.
+  <em>Document</em> is the plain section-by-section rendering for reference.</p>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
 
@@ -1912,6 +2294,8 @@ $("#curl-leaderboard").textContent =
 
 /* ---- clinician view ---- */
 let cvSubs = [];
+let cvCurrent = null;
+let cvMode = "compare";
 
 async function initClinician() {
   try {
@@ -1975,33 +2359,438 @@ function cvItemHtml(item) {
   return "<li>"
     + '<span class="cv-label">' + esc(item.label || "Unnamed item") + "</span>"
     + (item.status ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
+    + cvChips(item)
     + (item.detail ? '<div class="cv-detail muted">' + esc(item.detail) + "</div>" : "")
     + "</li>";
 }
 
-function renderClinicianDoc(d) {
+/* ---- shared helpers for the clinician renderings ---- */
+const CAT_LABEL = { allergy: "Allergy", problem: "Problem", medication: "Medicine",
+  result: "Result", procedure: "Procedure", immunization: "Vaccination",
+  plan: "Care plan", device: "Device", other: "Other" };
+const CAT_ORDER = ["allergy", "problem", "medication", "result", "procedure",
+  "immunization", "device", "plan", "other"];
+const RISK_FLAGS = ["high risk", "severe", "abnormal"];
+
+function cvItems(s) {
+  const out = [];
+  (s.sections || []).forEach((sec) => (sec.items || []).forEach((it) =>
+    out.push(Object.assign({ section: sec.title || "Untitled section" }, it))));
+  (s.unreferenced || []).forEach((it) =>
+    out.push(Object.assign({ section: null, orphan: true }, it)));
+  return out;
+}
+const cvCat = (items, cat) => items.filter((i) => i.category === cat);
+const hasFlag = (it, f) => (it.flags || []).indexOf(f) !== -1;
+const hasGap = (it, g) => (it.gaps || []).indexOf(g) !== -1;
+const countGap = (arr, g) => arr.filter((i) => hasGap(i, g)).length;
+const plural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"));
+const pctOf = (n, d) => (d ? Math.round((n / d) * 100) : 0);
+const shortDate = (dt) => String(dt || "").slice(0, 10);
+const names = (arr, n) => arr.slice(0, n).map((i) => esc(i.label || "unnamed")).join(", ");
+
+function cvChips(i) {
+  let h = "";
+  (i.flags || []).forEach((f) => {
+    const kind = RISK_FLAGS.indexOf(f) !== -1 ? "risk" : (f === "active" ? "ok" : "warn");
+    h += '<span class="chip cvc ' + kind + '">' + esc(f) + "</span>";
+  });
+  (i.gaps || []).forEach((g) => {
+    h += '<span class="chip cvc gap">' + esc(g) + "</span>";
+  });
+  return h;
+}
+
+function cvAge(birth, on) {
+  if (!birth) return null;
+  const b = new Date(shortDate(birth));
+  const ref = on ? new Date(shortDate(on)) : new Date();
+  if (isNaN(b.getTime()) || isNaN(ref.getTime())) return null;
+  let a = ref.getFullYear() - b.getFullYear();
+  const m = ref.getMonth() - b.getMonth();
+  if (m < 0 || (m === 0 && ref.getDate() < b.getDate())) a--;
+  return a >= 0 && a < 130 ? a : null;
+}
+
+function monthsSince(from, to) {
+  const a = new Date(shortDate(from));
+  const b = to ? new Date(shortDate(to)) : new Date();
+  if (isNaN(a.getTime()) || isNaN(b.getTime())) return null;
+  return Math.round((b - a) / (30.44 * 24 * 3600 * 1000));
+}
+
+function sectionFor(sections, kind) {
+  return (sections || []).find((x) => x.kind === kind) || null;
+}
+const agree = (n, sing, plur) => n + " " + (n === 1 ? sing : plur);
+
+/* ---- A: narrative handover note ---- */
+function viewNarrative(d) {
   const s = d.summary || {};
-  const comp = s.composition || {};
-  let html = "";
-  if (!d.pass) {
-    html += '<div class="warn-banner">Invalid submission - this document failed'
-      + " validation and would be rejected in production. Content shown as-is.</div>";
+  const q = s.quality || {};
+  const p = s.patient;
+  const sections = s.sections || [];
+  const docDate = (s.composition || {}).date;
+  const items = cvItems(s);
+  const allergies = cvCat(items, "allergy");
+  const problems = cvCat(items, "problem");
+  const meds = cvCat(items, "medication");
+  const results = cvCat(items, "result");
+  const shots = cvCat(items, "immunization");
+  const procs = cvCat(items, "procedure");
+  const devices = cvCat(items, "device");
+  let h = '<div class="nv">';
+
+  const age = p ? cvAge(p.birth_date, docDate) : null;
+  if (p && p.name) {
+    const bits = [];
+    if (age !== null) bits.push(age + "-year-old");
+    if (p.gender) bits.push(esc(p.gender));
+    h += '<p class="lede">' + esc(p.name)
+      + (bits.length ? ", " + bits.join(" ") : "") + "."
+      + (p.birth_date ? ' <span class="muted">Born ' + esc(shortDate(p.birth_date))
+          + ".</span>" : "")
+      + "</p>";
+  } else {
+    h += '<p class="lede nv-risk">This document does not name the patient.</p>';
   }
-  html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
-  html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
-    + " · submitted " + new Date(d.ts).toLocaleString()
-    + (comp.date ? " · document date " + esc(comp.date) : "") + "</p>";
+
+  if (allergies.length) {
+    const high = allergies.filter((a) => hasFlag(a, "high risk"));
+    h += "<p>";
+    if (high.length) {
+      h += '<span class="nv-risk">'
+        + plural(high.length, "high-risk allergy", "high-risk allergies") + ":</span> "
+        + names(high, 4) + ". ";
+    }
+    h += "The summary records "
+      + plural(allergies.length, "allergy or intolerance", "allergies or intolerances")
+      + ": " + names(allergies, 6)
+      + (allergies.length > 6 ? " and " + (allergies.length - 6) + " more" : "") + ".";
+    const noCrit = countGap(allergies, "no criticality");
+    const noReac = countGap(allergies, "no reaction recorded");
+    const missing = [];
+    if (noCrit) missing.push(agree(noCrit, "carries", "carry")
+      + " no criticality rating");
+    if (noReac) missing.push(agree(noReac, "does not", "do not")
+      + " describe the reaction");
+    if (missing.length) {
+      h += ' <span class="muted">But ' + missing.join(", and ")
+        + ", so the danger cannot be judged from this document alone.</span>";
+    }
+    h += "</p>";
+  } else {
+    const sec = sectionFor(sections, "allergy");
+    if (sec && sec.empty_reason) {
+      h += '<p>Allergies: <span class="nv-key">' + esc(sec.empty_reason)
+        + "</span>. The author asserted this positively, so the blank is a clinical"
+        + " statement rather than missing data.</p>";
+    } else {
+      h += '<p><span class="nv-risk">No allergy information at all.</span> The document'
+        + " neither lists an allergy nor states that none is known, so nothing may be"
+        + " assumed before prescribing.</p>";
+    }
+  }
+
+  if (problems.length) {
+    const active = problems.filter((x) => hasFlag(x, "active"));
+    const shown = active.length ? active : problems;
+    h += "<p>" + (active.length
+      ? plural(active.length, "active problem") + " of " + problems.length + " recorded"
+      : plural(problems.length, "problem") + " recorded, none marked active")
+      + ": " + names(shown, 6)
+      + (shown.length > 6 ? " and " + (shown.length - 6) + " more" : "") + ".";
+    const severe = problems.filter((x) => hasFlag(x, "severe")).length;
+    if (severe) h += ' <span class="nv-risk">' + severe + " marked severe.</span>";
+    const undated = problems.filter((x) => !x.date).length;
+    if (undated) {
+      h += ' <span class="muted">' + agree(undated, "carries", "carry")
+        + " no onset date, so the course of the illness cannot be read.</span>";
+    }
+    h += "</p>";
+  } else {
+    const sec = sectionFor(sections, "problem");
+    h += "<p>No problems or diagnoses are listed"
+      + (sec && sec.empty_reason ? ' - stated as <span class="nv-key">'
+          + esc(sec.empty_reason) + "</span>" : "") + ".</p>";
+  }
+
+  if (meds.length) {
+    const noDose = countGap(meds, "no dose");
+    h += "<p>" + plural(meds.length, "medicine") + " listed: " + names(meds, 6)
+      + (meds.length > 6 ? " and " + (meds.length - 6) + " more" : "") + ".";
+    h += noDose
+      ? ' <span class="nv-risk">' + agree(noDose, "carries", "carry")
+        + " no dose or frequency</span>, which is not enough to safely continue"
+        + " treatment."
+      : " Every entry carries a dose.";
+    h += "</p>";
+  } else {
+    const sec = sectionFor(sections, "medication");
+    h += "<p>No medication is listed"
+      + (sec && sec.empty_reason ? ' - stated as <span class="nv-key">'
+          + esc(sec.empty_reason) + "</span>" : "") + ".</p>";
+  }
+
+  const also = [];
+  if (results.length) {
+    const abn = results.filter((r) => hasFlag(r, "abnormal")).length;
+    const noVal = countGap(results, "no value");
+    also.push(plural(results.length, "result")
+      + (abn ? ", " + abn + " flagged abnormal" : "")
+      + (noVal ? ", " + noVal + " with no value recorded" : ""));
+  }
+  if (shots.length) also.push(plural(shots.length, "vaccination"));
+  if (procs.length) also.push(plural(procs.length, "procedure"));
+  if (devices.length) also.push(plural(devices.length, "device"));
+  if (also.length) h += "<p>Also present: " + also.join("; ") + ".</p>";
+
+  if (q.latest) {
+    const m = monthsSince(q.latest, docDate);
+    h += "<p>The newest dated entry is " + esc(shortDate(q.latest));
+    h += (m !== null && m > 18)
+      ? ', <span class="nv-risk">' + Math.round(m / 12)
+        + " years before the document date</span>, so this summary may not describe"
+        + " the patient's current state."
+      : ".";
+    if (q.earliest && q.earliest !== q.latest) {
+      h += " History reaches back to " + esc(shortDate(q.earliest)) + ".";
+    }
+    h += "</p>";
+  } else {
+    h += '<p><span class="nv-risk">Nothing in this document carries a date</span>,'
+      + " so none of it can be placed in the patient's history.</p>";
+  }
+
+  const empty = sections.filter((x) => !(x.items || []).length);
+  const asserted = empty.filter((x) => x.empty_reason);
+  if (asserted.length) {
+    h += "<h4>Positively asserted as empty</h4>";
+    h += '<ul class="nv-unknown">' + asserted.map((x) => "<li>"
+      + esc(x.title || "A section") + " - " + esc(x.empty_reason)
+      + "</li>").join("") + "</ul>";
+  }
+  h += "<h4>What a clinician still cannot tell</h4>";
+  const unknown = [];
+  empty.filter((x) => !x.empty_reason).forEach((x) => {
+    unknown.push(esc(x.title || "A section")
+      + " is empty and no reason is given, so it is unclear whether nothing exists"
+      + " or nothing was sent");
+  });
+  Object.keys(q.gaps || {}).forEach((g) => {
+    unknown.push(plural(q.gaps[g], "entry", "entries") + " with " + esc(g));
+  });
+  if ((s.unreferenced || []).length) {
+    unknown.push(plural(s.unreferenced.length, "resource")
+      + " present in the bundle but not referenced by any section");
+  }
+  if (!unknown.length) {
+    unknown.push("Nothing obvious - every entry is coded, dated and complete.");
+  }
+  h += '<ul class="nv-unknown"><li>' + unknown.join("</li><li>") + "</li></ul>";
+  return h + "</div>";
+}
+
+/* ---- B: clinical timeline ---- */
+function viewTimeline(d) {
+  const s = d.summary || {};
+  const q = s.quality || {};
+  const items = cvItems(s);
+  const dated = items.filter((i) => i.date)
+    .sort((a, b) => (a.date < b.date ? 1 : (a.date > b.date ? -1 : 0)));
+  const undated = items.filter((i) => !i.date);
+  const cats = CAT_ORDER.filter((c) => items.some((i) => i.category === c));
+  let h = '<div class="tl-legend">' + cats.map((c) =>
+    '<span class="c-' + esc(c) + '"><i class="cdot"></i>' + esc(CAT_LABEL[c] || c)
+    + " (" + cvCat(items, c).length + ")</span>").join("") + "</div>";
+  h += '<p class="muted" style="margin:8px 0 0">'
+    + plural(dated.length, "dated entry", "dated entries")
+    + (q.earliest && q.latest
+        ? ", " + esc(shortDate(q.earliest)) + " to " + esc(shortDate(q.latest)) : "")
+    + (undated.length ? " &middot; " + undated.length + " undated" : "") + "</p>";
+
+  if (dated.length) {
+    let year = null;
+    h += '<div class="tl">';
+    dated.forEach((i) => {
+      const y = String(i.date).slice(0, 4);
+      if (y !== year) { year = y; h += '<div class="tl-year">' + esc(y) + "</div>"; }
+      h += '<div class="tl-row c-' + esc(i.category || "other") + '">'
+        + '<div class="tl-date">' + esc(shortDate(i.date)) + " &middot; "
+        + esc(CAT_LABEL[i.category] || "Entry")
+        + (i.status ? " &middot; " + esc(i.status) : "") + "</div>"
+        + '<div class="tl-label">' + esc(i.label || "Unnamed item") + cvChips(i) + "</div>"
+        + (i.detail ? '<div class="tl-detail">' + esc(i.detail) + "</div>" : "")
+        + "</div>";
+    });
+    h += "</div>";
+  } else {
+    h += '<p class="muted">No entry carries a date, so this document cannot be'
+      + " placed on a timeline at all.</p>";
+  }
+
+  if (undated.length) {
+    h += '<div class="tl-undated"><strong>'
+      + plural(undated.length, "entry", "entries") + " with no date</strong>"
+      + '<p class="muted" style="margin:2px 0 4px;font-size:0.8rem">Present in the'
+      + " document but impossible to place in the patient's history.</p>"
+      + '<ul class="cv-items">' + undated.map(cvItemHtml).join("") + "</ul></div>";
+  }
+  return h;
+}
+
+/* ---- C: safety dashboard ---- */
+function dbCard(title, body, cls) {
+  return '<div class="db-card' + (cls ? " " + cls : "") + '"><h4>' + esc(title)
+    + "</h4>" + body + "</div>";
+}
+function dbList(arr, n, fn) {
+  return '<ul class="db-list">' + arr.slice(0, n).map(fn).join("") + "</ul>"
+    + (arr.length > n ? '<p class="db-more">and ' + (arr.length - n) + " more</p>" : "");
+}
+function dbMeter(label, n, total) {
+  const v = pctOf(n, total);
+  const cls = v >= 90 ? "" : (v >= 60 ? " mid" : " low");
+  return '<div class="mt"><div class="mt-top"><span>' + esc(label) + "</span><span>"
+    + v + "%</span></div>"
+    + '<div class="meter' + cls + '"><span style="width:' + v + '%"></span></div>'
+    + '<div class="db-more">' + n + " of " + total + "</div></div>";
+}
+function dbRow(i) {
+  return "<li>" + esc(i.label || "Unnamed item") + cvChips(i)
+    + (i.date ? ' <span class="db-more" style="display:inline">'
+        + esc(shortDate(i.date)) + "</span>" : "") + "</li>";
+}
+
+function viewDashboard(d) {
+  const s = d.summary || {};
+  const q = s.quality || {};
+  const p = s.patient;
+  const sections = s.sections || [];
+  const items = cvItems(s);
+  const allergies = cvCat(items, "allergy");
+  const problems = cvCat(items, "problem");
+  const meds = cvCat(items, "medication");
+  const results = cvCat(items, "result");
+  const shots = cvCat(items, "immunization");
+  const docDate = (s.composition || {}).date;
+  let h = '<div class="db-grid">';
+
+  const age = p ? cvAge(p.birth_date, docDate) : null;
+  h += dbCard("Patient",
+    '<div class="db-big">' + esc((p && p.name) || "Unnamed") + "</div>"
+    + '<div class="db-sub">'
+    + [age !== null ? age + " years" : null, p && p.gender ? esc(p.gender) : null,
+       p && p.birth_date ? "born " + esc(shortDate(p.birth_date)) : null]
+      .filter(Boolean).join(" &middot; ")
+    + "</div>", p && p.name ? "" : "alert");
+
+  const high = allergies.filter((a) => hasFlag(a, "high risk"));
+  const allergySec = sectionFor(sections, "allergy");
+  let aBody;
+  let aCls = "";
+  if (allergies.length) {
+    aBody = '<div class="db-big">' + allergies.length
+      + (high.length ? ' <span class="chip cvc risk">' + high.length
+          + " high risk</span>" : "") + "</div>"
+      + dbList(allergies, 5, dbRow);
+    aCls = high.length ? "alert" : "";
+  } else if (allergySec && allergySec.empty_reason) {
+    aBody = '<div class="db-big">' + esc(allergySec.empty_reason) + "</div>"
+      + '<div class="db-sub">Positively asserted by the author - safe to rely on.</div>';
+    aCls = "good";
+  } else {
+    aBody = '<div class="db-big">Unknown</div><div class="db-sub">Neither an allergy'
+      + " nor a statement that none is known.</div>";
+    aCls = "alert";
+  }
+  h += dbCard("Allergies and intolerances", aBody, aCls);
+
+  const active = problems.filter((x) => hasFlag(x, "active"));
+  h += dbCard("Problems",
+    '<div class="db-big">' + (active.length || problems.length) + "</div>"
+    + '<div class="db-sub">' + (active.length ? "active of " + problems.length
+        + " recorded" : (problems.length ? "recorded, none marked active"
+        : "nothing recorded")) + "</div>"
+    + dbList(active.length ? active : problems, 5, dbRow),
+    problems.filter((x) => hasFlag(x, "severe")).length ? "alert" : "");
+
+  const noDose = countGap(meds, "no dose");
+  h += dbCard("Current medication",
+    '<div class="db-big">' + meds.length + "</div>"
+    + '<div class="db-sub">' + (meds.length
+        ? (noDose ? noDose + " without a usable dose" : "all with a dose")
+        : "nothing recorded") + "</div>"
+    + dbList(meds, 5, dbRow), noDose ? "alert" : "");
+
+  if (results.length) {
+    const recent = results.slice()
+      .sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1);
+    const abn = results.filter((r) => hasFlag(r, "abnormal"));
+    h += dbCard("Results",
+      '<div class="db-big">' + results.length
+      + (abn.length ? ' <span class="chip cvc risk">' + abn.length
+          + " abnormal</span>" : "") + "</div>"
+      + dbList(abn.length ? abn.concat(recent.filter((r) => abn.indexOf(r) === -1))
+               : recent, 5, dbRow),
+      abn.length ? "alert" : "");
+  }
+  if (shots.length) {
+    h += dbCard("Vaccinations", '<div class="db-big">' + shots.length + "</div>"
+      + dbList(shots.slice().sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1),
+               4, dbRow));
+  }
+
+  const empty = sections.filter((x) => !(x.items || []).length);
+  h += dbCard("Document coverage",
+    '<div class="db-big">' + (sections.length - empty.length) + " / "
+    + sections.length + "</div>"
+    + '<div class="db-sub">sections carrying data</div>'
+    + (empty.length ? dbList(empty, 6, (x) => "<li>" + esc(x.title || "Untitled")
+        + (x.empty_reason ? '<span class="chip cvc ok">' + esc(x.empty_reason)
+            + "</span>" : '<span class="chip cvc gap">no reason given</span>')
+        + "</li>") : ""),
+    empty.some((x) => !x.empty_reason) ? "alert" : "");
+
+  const total = q.items || 0;
+  let dq = dbMeter("Coded with a terminology", q.coded || 0, total)
+    + dbMeter("Placed in time", q.dated || 0, total);
+  const gaps = q.gaps || {};
+  const gapKeys = Object.keys(gaps);
+  if (gapKeys.length) {
+    dq += dbList(gapKeys, 5, (g) => "<li>" + esc(g)
+      + '<span class="chip cvc gap">' + gaps[g] + "</span></li>");
+  } else if (total) {
+    dq += '<p class="db-more">No gaps detected in ' + total + " entries.</p>";
+  }
+  h += dbCard("Data quality (" + total + " entries)", dq,
+    total && pctOf((q.items || 0) - (q.with_gaps || 0), total) < 60 ? "alert" : "");
+
+  if ((s.unreferenced || []).length) {
+    h += dbCard("Unreachable resources",
+      '<div class="db-big">' + s.unreferenced.length + "</div>"
+      + '<div class="db-sub">in the bundle but not referenced by any section, so a'
+      + " conforming viewer may never show them</div>"
+      + dbList(s.unreferenced, 5, dbRow), "alert");
+  }
+  return h + "</div>";
+}
+
+/* ---- baseline: plain document rendering ---- */
+function viewDocument(d) {
+  const s = d.summary || {};
+  let html = "";
   const p = s.patient;
   if (p) {
     const meta = [p.birth_date ? "Born " + esc(p.birth_date) : null,
-                  p.gender ? esc(p.gender) : null].filter(Boolean).join(" · ");
+                  p.gender ? esc(p.gender) : null].filter(Boolean).join(" &middot; ");
     html += '<div class="patient-card">'
       + '<div class="patient-name">' + esc(p.name || "Unnamed patient") + "</div>"
       + (meta ? "<div>" + meta + "</div>" : "")
       + (p.identifiers && p.identifiers.length
         ? '<div class="muted" style="font-size:0.8rem">'
           + p.identifiers.map((i) => esc(i.value)
-              + (i.system ? " (" + esc(i.system) + ")" : "")).join(" · ") + "</div>"
+              + (i.system ? " (" + esc(i.system) + ")" : "")).join(" &middot; ") + "</div>"
         : "")
       + "</div>";
   } else {
@@ -2024,10 +2813,61 @@ function renderClinicianDoc(d) {
       + " document but no section points at them (data-quality hint).</p>"
       + '<ul class="cv-items">' + s.unreferenced.map(cvItemHtml).join("") + "</ul>";
   }
+  return html;
+}
+
+const CV_VIEWS = {
+  narrative: { fn: viewNarrative, tag: "A", name: "Narrative handover note",
+    why: "Prose a clinician can read in one pass - shows whether the captured data"
+       + " adds up to a coherent clinical story." },
+  timeline: { fn: viewTimeline, tag: "B", name: "Clinical timeline",
+    why: "Chronology across every section - shows recency and whether the record"
+       + " is current enough to act on." },
+  dashboard: { fn: viewDashboard, tag: "C", name: "Safety dashboard",
+    why: "Risk and completeness first - answers what would stop you prescribing"
+       + " before you read anything else." },
+  document: { fn: viewDocument, tag: "", name: "Document", why: "" },
+};
+
+function cmpCol(key, d) {
+  const v = CV_VIEWS[key];
+  return '<div class="cmp-col"><h3>' + esc(v.tag + " · " + v.name) + "</h3>"
+    + '<p class="cmp-why">' + esc(v.why) + "</p>"
+    + '<div class="cmp-body">' + v.fn(d) + "</div></div>";
+}
+
+function renderClinicianDoc(d) {
+  cvCurrent = d;
+  const s = d.summary || {};
+  const comp = s.composition || {};
+  let html = "";
+  if (!d.pass) {
+    html += '<div class="warn-banner">Invalid submission - this document failed'
+      + " validation and would be rejected in production. Content shown as-is.</div>";
+  }
+  html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
+  html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
+    + " &middot; submitted " + new Date(d.ts).toLocaleString()
+    + (comp.date ? " &middot; document date " + esc(comp.date) : "") + "</p>";
+  html += cvMode === "compare"
+    ? '<div class="cmp-grid">' + cmpCol("narrative", d) + cmpCol("timeline", d)
+      + cmpCol("dashboard", d) + "</div>"
+    : (CV_VIEWS[cvMode] || CV_VIEWS.document).fn(d);
   const doc = $("#cv-doc");
   doc.innerHTML = html;
   doc.style.display = "block";
 }
+
+document.querySelectorAll(".cv-mode").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    cvMode = btn.dataset.mode;
+    document.querySelectorAll(".cv-mode").forEach((b) =>
+      b.classList.toggle("active", b === btn));
+    document.body.classList.toggle("cmp-wide", cvMode === "compare");
+    if (cvCurrent) renderClinicianDoc(cvCurrent);
+  });
+});
+document.body.classList.toggle("cmp-wide", cvMode === "compare");
 
 /* ---- interop testing ---- */
 function interopCurls() {
