@@ -3,3 +3,4 @@ keys.env
 __pycache__/
 .pytest_cache/
 connectathon/data/
+.claude/
