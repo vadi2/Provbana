@@ -873,17 +873,25 @@ def test_index_has_tabs_and_company_copy(client):
 
 def test_index_offers_dashboard_timeline_and_document_views(client):
     text = client.get("/").text
-    for mode in ("dashboard", "timeline", "document"):
+    for mode in ("dashboard", "timeline", "compare", "document"):
         assert 'data-mode="%s"' % mode in text
     for fn in ("function viewTimeline(", "function viewDashboard(",
-               "function viewDocument("):
+               "function viewDocument(", "function cmpCol("):
         assert fn in text
     # the dashboard is what opens by default
     assert 'class="cv-mode active" data-mode="dashboard"' in text
     assert 'let cvMode = "dashboard";' in text
-    # the dropped visualisations left nothing behind
+    # compare puts the dashboard and the timeline next to each other
+    assert 'cmpCol("dashboard", d) + cmpCol("timeline", d)' in text
+    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in text
+    # the dropped narrative view left nothing behind
     assert "viewNarrative" not in text
-    assert "cmp-grid" not in text
+
+
+def test_index_credits_matchbox(client):
+    text = client.get("/").text
+    assert "https://github.com/ahdis/matchbox" in text
+    assert "http://hl7.eu/fhir/eps/" in text
 
 
 # ------------------------------------------------------------- sample documents

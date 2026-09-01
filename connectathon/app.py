@@ -1798,6 +1798,22 @@ h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
   margin: 0 0 14px; font-weight: 600; }
 tr.cv-row { cursor: pointer; }
 tr.cv-row:hover td { background: var(--accent-soft); }
+footer { max-width: 1100px; margin: 26px auto 40px; padding: 0 22px;
+  font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
+footer a { color: var(--accent); }
+body.cmp-wide footer { max-width: 1560px; }
+/* side-by-side compare */
+.cmp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px; margin-top: 14px; }
+@media (max-width: 1000px) { .cmp-grid { grid-template-columns: 1fr; } }
+.cmp-col { border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  min-width: 0; }
+.cmp-col > h3 { margin: 0; font-size: 0.95rem; }
+.cmp-col > p.cmp-why { margin: 2px 0 10px; font-size: 0.78rem; color: var(--muted);
+  line-height: 1.45; }
+.cmp-body { max-height: 68vh; overflow-y: auto; padding-right: 4px; }
+.cmp-col .db-grid { grid-template-columns: 1fr; }
+body.cmp-wide main, body.cmp-wide header { max-width: 1560px; }
 /* sample documents */
 .cv-samples { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   margin: 10px 0 4px; }
@@ -1997,7 +2013,9 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
       <button id="submit-btn">Validate bundle</button>
     </div>
     <div class="spinner" id="spinner"><span class="ring"></span>
-      <span>Validating against Matchbox - this can take up to 30 seconds...</span></div>
+      <span>Validating against <a href="https://github.com/ahdis/matchbox"
+      target="_blank" rel="noopener">Matchbox</a> - this can take up to 30
+      seconds...</span></div>
     <div class="error-note" id="submit-error"></div>
     <div class="banner" id="banner"></div>
     <div id="issues-wrap">
@@ -2035,11 +2053,13 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   <div class="cv-modes" id="cv-modes">
     <button class="cv-mode active" data-mode="dashboard">Safety dashboard</button>
     <button class="cv-mode" data-mode="timeline">Clinical timeline</button>
+    <button class="cv-mode" data-mode="compare">Side by side</button>
     <button class="cv-mode" data-mode="document">Document</button>
   </div>
   <p class="muted cv-hint">The <em>safety dashboard</em> opens by default: risk and
   completeness first. Switch to the <em>clinical timeline</em> to read the same data
-  as a chronology, or to <em>document</em> for the plain section-by-section rendering.</p>
+  as a chronology, <em>side by side</em> to weigh the two against each other, or
+  <em>document</em> for the plain section-by-section rendering.</p>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
 
@@ -2079,6 +2099,14 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 </div>
 
 </main>
+<footer>
+  <p>Bundles are validated by <a href="https://github.com/ahdis/matchbox"
+  target="_blank" rel="noopener">Matchbox</a>, the open-source FHIR validation and
+  mapping server from <a href="https://ahdis.ch/" target="_blank" rel="noopener">ahdis</a>,
+  against the HL7 Europe <a href="http://hl7.eu/fhir/eps/" target="_blank"
+  rel="noopener">Patient Summary</a> implementation guide. Terminology is SNOMED CT,
+  LOINC and WHO ATC.</p>
+</footer>
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
@@ -2765,10 +2793,21 @@ function viewDocument(d) {
 }
 
 const CV_VIEWS = {
-  dashboard: viewDashboard,
-  timeline: viewTimeline,
-  document: viewDocument,
+  dashboard: { fn: viewDashboard, name: "Safety dashboard",
+    why: "Risk and completeness first - answers what would stop you prescribing"
+       + " before you read anything else." },
+  timeline: { fn: viewTimeline, name: "Clinical timeline",
+    why: "Chronology across every section - shows recency and whether the record"
+       + " is current enough to act on." },
+  document: { fn: viewDocument, name: "Document", why: "" },
 };
+
+function cmpCol(key, d) {
+  const v = CV_VIEWS[key];
+  return '<div class="cmp-col"><h3>' + esc(v.name) + "</h3>"
+    + '<p class="cmp-why">' + esc(v.why) + "</p>"
+    + '<div class="cmp-body">' + v.fn(d) + "</div></div>";
+}
 
 function renderClinicianDoc(d) {
   cvCurrent = d;
@@ -2789,7 +2828,10 @@ function renderClinicianDoc(d) {
     + (d.sample ? "" : " &middot; submitted " + new Date(d.ts).toLocaleString())
     + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
     + "</p>";
-  html += (CV_VIEWS[cvMode] || viewDashboard)(d);
+  html += cvMode === "compare"
+    ? '<div class="cmp-grid">' + cmpCol("dashboard", d) + cmpCol("timeline", d)
+      + "</div>"
+    : (CV_VIEWS[cvMode] || CV_VIEWS.dashboard).fn(d);
   const doc = $("#cv-doc");
   doc.innerHTML = html;
   doc.style.display = "block";
@@ -2800,6 +2842,7 @@ document.querySelectorAll(".cv-mode").forEach((btn) => {
     cvMode = btn.dataset.mode;
     document.querySelectorAll(".cv-mode").forEach((b) =>
       b.classList.toggle("active", b === btn));
+    document.body.classList.toggle("cmp-wide", cvMode === "compare");
     if (cvCurrent) renderClinicianDoc(cvCurrent);
   });
 });
