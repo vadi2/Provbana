@@ -949,6 +949,21 @@ def read_submission_bytes(team_slug: str, filename: str) -> bytes | None:
         return None
 
 
+def bundle_response(raw: bytes, filename: str, **headers: str) -> Response:
+    """Serve a bundle so a click in a browser saves it under a usable name.
+
+    Without this the browser has no filename to work from and saves every
+    document as "bundle", with no extension.
+    """
+    return Response(
+        content=raw,
+        media_type="application/fhir+json",
+        headers=dict(
+            headers, **{"Content-Disposition": 'attachment; filename="%s"' % filename}
+        ),
+    )
+
+
 # ---------------------------------------------------------------- matchbox
 
 
@@ -1332,7 +1347,7 @@ def submission_bundle(sub_id: int) -> Response:
     raw = read_submission_bytes(row["team_slug"], row["filename"])
     if raw is None:
         raise HTTPException(404, detail="Submission file missing")
-    return Response(content=raw, media_type="application/fhir+json")
+    return bundle_response(raw, "%s-%d-eps.json" % (row["team_slug"], row["id"]))
 
 
 # ----------------------------------------------------------------- sample API
@@ -1424,7 +1439,7 @@ def sample_bundle(sample_id: str) -> Response:
     raw = read_sample_bytes(sample_id)
     if raw is None:
         raise HTTPException(404, detail="Unknown sample")
-    return Response(content=raw, media_type="application/fhir+json")
+    return bundle_response(raw, "%s-example-eps.json" % sample_id)
 
 
 # ---------------------------------------------------------------- interop API
@@ -1492,10 +1507,10 @@ def exchange_fetch(
     raw = read_submission_bytes(producer["slug"], best["filename"])
     if raw is None:
         raise HTTPException(404, detail="Exchange document file missing")
-    return Response(
-        content=raw,
-        media_type="application/fhir+json",
-        headers={"X-Exchange-Id": str(best["id"]), "X-Producer": producer["slug"]},
+    return bundle_response(
+        raw,
+        "%s-eps.json" % producer["slug"],
+        **{"X-Exchange-Id": str(best["id"]), "X-Producer": producer["slug"]},
     )
 
 
@@ -2901,7 +2916,7 @@ function partnerCard(p, canConfirm) {
     + " · " + p.sections + " sections · " + p.resources + " resources · "
     + '<a href="#" class="io-view" data-id="' + p.exchange_id + '">View document</a>'
     + ' · <a href="/api/submissions/' + p.exchange_id
-    + '/bundle" target="_blank">raw bundle</a></p>'
+    + '/bundle" download>download bundle</a></p>'
     + (canConfirm
         ? '<div class="io-form">'
           + '<div><label>Patient family name</label><input type="text" class="io-family"></div>'

@@ -720,6 +720,21 @@ def test_anyone_can_download_a_published_bundle(client, monkeypatch):
     assert json.loads(res.content)["resourceType"] == "Bundle"
 
 
+def test_bundles_download_under_a_named_file(client, monkeypatch):
+    """A browser click must not save every document as a nameless "bundle"."""
+    tok_p, _ = interop_setup(client, monkeypatch)
+    cases = {
+        "/api/exchange/producer": 'attachment; filename="producer-eps.json"',
+        "/api/submissions/1/bundle": 'attachment; filename="producer-1-eps.json"',
+        "/api/samples/andrea-cross-border/bundle":
+            'attachment; filename="andrea-cross-border-example-eps.json"',
+    }
+    for url, disposition in cases.items():
+        res = client.get(url)
+        assert res.status_code == 200, url
+        assert res.headers["content-disposition"] == disposition, url
+
+
 def test_exchange_lists_other_teams_with_valid_docs_only(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     tok_f = register(client, "Failing")
