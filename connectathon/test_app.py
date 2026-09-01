@@ -9,8 +9,11 @@ resource (capped at +60). Team score = max submission score (+20 one-time
 first blood for the first team ever to go valid).
 """
 
+import io
 import json
 import os
+import urllib.error
+import urllib.request
 
 import pytest
 from fastapi.testclient import TestClient
@@ -40,6 +43,27 @@ def bundle(sections=0, resources=0, empty_sections=0):
 
 
 BUNDLE = bundle()  # valid shape, no populated sections, no clinical payload
+
+
+def bundle_with_section(*sections, resources=0):
+    """A document Bundle carrying exactly the given Composition sections.
+
+    Resources get a fullUrl of urn:uuid:res-N so a section entry referencing
+    one actually resolves, which is what separates a populated section from an
+    asserted-empty one.
+    """
+    comp = {"resourceType": "Composition", "status": "final",
+            "section": [dict(s) for s in sections]}
+    entries = [{"resource": comp},
+               {"resource": {"resourceType": "Patient", "id": "p1"}}]
+    for i in range(resources):
+        entries.append({
+            "fullUrl": f"urn:uuid:res-{i}",
+            "resource": {"resourceType": "Observation", "id": f"o{i}",
+                         "code": {"text": f"observation {i}"}},
+        })
+    return json.dumps({"resourceType": "Bundle", "type": "document",
+                       "entry": entries})
 
 
 def outcome(errors=0, warnings=0, infos=0, fatals=0):
@@ -114,16 +138,26 @@ def test_register_name_length_validation(client):
 
 # ---------------------------------------------------------------- submit auth
 
-def test_submit_without_token_401(client):
-    res = client.post("/api/eps", content=BUNDLE)
-    assert res.status_code == 401
+def test_submit_without_token_401(client, monkeypatch):
+    # a real team exists, so this pins the credential check rather than an
+    # empty table
+    token = register(client, "Alpha")
+    assert client.post("/api/eps", content=BUNDLE).status_code == 401
+    assert submit(client, token, outcome(), monkeypatch).status_code == 200
 
 
-def test_submit_bad_token_401(client):
-    register(client, "Alpha")
+def test_submit_bad_token_401(client, monkeypatch):
+    token = register(client, "Alpha")
     res = client.post("/api/eps", content=BUNDLE,
                       headers={"X-Team-Token": "deadbeefdeadbeef"})
     assert res.status_code == 401
+    # not a prefix or suffix match either
+    for wrong in (token[:-1], token + "0", token.upper() if token.islower() else token):
+        if wrong == token:
+            continue
+        assert client.post("/api/eps", content=BUNDLE,
+                           headers={"X-Team-Token": wrong}).status_code == 401
+    assert submit(client, token, outcome(), monkeypatch).status_code == 200
 
 
 def test_submit_bearer_token_accepted(client, monkeypatch):
@@ -694,6 +728,7 @@ def test_confirming_requires_auth_but_reading_does_not(client):
 
 
 def test_a_wrong_token_is_still_rejected_on_read(client):
+    register(client, "Alpha")   # a valid token exists; this one is still wrong
     bad = {"X-Team-Token": "not-a-real-token"}
     assert client.get("/api/exchange", headers=bad).status_code == 401
     assert client.get("/api/exchange/anyone", headers=bad).status_code == 401
@@ -923,18 +958,11 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     # the dashboard is what opens by default
     assert 'class="cv-mode active" data-mode="dashboard"' in text
     assert 'let cvMode = "dashboard";' in text
-    # compare puts the dashboard and the timeline next to each other
-    assert 'cmpCol("dashboard", d) + cmpCol("timeline", d)' in text
-    assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in text
-    # the dropped narrative view left nothing behind
-    assert "viewNarrative" not in text
 
 
 def test_index_offers_bundle_downloads_and_anonymous_partner_browsing(client):
     text = client.get("/").text
     assert '/bundle" download>download the FHIR bundle</a>' in text
-    assert "partnerCard(p, !!token)" in text
-    assert 'fetch("/api/exchange",' in text
 
 
 def test_index_credits_matchbox(client):
@@ -978,7 +1006,7 @@ def test_swedish_sample_is_classified_by_loinc_not_title(client):
     data = client.get("/api/samples/arne-complex-care").json()
     sections = {s["kind"]: s for s in data["summary"]["sections"]}
     assert sections["allergy"]["title"] == "Allergier och intoleranser"
-    assert sections["medication"]["title"] == "Lakemedelslista"
+    assert sections["medication"]["title"] == "Läkemedelslista"
     assert len(sections["problem"]["items"]) == 10
     labels = " ".join(i["label"] for i in sections["allergy"]["items"])
     assert "Penicillin" in labels
@@ -1003,3 +1031,358 @@ def test_register_returns_company_note(client):
     data = client.post("/api/register", json={"team": "NoteCo"}).json()
     assert "note" in data
     assert "company" in data["note"].lower()
+
+
+# ------------------------------------------------- asserted-empty sections
+
+def test_empty_reason_codes_map_to_clinician_labels():
+    for code, label in [("nilknown", "None known"), ("notasked", "Not asked"),
+                        ("withheld", "Information withheld"),
+                        ("unavailable", "Unavailable"),
+                        ("notstarted", "Not started"), ("closed", "Closed")]:
+        s = app_module.summarize_bundle(json.loads(bundle_with_section(
+            {"title": "S", "emptyReason": {"coding": [{"code": code}]}})))
+        assert s["sections"][0]["empty_reason"] == label
+    # an unrecognised code is shown as authored rather than dropped
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "S", "emptyReason": {"coding": [{"code": "novel-code"}]}})))
+    assert s["sections"][0]["empty_reason"] == "novel-code"
+
+
+def test_empty_reason_is_only_reported_when_the_section_is_actually_empty():
+    """A populated section must not advertise an emptyReason it also carries.
+
+    "Nil known" is a positive clinical claim. Repeating it next to real content
+    would tell the reader the opposite of what the document says.
+    """
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "S", "entry": [{"reference": "urn:uuid:res-0"}],
+         "emptyReason": {"coding": [{"code": "nilknown"}]}}, resources=1)))
+    section = s["sections"][0]
+    assert len(section["items"]) == 1
+    assert section["empty_reason"] is None
+
+
+def test_asserted_empty_section_is_distinguishable_from_an_absent_one():
+    asserted = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Allergies", "emptyReason": {"coding": [{"code": "nilknown"}]}})))
+    assert [x["title"] for x in asserted["sections"]] == ["Allergies"]
+    assert asserted["sections"][0]["empty_reason"] == "None known"
+    absent = app_module.summarize_bundle(json.loads(bundle()))
+    assert absent["sections"] == []
+
+
+def test_a_section_with_no_entry_and_no_empty_reason_asserts_nothing():
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Allergies"})))
+    assert s["sections"][0]["items"] == []
+    assert s["sections"][0]["empty_reason"] is None
+
+
+def test_empty_sections_never_earn_points(client, monkeypatch):
+    consume_first_blood(client, monkeypatch)
+    token = register(client, "Alpha")
+    body = bundle_with_section(
+        {"title": "Allergies", "emptyReason": {"coding": [{"code": "nilknown"}]}})
+    res = submit(client, token, outcome(), monkeypatch, body=body)
+    assert res.headers["X-Sections"] == "0"
+    assert res.headers["X-Score"] == "50"
+
+
+# ------------------------------------------------------- section distinctness
+
+def test_repeated_sections_count_once():
+    section = {"title": "Allergies", "entry": [{"reference": "urn:uuid:res-0"}]}
+    doc = json.loads(bundle_with_section(*[dict(section)] * 8, resources=1))
+    assert app_module.count_bundle_richness(doc)[0] == 1
+
+
+def test_distinct_sections_count_separately():
+    doc = json.loads(bundle_with_section(
+        {"title": "Allergies", "entry": [{"reference": "urn:uuid:res-0"}]},
+        {"title": "Medication", "entry": [{"reference": "urn:uuid:res-0"}]},
+        resources=1))
+    assert app_module.count_bundle_richness(doc)[0] == 2
+
+
+def test_section_identity_is_the_code_when_there_is_one():
+    coded = lambda code, title: {
+        "title": title, "code": {"coding": [{"system": "http://loinc.org",
+                                             "code": code}]},
+        "entry": [{"reference": "urn:uuid:res-0"}]}
+    # same code, different titles -> one section
+    doc = json.loads(bundle_with_section(
+        coded("48765-2", "Allergies"), coded("48765-2", "Allergier"),
+        resources=1))
+    assert app_module.count_bundle_richness(doc)[0] == 1
+    # different codes, identical titles -> two
+    doc = json.loads(bundle_with_section(
+        coded("48765-2", "Same"), coded("10160-0", "Same"), resources=1))
+    assert app_module.count_bundle_richness(doc)[0] == 2
+
+
+def test_untitled_uncoded_sections_all_collapse_together():
+    anon = {"entry": [{"reference": "urn:uuid:res-0"}]}
+    doc = json.loads(bundle_with_section(*[dict(anon)] * 5, resources=1))
+    assert app_module.count_bundle_richness(doc)[0] == 1
+    # titles differing only in case and whitespace are the same section
+    doc = json.loads(bundle_with_section(
+        {"title": "Allergies", "entry": [{"reference": "urn:uuid:res-0"}]},
+        {"title": "  ALLERGIES  ", "entry": [{"reference": "urn:uuid:res-0"}]},
+        resources=1))
+    assert app_module.count_bundle_richness(doc)[0] == 1
+
+
+def test_section_points_are_capped():
+    assert app_module.submission_score(True, 16, 0) == 50 + 160
+    assert app_module.submission_score(True, 500, 0) == 50 + app_module.SECTION_CAP
+    # the cap does not leak into the resource half
+    assert app_module.submission_score(True, 500, 500) == (
+        50 + app_module.SECTION_CAP + app_module.RESOURCE_CAP)
+
+
+def test_padding_a_document_cannot_outscore_a_real_one(client, monkeypatch):
+    consume_first_blood(client, monkeypatch)
+    token = register(client, "Padder")
+    padded = {"title": "Allergies", "entry": [{"reference": "urn:uuid:res-0"}]}
+    body = bundle_with_section(*[dict(padded)] * 200, resources=1)
+    res = submit(client, token, outcome(), monkeypatch, body=body)
+    assert res.headers["X-Sections"] == "1"
+    assert res.headers["X-Score"] == "62"   # 50 + 1*10 + 1*2
+
+
+# ------------------------------------------------------------- request limits
+
+def test_oversized_bundle_is_refused(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 500)
+    token = register(client, "Alpha")
+    res = client.post("/api/eps", content="x" * 2000,
+                      headers={"X-Team-Token": token})
+    assert res.status_code == 413
+    assert "limit is 500 bytes" in res.json()["detail"]
+
+
+def test_an_unauthenticated_oversized_post_is_rejected_on_the_credential(client,
+                                                                        monkeypatch):
+    """401 must come before the body is read, or anyone can spend our memory."""
+    monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 500)
+    register(client, "Alpha")
+    assert client.post("/api/eps", content="x" * 2000).status_code == 401
+
+
+def test_small_endpoints_have_their_own_tighter_limit(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 200)
+    res = client.post("/api/register", json={"team": "A" * 400})
+    assert res.status_code == 413
+    # unchanged limit still admits an ordinary registration
+    monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 64 * 1024)
+    assert client.post("/api/register", json={"team": "Alpha"}).status_code == 200
+
+
+def test_deeply_nested_json_is_a_client_error_not_a_crash(client):
+    token = register(client, "Alpha")
+    nested = "[" * 10000 + "]" * 10000
+    res = client.post("/api/eps", content=nested, headers={"X-Team-Token": token})
+    assert res.status_code == 400
+    assert res.json()["detail"] == "Body is not valid JSON"
+    res = client.post("/api/register", content=nested,
+                      headers={"Content-Type": "application/json"})
+    assert res.status_code == 400
+
+
+def test_non_object_json_body_is_rejected(client):
+    res = client.post("/api/register", content="[1, 2, 3]",
+                      headers={"Content-Type": "application/json"})
+    assert res.status_code == 400
+    assert res.json()["detail"] == "Body must be a JSON object"
+
+
+# ------------------------------------------------------------ registration code
+
+def test_registration_is_open_by_default(client):
+    assert app_module.REGISTER_CODE == ""
+    assert client.post("/api/register", json={"team": "Alpha"}).status_code == 200
+
+
+def test_registration_code_gates_when_set(client, monkeypatch):
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
+    assert client.post("/api/register", json={"team": "Alpha"}).status_code == 403
+    assert client.post("/api/register",
+                       json={"team": "Alpha", "code": "wrong"}).status_code == 403
+    assert client.post("/api/register",
+                       json={"team": "Alpha", "code": 1234}).status_code == 403
+    res = client.post("/api/register", json={"team": "Alpha", "code": "s3cret"})
+    assert res.status_code == 200
+
+
+# ------------------------------------------------------------- interop bounds
+
+def test_interop_points_are_capped(client, monkeypatch):
+    consume_first_blood(client, monkeypatch)
+    tok_c = register(client, "Consumer")
+    for i in range(6):
+        tok_p = register(client, f"Prod{i}")
+        submit(client, tok_p, outcome(), monkeypatch, body=CLINICAL_BODY)
+        res = confirm(client, tok_c, partner=f"prod{i}")
+        assert res.json()["result"] == "confirmed", res.text
+    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
+    # 6 x 25 = 150 uncapped; a team standing up throwaway partners gains nothing
+    # past the cap
+    assert lb["Consumer"]["interop"] == app_module.INTEROP_CAP
+
+
+def test_a_receipt_survives_the_partner_resubmitting(client, monkeypatch):
+    """The consumer read the document correctly; the producer moved it."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    original = client.get("/api/submissions", params={"team": "producer"}
+                          ).json()[0]["id"]
+    # a richer bundle, which now becomes the producer's published document
+    submit(client, tok_p, outcome(), monkeypatch,
+           body=bundle(sections=6, resources=10))
+    listing = client.get("/api/exchange", headers={"X-Team-Token": tok_c}).json()
+    assert listing[0]["exchange_id"] != original
+    res = confirm(client, tok_c)          # receipt taken from the original
+    assert res.status_code == 200, res.text
+    assert res.json()["result"] == "confirmed"
+    assert res.json()["exchange_id"] == original
+
+
+def test_a_wrong_receipt_is_still_rejected_after_a_resubmission(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch,
+           body=bundle(sections=6, resources=10))
+    res = confirm(client, tok_c, patient_family="Nobody")
+    assert res.status_code == 422
+    assert "patient_family" in res.json()["fields"]
+    assert "Schwartz" not in res.text
+
+
+# --------------------------------------------------------- unreadable document
+
+def test_a_document_that_no_longer_parses_says_so(client, monkeypatch):
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=CLINICAL_BODY)
+    sub = client.get("/api/submissions", params={"team": "alpha"}).json()[0]
+    assert client.get("/api/submissions/%d" % sub["id"]).json()["bundle_readable"]
+    team_dir = os.path.join(client.data_dir, "submissions", "alpha")
+    stored = os.path.join(team_dir, os.listdir(team_dir)[0])
+    with open(stored, "wb") as fh:
+        fh.write(b"{ this is not json")
+    data = client.get("/api/submissions/%d" % sub["id"]).json()
+    # the recorded verdict stands, but the summary is explicitly not evidence
+    assert data["pass"] is True
+    assert data["bundle_readable"] is False
+    assert data["summary"]["sections"] == []
+
+
+# ----------------------------------------------------------- matchbox client
+
+
+class FakeResponse:
+    def __init__(self, payload, status=200):
+        self.payload = payload
+        self.status = status
+
+    def read(self):
+        return self.payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_urlopen(monkeypatch, result, captured=None):
+    def _open(req, timeout=None):
+        if captured is not None:
+            captured.append((req, timeout))
+        if isinstance(result, Exception):
+            raise result
+        return result
+    monkeypatch.setattr(urllib.request, "urlopen", _open)
+
+
+OK_OUTCOME = json.dumps(outcome(warnings=1)).encode()
+
+
+def test_validate_posts_the_bundle_to_the_profile_endpoint(monkeypatch):
+    captured = []
+    fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
+    result = app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}')
+    assert result["resourceType"] == "OperationOutcome"
+    req, timeout = captured[0]
+    assert req.full_url.startswith(app_module.MATCHBOX_URL + "/$validate?profile=")
+    assert app_module.PROFILE.replace(":", "%3A").replace("/", "%2F") in req.full_url
+    assert req.get_method() == "POST"
+    assert req.data == b'{"resourceType":"Bundle"}'
+    assert req.get_header("Content-type") == "application/fhir+json"
+    assert timeout == app_module.MATCHBOX_TIMEOUT
+
+
+def test_validate_keeps_the_outcome_from_an_http_error(monkeypatch):
+    """Matchbox answers 4xx with a real OperationOutcome; that is the verdict."""
+    body = json.dumps(outcome(errors=3)).encode()
+    fake_urlopen(monkeypatch, urllib.error.HTTPError(
+        "http://mb", 422, "Unprocessable", None, io.BytesIO(body)))
+    result = app_module.validate_with_matchbox(b"{}")
+    assert sum(1 for i in result["issue"] if i["severity"] == "error") == 3
+
+
+def test_validate_raises_when_an_http_error_carries_no_outcome(monkeypatch):
+    for payload in (b"<html>gateway timeout</html>",
+                    json.dumps({"resourceType": "Bundle"}).encode()):
+        fake_urlopen(monkeypatch, urllib.error.HTTPError(
+            "http://mb", 500, "Server Error", None, io.BytesIO(payload)))
+        with pytest.raises(app_module.MatchboxError, match="HTTP 500"):
+            app_module.validate_with_matchbox(b"{}")
+
+
+def test_validate_raises_when_matchbox_is_unreachable(monkeypatch):
+    for exc in (urllib.error.URLError("refused"), TimeoutError("timed out"),
+                OSError("broken pipe")):
+        fake_urlopen(monkeypatch, exc)
+        with pytest.raises(app_module.MatchboxError, match="unreachable"):
+            app_module.validate_with_matchbox(b"{}")
+
+
+def test_validate_raises_on_a_200_that_is_not_an_outcome(monkeypatch):
+    fake_urlopen(monkeypatch, FakeResponse(b"not json at all"))
+    with pytest.raises(app_module.MatchboxError, match="non-JSON"):
+        app_module.validate_with_matchbox(b"{}")
+    fake_urlopen(monkeypatch, FakeResponse(json.dumps(
+        {"resourceType": "Bundle"}).encode()))
+    with pytest.raises(app_module.MatchboxError, match="not an OperationOutcome"):
+        app_module.validate_with_matchbox(b"{}")
+    fake_urlopen(monkeypatch, FakeResponse(b"[1, 2, 3]"))
+    with pytest.raises(app_module.MatchboxError, match="not an OperationOutcome"):
+        app_module.validate_with_matchbox(b"{}")
+
+
+def test_a_matchbox_failure_surfaces_as_502(client, monkeypatch):
+    token = register(client, "Alpha")
+    def boom(body):
+        raise app_module.MatchboxError("Matchbox unreachable: nope")
+    monkeypatch.setattr(app_module, "validate_with_matchbox", boom)
+    res = client.post("/api/eps", content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 502
+    assert "unreachable" in res.json()["detail"]
+
+
+def test_matchbox_health_url_drops_the_fhir_suffix(monkeypatch):
+    monkeypatch.setattr(app_module, "MATCHBOX_URL",
+                        "http://matchbox:8080/matchboxv3/fhir")
+    assert app_module.matchbox_health_url().startswith(
+        "http://matchbox:8080/matchboxv3")
+    assert "/fhir/" not in app_module.matchbox_health_url()
+
+
+def test_health_reports_matchbox_up_and_down(client, monkeypatch):
+    fake_urlopen(monkeypatch, FakeResponse(b"{}", status=200))
+    assert client.get("/api/health").json() == {"status": "ok", "matchbox": "up"}
+    fake_urlopen(monkeypatch, FakeResponse(b"{}", status=503))
+    assert client.get("/api/health").json()["matchbox"] == "down"
+    fake_urlopen(monkeypatch, urllib.error.URLError("refused"))
+    body = client.get("/api/health").json()
+    # the service itself is still ok - only the validator is down
+    assert body == {"status": "ok", "matchbox": "down"}

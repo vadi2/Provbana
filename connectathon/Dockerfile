@@ -1,8 +1,20 @@
-FROM python:3.12-slim
-RUN pip install --no-cache-dir fastapi uvicorn
+# Pinned base image: a floating "3.12-slim" makes two builds a week apart
+# different images. Bump this tag deliberately, not by accident.
+FROM python:3.12.14-slim-bookworm
+
 WORKDIR /app
+
+# Dependencies first so the layer caches across app.py edits. Versions are
+# pinned in requirements.txt.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY app.py .
 COPY samples ./samples
+
 ENV DATA_DIR=/data
+# PORT is honoured by app.py's __main__ entry point, which also binds 0.0.0.0.
+ENV PORT=8095
 EXPOSE 8095
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8095"]
+
+CMD ["python", "app.py"]

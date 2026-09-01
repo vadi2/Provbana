@@ -50,6 +50,11 @@ def resource_narrative(r):
                 ("Gender", r.get("gender")),
                 ("Date of birth", r.get("birthDate")),
                 ("Identifier", r["identifier"][0]["value"])]
+        # The receiving clinician needs the language before the consultation
+        # starts, so it belongs in the rendered summary and not only in the data.
+        for c in r.get("communication", []):
+            rows.append(("Preferred language" if c.get("preferred") else "Language",
+                         _txt(c.get("language"))))
         for a in r.get("address", []):
             label = "Address" if a.get("use") != "temp" else "Temporary address"
             rows.append((label, ", ".join(
@@ -165,7 +170,8 @@ class BundleBuilder:
     def section(self, title, loinc, loinc_display, rows, headers,
                 refs, empty_reason=None):
         sec = {"title": title, "code": cc(LOINC, loinc, loinc_display)}
-        sec["text"] = {"status": "generated", "div": narrative(headers, rows)}
+        sec["text"] = {"status": "generated",
+                       "div": narrative(headers, rows, self.language)}
         if refs:
             sec["entry"] = [{"reference": r} for r in refs]
         if empty_reason:
@@ -193,7 +199,8 @@ class BundleBuilder:
             ["Field", "Value"],
             [["Document", self.title], ["Patient", self.pat_display],
              ["Document date", self.doc_date],
-             ["Sections", ", ".join(s["title"] for s in self.sections)]])}
+             ["Sections", ", ".join(s["title"] for s in self.sections)]],
+            self.language)}
         self.entries.insert(0, {"fullUrl": "urn:uuid:" + comp["id"], "resource": comp})
         return {
             "resourceType": "Bundle",
@@ -207,9 +214,14 @@ class BundleBuilder:
         }
 
 
-def narrative(headers, rows):
+def narrative(headers, rows, lang=None):
     e = html.escape
-    out = ['<div xmlns="http://www.w3.org/1999/xhtml">']
+    # xml:lang matters here: these are cross-border documents, and a receiving
+    # system has to know which language the rendered narrative is actually in.
+    attrs = '<div xmlns="http://www.w3.org/1999/xhtml"'
+    if lang:
+        attrs += ' xml:lang="%s" lang="%s"' % (lang, lang)
+    out = [attrs + '>']
     if not rows:
         out.append("<p>%s</p></div>" % e(headers))
         return "".join(out)
@@ -408,7 +420,9 @@ def build_andrea():
             "resourceType": "Patient",
             "meta": {"profile": [EPS + "patient-eu-eps"]},
             "identifier": [{
-                "type": cc(THL7 + "v2-0203", "JHN", "Jurisdictional health number"),
+                "type": cc(THL7 + "v2-0203", "NI",
+                                "National unique individual identifier",
+                                "Personnummer"),
                 "system": "urn:oid:1.2.752.129.2.1.3.1",
                 "value": "20020317-0000",
             }],
@@ -420,9 +434,9 @@ def build_andrea():
             "gender": "female",
             "birthDate": "2002-03-17",
             "address": [
-                {"use": "home", "type": "physical", "line": ["Sysslomansgatan 12"],
+                {"use": "home", "type": "physical", "line": ["Lärkstigen 12"],
                  "city": "Uppsala", "postalCode": "753 11", "country": "SE"},
-                {"use": "temp", "type": "physical", "line": ["Cite Universitaire, 17 Bd Jourdan"],
+                {"use": "temp", "type": "physical", "line": ["Résidence Les Tilleuls, 8 rue Camille Vasseur"],
                  "city": "Paris", "postalCode": "75014", "country": "FR",
                  "period": {"start": "2026-02-01"}},
             ],
@@ -432,12 +446,12 @@ def build_andrea():
         author={"practitioner": {
             "resourceType": "Practitioner",
             "meta": {"profile": [EUBASE + "practitioner-eu"]},
-            "name": [{"family": "Ohlsson", "given": ["Karin"], "prefix": ["Dr"]}],
+            "name": [{"family": "Sundström", "given": ["Åsa"], "prefix": ["Dr"]}],
         }},
         org={
             "resourceType": "Organization",
             "meta": {"profile": [EUBASE + "organization-eu"]},
-            "name": "Uppsala vardcentral Kungsgardet",
+            "name": "Vårdcentralen Norrskogen",
             "address": [{"city": "Uppsala", "postalCode": "752 28", "country": "SE"}],
         },
     )
@@ -512,17 +526,17 @@ def build_andrea():
         dict(loinc="59261-8",
              display="Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol",
              date="2025-12-09", value=68, unit="mmol/mol", low=27, high=42,
-             interpretation=("H", "High"), performer="Akademiska laboratoriet, Uppsala"),
+             interpretation=("H", "High"), performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
         dict(loinc="2160-0", display="Creatinine [Mass/volume] in Serum or Plasma",
              date="2025-12-09", value=71, unit="umol/L", low=45, high=90,
-             performer="Akademiska laboratoriet, Uppsala"),
+             performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
         dict(loinc="14959-1",
              display="Microalbumin/Creatinine [Mass Ratio] in Urine",
              date="2025-12-09", value=4.1, unit="mg/mmol", high=3.0,
-             interpretation=("H", "High"), performer="Akademiska laboratoriet, Uppsala"),
+             interpretation=("H", "High"), performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
         dict(loinc="2093-3", display="Cholesterol [Mass/volume] in Serum or Plasma",
              date="2025-12-09", value=4.4, unit="mmol/L", high=5.0,
-             performer="Akademiska laboratoriet, Uppsala"),
+             performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
     ]
     refs = [lab(b, **l) for l in labs]
     b.section("Relevant diagnostic tests and laboratory data", "30954-2",
@@ -583,44 +597,46 @@ def build_arne():
     b = BundleBuilder(
         doc_date=doc_date,
         language="sv",
-        title="Patientoversikt (European Patient Summary)",
+        title="Patientöversikt (European Patient Summary)",
         doc_uuid="arne-complex-care",
         patient={
             "resourceType": "Patient",
             "meta": {"profile": [EPS + "patient-eu-eps"]},
             "identifier": [{
-                "type": cc(THL7 + "v2-0203", "JHN", "Jurisdictional health number"),
+                "type": cc(THL7 + "v2-0203", "NI",
+                                "National unique individual identifier",
+                                "Personnummer"),
                 "system": "urn:oid:1.2.752.129.2.1.3.1",
                 "value": "19430211-0000",
             }],
-            "name": [{"text": "Arne Bergqvist", "family": "Bergqvist",
+            "name": [{"text": "Arne Bergström", "family": "Bergström",
                       "given": ["Arne", "Gustav"]}],
             "telecom": [{"system": "phone", "value": "+46 70 000 00 02",
                          "use": "home"}],
             "gender": "male",
             "birthDate": "1943-02-11",
             "address": [{"use": "home", "type": "physical",
-                         "line": ["Backvagen 8 A"], "city": "Falkenberg",
+                         "line": ["Ängsbacken 8 A"], "city": "Falkenberg",
                          "postalCode": "311 34", "country": "SE"}],
             "communication": [{"language": cc("urn:ietf:bcp:47", "sv", "Swedish"),
                                "preferred": True}],
             "contact": [{
                 "relationship": [cc(THL7 + "v2-0131", "C", "Emergency Contact")],
-                "name": {"text": "Mikael Bergqvist", "family": "Bergqvist",
+                "name": {"text": "Mikael Bergström", "family": "Bergström",
                          "given": ["Mikael"]},
                 "telecom": [{"system": "phone", "value": "+45 20 00 00 03"}],
-                "address": {"city": "Kobenhavn", "country": "DK"},
+                "address": {"city": "København", "country": "DK"},
             }],
         },
         author={"practitioner": {
             "resourceType": "Practitioner",
             "meta": {"profile": [EUBASE + "practitioner-eu"]},
-            "name": [{"family": "Hallberg", "given": ["Elin"], "prefix": ["Dr"]}],
+            "name": [{"family": "Lövgren", "given": ["Märta"], "prefix": ["Dr"]}],
         }},
         org={
             "resourceType": "Organization",
             "meta": {"profile": [EUBASE + "organization-eu"]},
-            "name": "Vardcentralen Falkenberg",
+            "name": "Vårdcentralen Kvarnängen",
             "address": [{"city": "Falkenberg", "postalCode": "311 32",
                          "country": "SE"}],
         },
@@ -634,10 +650,10 @@ def build_arne():
              onset="1972-06-18",
              reaction=sct("39579001", "Anaphylaxis", "Anafylaktisk reaktion"),
              severity="severe",
-             note="Anafylaxi efter fenoximetylpenicillin 1972, vardad pa "
+             note="Anafylaxi efter fenoximetylpenicillin 1972, vårdad på "
                   "akutmottagning. Undvik samtliga betalaktamantibiotika tills "
-                  "allergiutredning genomforts."),
-        dict(code=sct("256262001", "European white birch pollen", "Bjorkpollen"),
+                  "allergiutredning genomförts."),
+        dict(code=sct("256262001", "European white birch pollen", "Björkpollen"),
              category="environment", atype="allergy", criticality="low",
              onset="1988-04-02",
              reaction=sct("1371396001", "Allergic rhinoconjunctivitis",
@@ -649,21 +665,21 @@ def build_arne():
               "Allergies and adverse reactions Document",
               [[a["code"]["text"], a["criticality"], a["onset"],
                 a["reaction"]["text"], a.get("severity")] for a in allergies],
-              ["Allergen", "Kritikalitet", "Debut", "Reaktion", "Svarighetsgrad"],
+              ["Allergen", "Kritikalitet", "Debut", "Reaktion", "Svårighetsgrad"],
               refs)
 
     # --- problems
-    hf = sct("88805009", "Chronic congestive heart failure", "Kronisk hjartsvikt")
+    hf = sct("88805009", "Chronic congestive heart failure", "Kronisk hjärtsvikt")
     t2dm = sct("44054006", "Type 2 diabetes mellitus", "Diabetes mellitus typ 2")
-    af = sct("49436004", "Atrial fibrillation", "Formaksflimmer")
+    af = sct("49436004", "Atrial fibrillation", "Förmaksflimmer")
     stroke = sct("230690007", "Cerebrovascular accident", "Stroke")
-    hemi = sct("278287000", "Left hemiparesis", "Vanstersidig hemipares")
+    hemi = sct("278287000", "Left hemiparesis", "Vänstersidig hemipares")
     angina = sct("233819005", "Stable angina", "Stabil angina pectoris")
     emphysema = sct("87433001", "Pulmonary emphysema", "Lungemfysem")
     htn = sct("59621000", "Essential hypertension", "Essentiell hypertoni")
-    ulcer = sct("1237117000", "Venous ulcer of lower leg", "Venost bensar")
+    ulcer = sct("1237117000", "Venous ulcer of lower leg", "Venöst bensår")
     prostate = sct("399068003", "Malignant neoplasm of prostate",
-                   "Prostatacancer, avancerad")
+                   "Prostatacancer, lokalt avancerad")
     probs = [
         (htn, "1998-10-02", "active"),
         (t2dm, "2004-06-30", "active"),
@@ -679,66 +695,67 @@ def build_arne():
     refs = [condition(b, c, o, s) for c, o, s in probs]
     b.section("Problemlista", "11450-4", "Problem list - Reported",
               [[c["text"], o, s] for c, o, s in probs],
-              ["Tillstand", "Debut", "Status"], refs)
+              ["Tillstånd", "Debut", "Status"], refs)
 
     # --- medication
     tablet = ("421026006", "Oral tablet")
     meds = [
         dict(atc="B01AF02", atc_display="apixaban",
              text="Apixaban 5 mg tablett",
-             dose="1 tablett (5 mg) 2 ganger dagligen", start="2017-10-05",
+             dose="1 tablett (5 mg) 2 gånger dagligen", start="2017-10-05",
              reason=af, form=tablet),
         dict(atc="C07AB02", atc_display="metoprolol",
              text="Metoprolol depottablett 50 mg",
-             dose="1 tablett (50 mg) 1 gang dagligen pa morgonen",
+             dose="1 tablett (50 mg) 1 gång dagligen på morgonen",
              start="2018-04-20", reason=hf, form=tablet),
         dict(atc="C09AA05", atc_display="ramipril",
              text="Ramipril 5 mg tablett",
-             dose="1 tablett (5 mg) 1 gang dagligen", start="2018-04-20",
+             dose="1 tablett (5 mg) 1 gång dagligen", start="2018-04-20",
              reason=hf, form=tablet),
         dict(atc="C03CA01", atc_display="furosemide",
              text="Furosemid 40 mg tablett",
-             dose="1 tablett (40 mg) 1 gang dagligen pa morgonen",
+             dose="1 tablett (40 mg) 1 gång dagligen på morgonen",
              start="2018-04-20", reason=hf, form=tablet),
         dict(atc="A10AE04", atc_display="insulin glargine",
-             text="Insulin glargin 100 E/ml injektionsvatska",
+             text="Insulin glargin 100 E/ml injektionsvätska",
              dose="22 enheter subkutant till natten", start="2016-02-08",
              reason=t2dm),
         dict(atc="A10BA02", atc_display="metformin",
              text="Metformin 500 mg tablett",
-             dose="1 tablett (500 mg) 2 ganger dagligen i samband med maltid",
+             dose="1 tablett (500 mg) 2 gånger dagligen i samband med måltid",
              start="2004-07-15", reason=t2dm, form=tablet),
         dict(atc="C01DA02", atc_display="glyceryl trinitrate",
              text="Glyceryltrinitrat 0,4 mg sublingual spray",
-             dose="1-2 doser under tungan vid brostsmarta, vid behov",
+             dose="1-2 doser under tungan vid bröstsmärta, vid behov",
              start="2015-11-10", reason=angina, as_needed=True),
         dict(atc="R03BB04", atc_display="tiotropium bromide",
              text="Tiotropium 18 mikrogram inhalationspulver",
-             dose="1 inhalation 1 gang dagligen", start="2011-04-05",
+             dose="1 inhalation 1 gång dagligen", start="2011-04-05",
              reason=emphysema),
         dict(atc="L02BB03", atc_display="bicalutamide",
-             text="Bikalutamid 50 mg tablett",
-             dose="1 tablett (50 mg) 1 gang dagligen", start="2020-09-14",
+             text="Bikalutamid 150 mg tablett",
+             dose="1 tablett (150 mg) 1 gång dagligen som monoterapi "
+                  "(ingen GnRH-analog)", start="2020-09-14",
              reason=prostate, form=tablet),
         dict(atc="C10AA05", atc_display="atorvastatin",
              text="Atorvastatin 20 mg tablett",
-             dose="1 tablett (20 mg) 1 gang dagligen till kvallen",
+             dose="1 tablett (20 mg) 1 gång dagligen till kvällen",
              start="2015-11-10", reason=angina, form=tablet),
     ]
     refs = [medication(b, **m) for m in meds]
-    b.section("Lakemedelslista", "10160-0", "History of Medication use Narrative",
+    b.section("Läkemedelslista", "10160-0", "History of Medication use Narrative",
               [[m["text"], m["dose"], m["start"], m["reason"]["text"]] for m in meds],
-              ["Lakemedel", "Dosering", "Insatt", "Indikation"], refs)
+              ["Läkemedel", "Dosering", "Insatt", "Indikation"], refs)
 
     # --- procedures
     procs = [
         (sct("90199006", "Transurethral resection of prostate",
              "Transuretral resektion av prostata (TURP)"), "2020-11-26",
-         "Utford pa Hallands sjukhus Varberg. Ingen peroperativ komplikation."),
+         "Utförd på Länssjukhuset Söderås, Varberg. Ingen peroperativ komplikation."),
     ]
     refs = [procedure(b, code=c, date=d, note=n) for c, d, n in procs]
-    b.section("Genomgangna atgarder", "47519-4", "History of Procedures Document",
-              [[c["text"], d] for c, d, _ in procs], ["Atgard", "Datum"], refs)
+    b.section("Genomgångna åtgärder", "47519-4", "History of Procedures Document",
+              [[c["text"], d] for c, d, _ in procs], ["Åtgärd", "Datum"], refs)
 
     # --- immunizations
     shots = [
@@ -785,7 +802,7 @@ def build_arne():
              interpretation=("H", "High")),
     ]
     for l in labspec:
-        l["performer"] = "Klinisk kemi, Hallands sjukhus"
+        l["performer"] = "Klinisk kemi, Länssjukhuset Söderås"
     refs = [lab(b, **l) for l in labspec]
     b.section("Laboratorieresultat", "30954-2",
               "Relevant diagnostic tests/laboratory data note",
@@ -798,7 +815,7 @@ def build_arne():
     rollator = sct("404946006", "Wheeled walking frame", "Rollator")
     refs = [device_use(b, code=rollator, since="2019-06-01",
                        note="Utprovad av arbetsterapeut efter stroke 2019. "
-                            "Anvands inomhus och utomhus.")]
+                            "Används inomhus och utomhus.")]
     b.section("Medicintekniska produkter", "46264-8",
               "History of medical device use",
               [["Rollator", "2019-06-01", "I bruk"]],
@@ -806,24 +823,24 @@ def build_arne():
 
     # --- plan of care
     plans = [
-        dict(description="Planerat aterbesok pa vardcentralen Falkenberg - "
-                         "arlig kontroll av hjartsvikt och diabetes",
+        dict(description="Planerat återbesök på Vårdcentralen Kvarnängen - "
+                         "årlig kontroll av hjärtsvikt och diabetes",
              start="2026-06-12", activity_status="scheduled",
              scheduled="2026-09-15", reason=hf),
-        dict(description="Hemtjanst tva besok dagligen - stod med lakemedel, "
-                         "personlig vard och maltider",
+        dict(description="Hemtjänst två besök dagligen - stöd med läkemedel, "
+                         "personlig vård och måltider",
              start="2019-06-01", activity_status="in-progress", reason=hemi,
-             note="Beviljad av Falkenbergs kommun. Kontaktperson finns i "
-                  "kommunens samordnade individuella plan (SIP)."),
-        dict(description="Sarvard av venost bensar hoger underben - "
-                         "kompressionsbehandling och omlaggning tva ganger per vecka",
+             note="Beviljad av kommunens biståndsenhet. Kontaktperson finns i "
+                  "den samordnade individuella planen (SIP)."),
+        dict(description="Sårvård av venöst bensår höger underben - "
+                         "kompressionsbehandling och omläggning två gånger per vecka",
              start="2023-05-19", activity_status="in-progress", reason=ulcer,
-             note="Utfors av distriktsskoterska i hemmet."),
+             note="Utförs av distriktssköterska i hemmet."),
     ]
     refs = [care_plan(b, **p) for p in plans]
-    b.section("Vardplan", "18776-5", "Plan of care note",
+    b.section("Vårdplan", "18776-5", "Plan of care note",
               [[p["description"], p["start"], p["activity_status"]] for p in plans],
-              ["Planerad atgard", "Sedan", "Status"], refs)
+              ["Planerad åtgärd", "Sedan", "Status"], refs)
     return b.build()
 
 

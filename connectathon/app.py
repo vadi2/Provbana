@@ -15,7 +15,7 @@ import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 MATCHBOX_URL = os.environ.get("MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir")
@@ -28,18 +28,36 @@ SAMPLES_DIR = os.environ.get(
 )
 PORT = int(os.environ.get("PORT", "8095"))
 
+# The submit endpoint holds the client connection for the whole validation, so
+# this is what a participant waits on a wedged Matchbox. A cold validator has
+# to load its packages on the first request, hence not tighter than a minute.
+MATCHBOX_TIMEOUT = float(os.environ.get("MATCHBOX_TIMEOUT", "60"))
+
 # Reject oversized submissions before they hit the audit log or Matchbox. The
 # richest real EPS bundles are a few hundred KB, so 5 MB is generous headroom
 # while still bounding disk use from a runaway or hostile client.
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 
+# Every other endpoint takes a handful of fields, so it gets a much tighter
+# ceiling than a bundle does.
+MAX_JSON_BODY_BYTES = 64 * 1024
+
 VALID_BASE = 50        # points for a submission with zero error/fatal issues
 SECTION_POINTS = 10    # per populated top-level Composition section
 RESOURCE_POINTS = 2    # per clinical resource (not Composition/Patient)
 RESOURCE_CAP = 60      # max points from clinical resources
+SECTION_CAP = 160      # max points from sections (the IPS set is ~16 sections)
 FIRST_BLOOD_BONUS = 20
 INTEROP_CONSUMER_POINTS = 25   # per distinct partner whose document you consumed
 INTEROP_PRODUCER_POINTS = 10   # per distinct team that consumed your document
+# Registration is deliberately open, so a team could stand up throwaway partners
+# and exchange with itself. Capping the track bounds that to what four honest
+# partnerships are worth, which is more than any real hackathon reaches.
+INTEROP_CAP = 100
+
+# Set REGISTER_CODE to require a shared secret on /api/register. Left empty the
+# endpoint stays open, which is what you want on a closed event network.
+REGISTER_CODE = os.environ.get("REGISTER_CODE", "")
 
 
 class MatchboxError(Exception):
@@ -122,19 +140,39 @@ def unique_slug(conn: sqlite3.Connection, name: str) -> str:
 # ---------------------------------------------------------------- scoring
 
 
+def section_key(section: dict) -> str:
+    """Identity used to de-duplicate sections: code, else title, else one bucket.
+
+    Repeating a section does not make a document richer, so scoring counts
+    distinct sections. Untitled, uncoded sections all collapse together
+    because nothing distinguishes them.
+    """
+    code = section.get("code")
+    if isinstance(code, dict) and isinstance(code.get("coding"), list):
+        for coding in code["coding"]:
+            if isinstance(coding, dict) and isinstance(coding.get("code"), str):
+                system = coding.get("system")
+                return "c:%s|%s" % (system if isinstance(system, str) else "",
+                                    coding["code"])
+    title = section.get("title")
+    if isinstance(title, str) and title.strip():
+        return "t:" + " ".join(title.lower().split())
+    return "u:"
+
+
 def count_bundle_richness(bundle) -> tuple[int, int]:
     """Return (populated_sections, clinical_resources) for a Bundle JSON value.
 
-    - populated_sections: top-level section[] items of the (first) Composition
-      that carry an entry[] with at least one element. Sections without entries
-      (e.g. emptyReason-only) do not count.
+    - populated_sections: distinct top-level section[] items of the (first)
+      Composition that carry an entry[] with at least one element. Sections
+      without entries (e.g. emptyReason-only) do not count.
     - clinical_resources: bundle entries whose resource is neither a
       Composition nor a Patient.
     Defensive against arbitrary JSON: anything malformed counts as 0.
     """
     if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
         return 0, 0
-    sections = 0
+    section_keys: set[str] = set()
     resources = 0
     composition_seen = False
     for entry in bundle["entry"]:
@@ -153,26 +191,27 @@ def count_bundle_richness(bundle) -> tuple[int, int]:
                             and isinstance(section.get("entry"), list)
                             and len(section["entry"]) >= 1
                         ):
-                            sections += 1
+                            section_keys.add(section_key(section))
             continue  # a Composition is never clinical payload
         if rtype == "Patient":
             continue
         resources += 1
-    return sections, resources
+    return len(section_keys), resources
 
 
 def submission_score(passed: bool, sections: int, resources: int) -> int:
     """Conformance gates the score: any error/fatal issue means 0.
 
-    A valid submission earns VALID_BASE, plus SECTION_POINTS per populated
-    Composition section, plus RESOURCE_POINTS per clinical resource capped
-    at RESOURCE_CAP points.
+    A valid submission earns VALID_BASE, plus SECTION_POINTS per distinct
+    populated Composition section capped at SECTION_CAP points, plus
+    RESOURCE_POINTS per clinical resource capped at RESOURCE_CAP points.
+    Both halves are capped so no amount of padding outruns a real document.
     """
     if not passed:
         return 0
     return (
         VALID_BASE
-        + SECTION_POINTS * sections
+        + min(SECTION_CAP, SECTION_POINTS * sections)
         + min(RESOURCE_CAP, RESOURCE_POINTS * resources)
     )
 
@@ -987,7 +1026,7 @@ def validate_with_matchbox(body: bytes) -> dict:
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=MATCHBOX_TIMEOUT) as resp:
             payload = resp.read()
     except urllib.error.HTTPError as exc:  # 4xx/5xx may still carry an outcome
         payload = exc.read()
@@ -1027,8 +1066,41 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="EPS Connectathon", lifespan=lifespan)
 
 
-async def raw_body(request: Request) -> bytes:
-    return await request.body()
+async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
+    """Read the body, refusing anything over `limit` before it is all resident.
+
+    request.body() buffers the whole payload first, so a size check in the
+    handler only ever runs once the memory has already been spent.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > limit:
+        raise HTTPException(
+            413, detail=f"{what} too large ({declared} bytes); limit is {limit} bytes"
+        )
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            raise HTTPException(
+                413,
+                detail=f"{what} too large (over {limit} bytes); limit is "
+                f"{limit} bytes",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def small_json_body(request: Request) -> dict:
+    """Size-capped JSON object body for the non-bundle endpoints."""
+    raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise HTTPException(400, detail="Body is not valid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, detail="Body must be a JSON object")
+    return payload
 
 
 def team_from_token(
@@ -1049,6 +1121,25 @@ def team_from_token(
     return team
 
 
+def current_team(
+    x_team_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> sqlite3.Row:
+    return team_from_token(x_team_token, authorization)
+
+
+async def bundle_body(
+    request: Request, team: sqlite3.Row = Depends(current_team)
+) -> bytes:
+    """The submitted bundle, read only once the caller is known.
+
+    Depending on current_team first means an anonymous client cannot make the
+    server buffer megabytes before the 401. FastAPI caches the dependency, so
+    the handler's own current_team is the same lookup, not a second one.
+    """
+    return await read_limited_body(request, MAX_BODY_BYTES, "Bundle")
+
+
 def optional_team_from_token(
     x_team_token: str | None, authorization: str | None
 ) -> sqlite3.Row | None:
@@ -1066,7 +1157,13 @@ def optional_team_from_token(
 
 
 @app.post("/api/register")
-def register(payload: dict = Body(...)) -> JSONResponse:
+def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
+    if REGISTER_CODE:
+        supplied = payload.get("code")
+        if not isinstance(supplied, str) or not secrets.compare_digest(
+            supplied, REGISTER_CODE
+        ):
+            raise HTTPException(403, detail="Registration code required")
     team = payload.get("team")
     if not isinstance(team, str):
         raise HTTPException(400, detail="Body must be {\"team\": \"<name>\"}")
@@ -1095,22 +1192,14 @@ def register(payload: dict = Body(...)) -> JSONResponse:
 
 @app.post("/api/eps")
 def submit_eps(
-    body: bytes = Depends(raw_body),
-    x_team_token: str | None = Header(default=None),
-    authorization: str | None = Header(default=None),
+    body: bytes = Depends(bundle_body),
+    team: sqlite3.Row = Depends(current_team),
 ) -> Response:
-    team = team_from_token(x_team_token, authorization)
-
-    if len(body) > MAX_BODY_BYTES:
-        raise HTTPException(
-            413,
-            detail=f"Bundle too large ({len(body)} bytes); limit is "
-            f"{MAX_BODY_BYTES} bytes",
-        )
-
     try:
         bundle = json.loads(body)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        # RecursionError: json rejects deeply nested input by blowing the stack,
+        # which is still the client's bad payload, not a server fault.
         raise HTTPException(400, detail="Body is not valid JSON")
 
     # Audit log: save the raw submission before anything else.
@@ -1212,9 +1301,11 @@ def leaderboard() -> list[dict]:
         first_blood = bool(team["first_blood"])
         # Interop track: points for consuming distinct partners' documents
         # plus points for each distinct team that consumed this team's own.
-        interop = INTEROP_CONSUMER_POINTS * consumed.get(
-            team["id"], 0
-        ) + INTEROP_PRODUCER_POINTS * produced.get(team["id"], 0)
+        interop = min(
+            INTEROP_CAP,
+            INTEROP_CONSUMER_POINTS * consumed.get(team["id"], 0)
+            + INTEROP_PRODUCER_POINTS * produced.get(team["id"], 0),
+        )
         if team_subs:
             # Highest-scoring submission drives the team score and the
             # richness columns; its timestamp is the moment the team first
@@ -1324,7 +1415,7 @@ def submission_detail(sub_id: int) -> dict:
         raise HTTPException(404, detail="Submission file missing")
     try:
         bundle = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
+    except (ValueError, UnicodeDecodeError, RecursionError):
         bundle = None  # summarize_bundle degrades gracefully
     return {
         "id": row["id"],
@@ -1335,6 +1426,9 @@ def submission_detail(sub_id: int) -> dict:
         "errors": row["errors"],
         "warnings": row["warnings"],
         "score": row["score"],
+        # The stored verdict stands even when the file no longer parses, so say
+        # so explicitly: an empty summary otherwise reads as an empty document.
+        "bundle_readable": bundle is not None,
         "summary": summarize_bundle(bundle),
     }
 
@@ -1371,7 +1465,7 @@ SAMPLES = [
     },
     {
         "id": "arne-complex-care",
-        "name": "Arne Bergqvist, 83",
+        "name": "Arne Bergström, 83",
         "tagline": "Multimorbid, admitted after a fall in Copenhagen",
         "scenario": (
             "A Swedish pensioner falls while visiting his son in Denmark and "
@@ -1514,9 +1608,26 @@ def exchange_fetch(
     )
 
 
+def receipt_mismatches(
+    bundle, family: str, birth: str, medications: int, allergies: int
+) -> list[str]:
+    """Which declared receipt fields disagree with the document."""
+    truth = interop_ground_truth(bundle)
+    out = []
+    if family.strip().casefold() not in truth["families"]:
+        out.append("patient_family")
+    if truth["birth_date"] is None or birth.strip() != truth["birth_date"]:
+        out.append("birth_date")
+    if medications != truth["medications"]:
+        out.append("medications")
+    if allergies != truth["allergies"]:
+        out.append("allergies")
+    return out
+
+
 @app.post("/api/interop/confirm")
 def interop_confirm(
-    payload: dict = Body(...),
+    payload: dict = Depends(small_json_body),
     x_team_token: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> JSONResponse:
@@ -1544,10 +1655,16 @@ def interop_confirm(
                 raise HTTPException(
                     400, detail="exchange_id is not a valid submission of that partner"
                 )
+            candidates = [sub]
         else:
-            sub = best_valid_submission(conn, partner["id"])
-            if sub is None:
+            candidates = conn.execute(
+                "SELECT * FROM submissions WHERE team_id = ? AND pass = 1 "
+                "ORDER BY score DESC, ts ASC, id ASC",
+                (partner["id"],),
+            ).fetchall()
+            if not candidates:
                 raise HTTPException(404, detail="Partner has no valid submission yet")
+            sub = candidates[0]
 
     family = payload.get("patient_family")
     birth = payload.get("birth_date")
@@ -1564,24 +1681,28 @@ def interop_confirm(
             "medications (int) and allergies (int)",
         )
 
-    raw = read_submission_bytes(partner["slug"], sub["filename"])
-    if raw is None:
+    # A partner who re-submits changes which document is "theirs", so a receipt
+    # is checked against every valid submission they hold, best first - otherwise
+    # a consumer who read the document correctly is failed for the producer's
+    # timing. Mismatches are reported against the current best.
+    mismatched = None
+    for candidate in candidates:
+        raw = read_submission_bytes(partner["slug"], candidate["filename"])
+        if raw is None:
+            continue
+        try:
+            bundle = json.loads(raw)
+        except (ValueError, UnicodeDecodeError, RecursionError):
+            continue
+        fields = receipt_mismatches(bundle, family, birth, medications, allergies)
+        if not fields:
+            sub = candidate
+            mismatched = []
+            break
+        if mismatched is None:
+            mismatched = fields
+    if mismatched is None:
         raise HTTPException(404, detail="Exchange document file missing")
-    try:
-        bundle = json.loads(raw)
-    except (ValueError, UnicodeDecodeError):
-        bundle = None
-    truth = interop_ground_truth(bundle)
-
-    mismatched = []
-    if family.strip().casefold() not in truth["families"]:
-        mismatched.append("patient_family")
-    if truth["birth_date"] is None or birth.strip() != truth["birth_date"]:
-        mismatched.append("birth_date")
-    if medications != truth["medications"]:
-        mismatched.append("medications")
-    if allergies != truth["allergies"]:
-        mismatched.append("allergies")
     if mismatched:
         # Deliberately do not echo the expected values - consuming teams must
         # extract them from the document themselves.
@@ -1966,6 +2087,8 @@ body.cmp-wide main, body.cmp-wide header { max-width: 1560px; }
 .tl-detail { font-size: 0.83rem; color: var(--muted); }
 .tl-undated { border: 1px dashed var(--warn); border-radius: var(--r-card); padding: 10px 14px;
   margin-top: 18px; background: var(--warn-bg); }
+.tl-asserted { border: 1px dashed var(--pass); border-radius: var(--r-card);
+  padding: 10px 14px; margin-top: 18px; background: var(--pass-bg); }
 /* C - dashboard */
 .db-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 12px; margin-top: 12px; }
@@ -2062,14 +2185,16 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   <p class="muted" style="margin:0">
     Any <strong>error or fatal</strong> validation issue scores the submission
     <strong>0</strong> - fix conformance first. A valid bundle earns
-    <strong>50</strong>, plus <strong>+10</strong> per Composition section that
-    actually contains entries, plus <strong>+2</strong> per clinical resource in
-    the bundle (everything except the Composition and Patient), capped at +60.
-    Your team score is your <strong>best submission</strong>; the first team to
-    go valid keeps a one-time <strong>+20 first blood</strong> bonus.
+    <strong>50</strong>, plus <strong>+10</strong> per <em>distinct</em>
+    Composition section that actually contains entries (capped at +160), plus
+    <strong>+2</strong> per clinical resource in the bundle (everything except
+    the Composition and Patient, capped at +60). Sections count once each -
+    repeating a section, or padding the bundle, does not make the document
+    richer. Your team score is your <strong>best submission</strong>; the first
+    team to go valid keeps a one-time <strong>+20 first blood</strong> bonus.
     Interop adds on top: <strong>+25</strong> for every partner document your
     team proves it consumed and <strong>+10</strong> for every team that
-    consumes yours.
+    consumes yours, up to <strong>+100</strong> in total.
   </p>
 </section>
 
@@ -2113,8 +2238,8 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
     </div>
     <div class="spinner" id="spinner"><span class="ring"></span>
       <span>Validating against <a href="https://github.com/ahdis/matchbox"
-      target="_blank" rel="noopener">Matchbox</a> - this can take up to 30
-      seconds...</span></div>
+      target="_blank" rel="noopener">Matchbox</a> - usually a few seconds, up
+      to a minute on the first submission after it starts...</span></div>
     <div class="error-note" id="submit-error"></div>
     <div class="banner" id="banner"></div>
     <div id="issues-wrap">
@@ -2470,9 +2595,12 @@ $("#submit-btn").addEventListener("click", async () => {
     let text;
     if (pass) {
       const resPts = Math.min(60, resources * 2);
-      const base = 50 + sections * 10 + resPts;
-      text = "✔ VALID - 50 + " + sections + " section" + (sections === 1 ? "" : "s")
-        + " ×10 + " + resources + " resource" + (resources === 1 ? "" : "s") + " ×2"
+      const secPts = Math.min(160, sections * 10);
+      const base = 50 + secPts + resPts;
+      text = "✔ VALID - 50 + " + sections + " distinct section"
+        + (sections === 1 ? "" : "s") + " ×10"
+        + (sections * 10 > 160 ? " (capped at +160)" : "")
+        + " + " + resources + " resource" + (resources === 1 ? "" : "s") + " ×2"
         + (resources * 2 > 60 ? " (capped at +60)" : "")
         + (score > base ? " + 20 first blood" : "")
         + " = " + score;
@@ -2616,13 +2744,22 @@ const CAT_ORDER = ["allergy", "problem", "medication", "result", "procedure",
   "immunization", "device", "plan", "other"];
 const RISK_FLAGS = ["high risk", "severe", "abnormal"];
 
-function cvItems(s) {
+/* Split deliberately: a resource the document never references is not part of
+   any section, so counting it under one contradicts that section's own
+   emptyReason assertion. Views that show everything use cvItems; views that
+   speak for a section use cvSectionItems and surface orphans separately. */
+function cvSectionItems(s) {
   const out = [];
   (s.sections || []).forEach((sec) => (sec.items || []).forEach((it) =>
     out.push(Object.assign({ section: sec.title || "Untitled section" }, it))));
-  (s.unreferenced || []).forEach((it) =>
-    out.push(Object.assign({ section: null, orphan: true }, it)));
   return out;
+}
+function cvOrphans(s) {
+  return (s.unreferenced || []).map((it) =>
+    Object.assign({ section: null, orphan: true }, it));
+}
+function cvItems(s) {
+  return cvSectionItems(s).concat(cvOrphans(s));
 }
 const cvCat = (items, cat) => items.filter((i) => i.category === cat);
 const hasFlag = (it, f) => (it.flags || []).indexOf(f) !== -1;
@@ -2668,13 +2805,20 @@ function sectionFor(sections, kind) {
 }
 
 /* ---- B: clinical timeline ---- */
+/* String comparison would sort an unparseable date above every real event,
+   silently moving the newest entry off the top of the timeline. */
+function tlTime(v) {
+  const t = Date.parse(shortDate(v));
+  return isNaN(t) ? null : t;
+}
+
 function viewTimeline(d) {
   const s = d.summary || {};
   const q = s.quality || {};
   const items = cvItems(s);
-  const dated = items.filter((i) => i.date)
-    .sort((a, b) => (a.date < b.date ? 1 : (a.date > b.date ? -1 : 0)));
-  const undated = items.filter((i) => !i.date);
+  const dated = items.filter((i) => tlTime(i.date) !== null)
+    .sort((a, b) => tlTime(b.date) - tlTime(a.date));
+  const undated = items.filter((i) => tlTime(i.date) === null);
   const cats = CAT_ORDER.filter((c) => items.some((i) => i.category === c));
   let h = '<div class="tl-legend">' + cats.map((c) =>
     '<span class="c-' + esc(c) + '"><i class="cdot"></i>' + esc(CAT_LABEL[c] || c)
@@ -2707,10 +2851,25 @@ function viewTimeline(d) {
 
   if (undated.length) {
     h += '<div class="tl-undated"><strong>'
-      + plural(undated.length, "entry", "entries") + " with no date</strong>"
+      + plural(undated.length, "entry", "entries") + " with no usable date</strong>"
       + '<p class="muted" style="margin:2px 0 4px;font-size:0.8rem">Present in the'
       + " document but impossible to place in the patient's history.</p>"
       + '<ul class="cv-items">' + undated.map(cvItemHtml).join("") + "</ul></div>";
+  }
+
+  const asserted = (s.sections || [])
+    .filter((x) => !(x.items || []).length && x.empty_reason);
+  if (asserted.length) {
+    h += '<div class="tl-asserted"><strong>'
+      + plural(asserted.length, "section", "sections")
+      + " asserting there is nothing to report</strong>"
+      + '<p class="muted" style="margin:2px 0 4px;font-size:0.8rem">Nothing to'
+      + " place on the timeline, but the author positively stated these are"
+      + " empty. That is a clinical finding, not missing data.</p>"
+      + '<ul class="cv-items">' + asserted.map((x) => "<li>"
+          + esc(x.title || "Untitled section") + '<span class="chip cvc ok">'
+          + esc(x.empty_reason) + "</span></li>").join("")
+      + "</ul></div>";
   }
   return h;
 }
@@ -2743,12 +2902,17 @@ function viewDashboard(d) {
   const q = s.quality || {};
   const p = s.patient;
   const sections = s.sections || [];
-  const items = cvItems(s);
+  const items = cvSectionItems(s);
+  const orphans = cvOrphans(s);
   const allergies = cvCat(items, "allergy");
   const problems = cvCat(items, "problem");
   const meds = cvCat(items, "medication");
   const results = cvCat(items, "result");
   const shots = cvCat(items, "immunization");
+  const procedures = cvCat(items, "procedure");
+  const devices = cvCat(items, "device");
+  const plans = cvCat(items, "plan");
+  const other = cvCat(items, "other");
   const docDate = (s.composition || {}).date;
   let h = '<div class="db-grid">';
 
@@ -2762,19 +2926,31 @@ function viewDashboard(d) {
     + "</div>", p && p.name ? "" : "alert");
 
   const high = allergies.filter((a) => hasFlag(a, "high risk"));
+  const orphanAllergies = cvCat(orphans, "allergy");
   const allergySec = sectionFor(sections, "allergy");
   let aBody;
   let aCls = "";
   if (allergies.length) {
+    /* Truncating in source order can drop a high-risk allergy off a list that
+       still shows five low-risk ones, so risk comes first. */
     aBody = '<div class="db-big">' + allergies.length
       + (high.length ? ' <span class="chip cvc risk">' + high.length
           + " high risk</span>" : "") + "</div>"
-      + dbList(allergies, 5, dbRow);
+      + dbList(high.concat(allergies.filter((a) => !hasFlag(a, "high risk"))),
+               5, dbRow);
     aCls = high.length ? "alert" : "";
   } else if (allergySec && allergySec.empty_reason) {
     aBody = '<div class="db-big">' + esc(allergySec.empty_reason) + "</div>"
-      + '<div class="db-sub">Positively asserted by the author - safe to rely on.</div>';
-    aCls = "good";
+      + (orphanAllergies.length
+          ? '<div class="db-sub">Contradicted: '
+            + plural(orphanAllergies.length, "allergy resource",
+                     "allergy resources")
+            + " sits in the bundle unreferenced, so the assertion and the data"
+            + " disagree. Do not rely on either.</div>"
+            + dbList(orphanAllergies, 5, dbRow)
+          : '<div class="db-sub">Positively asserted by the author - safe to'
+            + " rely on.</div>");
+    aCls = orphanAllergies.length ? "alert" : "good";
   } else {
     aBody = '<div class="db-big">Unknown</div><div class="db-sub">Neither an allergy'
       + " nor a statement that none is known.</div>";
@@ -2791,13 +2967,17 @@ function viewDashboard(d) {
     + dbList(active.length ? active : problems, 5, dbRow),
     problems.filter((x) => hasFlag(x, "severe")).length ? "alert" : "");
 
-  const noDose = countGap(meds, "no dose");
+  const activeMeds = meds.filter((x) => hasFlag(x, "active"));
+  const medsShown = activeMeds.length ? activeMeds : meds;
+  const noDose = countGap(medsShown, "no dose");
   h += dbCard("Current medication",
-    '<div class="db-big">' + meds.length + "</div>"
-    + '<div class="db-sub">' + (meds.length
-        ? (noDose ? noDose + " without a usable dose" : "all with a dose")
-        : "nothing recorded") + "</div>"
-    + dbList(meds, 5, dbRow), noDose ? "alert" : "");
+    '<div class="db-big">' + (activeMeds.length || meds.length) + "</div>"
+    + '<div class="db-sub">' + (activeMeds.length
+        ? "active of " + meds.length + " recorded"
+          + (noDose ? ", " + noDose + " without a usable dose" : "")
+        : (meds.length ? "recorded, none marked active" : "nothing recorded"))
+    + "</div>"
+    + dbList(medsShown, 5, dbRow), noDose ? "alert" : "");
 
   if (results.length) {
     const recent = results.slice()
@@ -2815,6 +2995,25 @@ function viewDashboard(d) {
     h += dbCard("Vaccinations", '<div class="db-big">' + shots.length + "</div>"
       + dbList(shots.slice().sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1),
                4, dbRow));
+  }
+  if (procedures.length) {
+    h += dbCard("Procedures", '<div class="db-big">' + procedures.length + "</div>"
+      + dbList(procedures.slice()
+          .sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1), 5, dbRow));
+  }
+  if (devices.length) {
+    h += dbCard("Devices and implants",
+      '<div class="db-big">' + devices.length + "</div>"
+      + dbList(devices, 5, dbRow));
+  }
+  if (plans.length) {
+    h += dbCard("Care plan", '<div class="db-big">' + plans.length + "</div>"
+      + dbList(plans, 5, dbRow));
+  }
+  if (other.length) {
+    h += dbCard("Other entries", '<div class="db-big">' + other.length + "</div>"
+      + '<div class="db-sub">carried by the document but outside the standard'
+      + " summary categories</div>" + dbList(other, 5, dbRow));
   }
 
   const empty = sections.filter((x) => !(x.items || []).length);
@@ -2922,6 +3121,11 @@ function renderClinicianDoc(d) {
   } else if (!d.pass) {
     html += '<div class="warn-banner">Invalid submission - this document failed'
       + " validation and would be rejected in production. Content shown as-is.</div>";
+  }
+  if (d.bundle_readable === false) {
+    html += '<div class="warn-banner">The stored document no longer parses as'
+      + " JSON. The validation verdict below is the one recorded at submission"
+      + " time; nothing under it was read from the file.</div>";
   }
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
   html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)

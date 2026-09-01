@@ -1,0 +1,17 @@
+# Test-only dependencies. Runtime deps come from requirements.txt.
+#
+# Install:  python -m pip install -r requirements.txt -r requirements-dev.txt
+# Run:      python -m pytest -q test_app.py
+
+pytest==9.1.1
+
+# fastapi.testclient needs httpx
+httpx==0.28.1
+
+# transitive - pytest / httpx
+certifi==2026.6.17
+httpcore==1.0.9
+iniconfig==2.3.0
+packaging==26.2
+pluggy==1.6.0
+Pygments==2.20.0

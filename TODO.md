@@ -15,8 +15,9 @@ Known occurrences in `connectathon/app.py`:
 - `<title>EPS Connectathon</title>`
 - `<h1>EPS Connectathon - Patient Summary Challenge</h1>`
 
-Also check `connectathon/README.md`, the `Dockerfile`, and the test assertions
-in `connectathon/test_app.py` that match on the current title.
+Also check `connectathon/README.md` (H1) and the test assertions in
+`connectathon/test_app.py` that match on the current title (module docstring,
+and the UI title assertion around line 900).
 
 Leave `connectathon.db` / the `DATA_DIR` layout alone - renaming the database
 file buys nothing and breaks existing deployments.
