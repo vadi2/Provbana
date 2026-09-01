@@ -23,6 +23,9 @@ PROFILE = os.environ.get(
     "PROFILE", "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
 )
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
+SAMPLES_DIR = os.environ.get(
+    "SAMPLES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
+)
 PORT = int(os.environ.get("PORT", "8095"))
 
 # Reject oversized submissions before they hit the audit log or Matchbox. The
@@ -1316,6 +1319,98 @@ def submission_bundle(sub_id: int) -> Response:
     return Response(content=raw, media_type="application/fhir+json")
 
 
+# ----------------------------------------------------------------- sample API
+
+# Synthetic worked examples of the Nordic Hackathon 2026 scenarios. They are
+# hand-authored to exercise the clinician views (nil-known assertions, stale
+# data, a non-English document) and do not come from any real system, record
+# or person.
+SAMPLES = [
+    {
+        "id": "andrea-cross-border",
+        "name": "Andrea Lindqvist, 24",
+        "tagline": "Type 1 diabetes, seen in a Paris emergency department",
+        "scenario": (
+            "A Swedish exchange student collapses in Paris. Her summary is "
+            "complete and well coded, but the data behind it has gone stale: "
+            "the last labs are eight months old and the follow-up that would "
+            "have refreshed them was cancelled and never rebooked."
+        ),
+        "language": "English",
+    },
+    {
+        "id": "arne-complex-care",
+        "name": "Arne Bergqvist, 83",
+        "tagline": "Multimorbid, admitted after a fall in Copenhagen",
+        "scenario": (
+            "A Swedish pensioner falls while visiting his son in Denmark and "
+            "needs surgery. Ten conditions, ten medicines and a high-criticality "
+            "penicillin anaphylaxis have to survive the border. The document is "
+            "authored in Swedish, so section identity rests on the LOINC codes "
+            "rather than the titles."
+        ),
+        "language": "Swedish",
+    },
+]
+
+SAMPLE_DISCLAIMER = (
+    "Synthetic example. Hand-authored for the hackathon scenarios - it does "
+    "not come from any real system, record or person, and only illustrates how "
+    "such a summary could look."
+)
+
+
+def _sample_meta(sample_id: str) -> dict | None:
+    return next((s for s in SAMPLES if s["id"] == sample_id), None)
+
+
+def read_sample_bytes(sample_id: str) -> bytes | None:
+    if _sample_meta(sample_id) is None:
+        return None
+    try:
+        with open(os.path.join(SAMPLES_DIR, sample_id + ".json"), "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+@app.get("/api/samples")
+def list_samples() -> dict:
+    return {
+        "disclaimer": SAMPLE_DISCLAIMER,
+        "samples": [dict(s, available=read_sample_bytes(s["id"]) is not None)
+                    for s in SAMPLES],
+    }
+
+
+@app.get("/api/samples/{sample_id}")
+def sample_detail(sample_id: str) -> dict:
+    meta = _sample_meta(sample_id)
+    raw = read_sample_bytes(sample_id)
+    if meta is None or raw is None:
+        raise HTTPException(404, detail="Unknown sample")
+    return {
+        "id": meta["id"],
+        "team": meta["name"],
+        "team_slug": meta["id"],
+        "ts": None,
+        "pass": True,
+        "errors": 0,
+        "warnings": 0,
+        "score": None,
+        "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
+        "summary": summarize_bundle(json.loads(raw)),
+    }
+
+
+@app.get("/api/samples/{sample_id}/bundle")
+def sample_bundle(sample_id: str) -> Response:
+    raw = read_sample_bytes(sample_id)
+    if raw is None:
+        raise HTTPException(404, detail="Unknown sample")
+    return Response(content=raw, media_type="application/fhir+json")
+
+
 # ---------------------------------------------------------------- interop API
 
 
@@ -1703,6 +1798,20 @@ h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
   margin: 0 0 14px; font-weight: 600; }
 tr.cv-row { cursor: pointer; }
 tr.cv-row:hover td { background: var(--accent-soft); }
+/* sample documents */
+.cv-samples { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin: 10px 0 4px; }
+.cv-sample { text-align: left; background: var(--card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 14px; cursor: pointer; color: inherit;
+  display: flex; flex-direction: column; gap: 4px; }
+.cv-sample:hover { border-color: var(--accent); background: var(--accent-soft); filter: none; }
+.cv-sample .s-name { font-weight: 700; }
+.cv-sample .s-tag { font-size: 0.85rem; color: var(--muted); }
+.cv-sample .s-why { font-size: 0.78rem; color: var(--muted); }
+.sample-note { margin: 6px 0 0; font-size: 0.78rem; }
+.sample-banner { padding: 10px 14px; border-radius: 10px; margin: 0 0 14px;
+  font-size: 0.85rem; color: var(--muted); background: var(--code-bg);
+  border: 1px solid var(--border); }
 /* clinician view modes */
 .cv-modes { display: flex; gap: 6px; flex-wrap: wrap; margin: 14px 0 0; }
 .cv-mode { background: transparent; color: var(--muted); border: 1px solid var(--border);
@@ -1728,16 +1837,6 @@ tr.cv-row:hover td { background: var(--accent-soft); }
 .c-other { --cat: #8b93a1; }
 .cdot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
   background: var(--cat, var(--accent)); margin-right: 5px; vertical-align: middle; }
-/* A - narrative */
-.nv { max-width: 64ch; }
-.nv p { margin: 0 0 12px; font-size: 0.98rem; line-height: 1.62; }
-.nv p.lede { font-size: 1.14rem; font-weight: 600; line-height: 1.45; margin-bottom: 14px; }
-.nv .nv-risk { color: var(--fail); font-weight: 700; }
-.nv .nv-key { background: var(--accent-soft); border-radius: 4px; padding: 0 3px; font-weight: 600; }
-.nv h4 { margin: 20px 0 6px; font-size: 0.74rem; text-transform: uppercase;
-  letter-spacing: 0.07em; color: var(--muted); }
-.nv ul.nv-unknown { margin: 0; padding-left: 20px; font-size: 0.88rem; color: var(--muted); }
-.nv ul.nv-unknown li { margin: 3px 0; }
 /* B - timeline */
 .tl-legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 0.78rem;
   color: var(--muted); margin-top: 10px; }
@@ -1782,21 +1881,6 @@ tr.cv-row:hover td { background: var(--accent-soft); }
 .meter > span { display: block; height: 100%; background: var(--pass); }
 .meter.mid > span { background: var(--warn); }
 .meter.low > span { background: var(--fail); }
-/* side-by-side compare */
-.cmp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px; margin-top: 14px; }
-@media (max-width: 1150px) { .cmp-grid { grid-template-columns: 1fr; } }
-.cmp-col { border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
-  min-width: 0; }
-.cmp-col > h3 { margin: 0; font-size: 0.95rem; }
-.cmp-col > p.cmp-why { margin: 2px 0 10px; font-size: 0.78rem; color: var(--muted);
-  line-height: 1.45; }
-.cmp-body { max-height: 68vh; overflow-y: auto; padding-right: 4px; }
-.cmp-col .db-grid { grid-template-columns: 1fr; }
-.cmp-col .nv { max-width: none; }
-.cmp-col .nv p { font-size: 0.9rem; }
-.cmp-col .nv p.lede { font-size: 1rem; }
-body.cmp-wide main, body.cmp-wide header { max-width: 1560px; }
 /* interop */
 ol.steps { margin: 8px 0 14px; padding-left: 22px; }
 ol.steps li { margin: 6px 0; }
@@ -1942,18 +2026,20 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   <h2>Clinician view</h2>
   <p class="muted" style="margin:0 0 4px">A readable rendering of submitted
   patient summaries - what a clinician would actually see.</p>
+  <h3 class="cv-sec" style="margin-top:14px">Example documents</h3>
+  <div class="cv-samples" id="cv-samples"></div>
+  <p class="muted sample-note" id="cv-samples-note"></p>
+  <h3 class="cv-sec">Submitted documents</h3>
   <label for="cv-team">Company</label>
   <select id="cv-team"><option value="">Select a company...</option></select>
   <div class="cv-modes" id="cv-modes">
-    <button class="cv-mode active" data-mode="compare">Compare all 3</button>
-    <button class="cv-mode" data-mode="narrative">A &middot; Narrative note</button>
-    <button class="cv-mode" data-mode="timeline">B &middot; Timeline</button>
-    <button class="cv-mode" data-mode="dashboard">C &middot; Safety dashboard</button>
+    <button class="cv-mode active" data-mode="dashboard">Safety dashboard</button>
+    <button class="cv-mode" data-mode="timeline">Clinical timeline</button>
     <button class="cv-mode" data-mode="document">Document</button>
   </div>
-  <p class="muted cv-hint">Three candidate renderings of the same EPS data, so a
-  clinician can judge whether what the profile captures is clinically usable.
-  <em>Document</em> is the plain section-by-section rendering for reference.</p>
+  <p class="muted cv-hint">The <em>safety dashboard</em> opens by default: risk and
+  completeness first. Switch to the <em>clinical timeline</em> to read the same data
+  as a chronology, or to <em>document</em> for the plain section-by-section rendering.</p>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
 
@@ -2295,9 +2381,34 @@ $("#curl-leaderboard").textContent =
 /* ---- clinician view ---- */
 let cvSubs = [];
 let cvCurrent = null;
-let cvMode = "compare";
+let cvMode = "dashboard";
+let cvDisclaimer = "";
+
+async function initSamples() {
+  let data;
+  try {
+    const res = await fetch("/api/samples");
+    if (!res.ok) return;
+    data = await res.json();
+  } catch (e) { return; }
+  cvDisclaimer = data.disclaimer || "";
+  $("#cv-samples").innerHTML = (data.samples || [])
+    .filter((s) => s.available)
+    .map((s) => '<button class="cv-sample" data-sample="' + esc(s.id) + '">'
+      + '<span class="s-name">' + esc(s.name)
+      + '<span class="chip cvc">' + esc(s.language) + "</span></span>"
+      + '<span class="s-tag">' + esc(s.tagline) + "</span>"
+      + '<span class="s-why">' + esc(s.scenario) + "</span></button>").join("");
+  $("#cv-samples-note").textContent = cvDisclaimer;
+}
+
+$("#cv-samples").addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".cv-sample");
+  if (btn) openDoc("/api/samples/" + btn.dataset.sample);
+});
 
 async function initClinician() {
+  initSamples();
   try {
     const res = await fetch("/api/submissions?limit=200");
     if (!res.ok) return;
@@ -2341,13 +2452,13 @@ function renderCvList() {
 $("#cv-team").addEventListener("change", renderCvList);
 $("#cv-list").addEventListener("click", (ev) => {
   const row = ev.target.closest("tr.cv-row");
-  if (row) openSubmission(parseInt(row.dataset.id, 10));
+  if (row) openDoc("/api/submissions/" + parseInt(row.dataset.id, 10));
 });
 
-async function openSubmission(id) {
+async function openDoc(url) {
   let data;
   try {
-    const res = await fetch("/api/submissions/" + id);
+    const res = await fetch(url);
     if (!res.ok) return;
     data = await res.json();
   } catch (e) { return; }
@@ -2356,10 +2467,15 @@ async function openSubmission(id) {
 }
 
 function cvItemHtml(item) {
+  // the status pill already says "active"; a flag chip repeating it is noise
+  const chips = item.status
+    ? cvChips(Object.assign({}, item,
+        { flags: (item.flags || []).filter((f) => f !== item.status) }))
+    : cvChips(item);
   return "<li>"
     + '<span class="cv-label">' + esc(item.label || "Unnamed item") + "</span>"
     + (item.status ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
-    + cvChips(item)
+    + chips
     + (item.detail ? '<div class="cv-detail muted">' + esc(item.detail) + "</div>" : "")
     + "</li>";
 }
@@ -2421,174 +2537,6 @@ function monthsSince(from, to) {
 
 function sectionFor(sections, kind) {
   return (sections || []).find((x) => x.kind === kind) || null;
-}
-const agree = (n, sing, plur) => n + " " + (n === 1 ? sing : plur);
-
-/* ---- A: narrative handover note ---- */
-function viewNarrative(d) {
-  const s = d.summary || {};
-  const q = s.quality || {};
-  const p = s.patient;
-  const sections = s.sections || [];
-  const docDate = (s.composition || {}).date;
-  const items = cvItems(s);
-  const allergies = cvCat(items, "allergy");
-  const problems = cvCat(items, "problem");
-  const meds = cvCat(items, "medication");
-  const results = cvCat(items, "result");
-  const shots = cvCat(items, "immunization");
-  const procs = cvCat(items, "procedure");
-  const devices = cvCat(items, "device");
-  let h = '<div class="nv">';
-
-  const age = p ? cvAge(p.birth_date, docDate) : null;
-  if (p && p.name) {
-    const bits = [];
-    if (age !== null) bits.push(age + "-year-old");
-    if (p.gender) bits.push(esc(p.gender));
-    h += '<p class="lede">' + esc(p.name)
-      + (bits.length ? ", " + bits.join(" ") : "") + "."
-      + (p.birth_date ? ' <span class="muted">Born ' + esc(shortDate(p.birth_date))
-          + ".</span>" : "")
-      + "</p>";
-  } else {
-    h += '<p class="lede nv-risk">This document does not name the patient.</p>';
-  }
-
-  if (allergies.length) {
-    const high = allergies.filter((a) => hasFlag(a, "high risk"));
-    h += "<p>";
-    if (high.length) {
-      h += '<span class="nv-risk">'
-        + plural(high.length, "high-risk allergy", "high-risk allergies") + ":</span> "
-        + names(high, 4) + ". ";
-    }
-    h += "The summary records "
-      + plural(allergies.length, "allergy or intolerance", "allergies or intolerances")
-      + ": " + names(allergies, 6)
-      + (allergies.length > 6 ? " and " + (allergies.length - 6) + " more" : "") + ".";
-    const noCrit = countGap(allergies, "no criticality");
-    const noReac = countGap(allergies, "no reaction recorded");
-    const missing = [];
-    if (noCrit) missing.push(agree(noCrit, "carries", "carry")
-      + " no criticality rating");
-    if (noReac) missing.push(agree(noReac, "does not", "do not")
-      + " describe the reaction");
-    if (missing.length) {
-      h += ' <span class="muted">But ' + missing.join(", and ")
-        + ", so the danger cannot be judged from this document alone.</span>";
-    }
-    h += "</p>";
-  } else {
-    const sec = sectionFor(sections, "allergy");
-    if (sec && sec.empty_reason) {
-      h += '<p>Allergies: <span class="nv-key">' + esc(sec.empty_reason)
-        + "</span>. The author asserted this positively, so the blank is a clinical"
-        + " statement rather than missing data.</p>";
-    } else {
-      h += '<p><span class="nv-risk">No allergy information at all.</span> The document'
-        + " neither lists an allergy nor states that none is known, so nothing may be"
-        + " assumed before prescribing.</p>";
-    }
-  }
-
-  if (problems.length) {
-    const active = problems.filter((x) => hasFlag(x, "active"));
-    const shown = active.length ? active : problems;
-    h += "<p>" + (active.length
-      ? plural(active.length, "active problem") + " of " + problems.length + " recorded"
-      : plural(problems.length, "problem") + " recorded, none marked active")
-      + ": " + names(shown, 6)
-      + (shown.length > 6 ? " and " + (shown.length - 6) + " more" : "") + ".";
-    const severe = problems.filter((x) => hasFlag(x, "severe")).length;
-    if (severe) h += ' <span class="nv-risk">' + severe + " marked severe.</span>";
-    const undated = problems.filter((x) => !x.date).length;
-    if (undated) {
-      h += ' <span class="muted">' + agree(undated, "carries", "carry")
-        + " no onset date, so the course of the illness cannot be read.</span>";
-    }
-    h += "</p>";
-  } else {
-    const sec = sectionFor(sections, "problem");
-    h += "<p>No problems or diagnoses are listed"
-      + (sec && sec.empty_reason ? ' - stated as <span class="nv-key">'
-          + esc(sec.empty_reason) + "</span>" : "") + ".</p>";
-  }
-
-  if (meds.length) {
-    const noDose = countGap(meds, "no dose");
-    h += "<p>" + plural(meds.length, "medicine") + " listed: " + names(meds, 6)
-      + (meds.length > 6 ? " and " + (meds.length - 6) + " more" : "") + ".";
-    h += noDose
-      ? ' <span class="nv-risk">' + agree(noDose, "carries", "carry")
-        + " no dose or frequency</span>, which is not enough to safely continue"
-        + " treatment."
-      : " Every entry carries a dose.";
-    h += "</p>";
-  } else {
-    const sec = sectionFor(sections, "medication");
-    h += "<p>No medication is listed"
-      + (sec && sec.empty_reason ? ' - stated as <span class="nv-key">'
-          + esc(sec.empty_reason) + "</span>" : "") + ".</p>";
-  }
-
-  const also = [];
-  if (results.length) {
-    const abn = results.filter((r) => hasFlag(r, "abnormal")).length;
-    const noVal = countGap(results, "no value");
-    also.push(plural(results.length, "result")
-      + (abn ? ", " + abn + " flagged abnormal" : "")
-      + (noVal ? ", " + noVal + " with no value recorded" : ""));
-  }
-  if (shots.length) also.push(plural(shots.length, "vaccination"));
-  if (procs.length) also.push(plural(procs.length, "procedure"));
-  if (devices.length) also.push(plural(devices.length, "device"));
-  if (also.length) h += "<p>Also present: " + also.join("; ") + ".</p>";
-
-  if (q.latest) {
-    const m = monthsSince(q.latest, docDate);
-    h += "<p>The newest dated entry is " + esc(shortDate(q.latest));
-    h += (m !== null && m > 18)
-      ? ', <span class="nv-risk">' + Math.round(m / 12)
-        + " years before the document date</span>, so this summary may not describe"
-        + " the patient's current state."
-      : ".";
-    if (q.earliest && q.earliest !== q.latest) {
-      h += " History reaches back to " + esc(shortDate(q.earliest)) + ".";
-    }
-    h += "</p>";
-  } else {
-    h += '<p><span class="nv-risk">Nothing in this document carries a date</span>,'
-      + " so none of it can be placed in the patient's history.</p>";
-  }
-
-  const empty = sections.filter((x) => !(x.items || []).length);
-  const asserted = empty.filter((x) => x.empty_reason);
-  if (asserted.length) {
-    h += "<h4>Positively asserted as empty</h4>";
-    h += '<ul class="nv-unknown">' + asserted.map((x) => "<li>"
-      + esc(x.title || "A section") + " - " + esc(x.empty_reason)
-      + "</li>").join("") + "</ul>";
-  }
-  h += "<h4>What a clinician still cannot tell</h4>";
-  const unknown = [];
-  empty.filter((x) => !x.empty_reason).forEach((x) => {
-    unknown.push(esc(x.title || "A section")
-      + " is empty and no reason is given, so it is unclear whether nothing exists"
-      + " or nothing was sent");
-  });
-  Object.keys(q.gaps || {}).forEach((g) => {
-    unknown.push(plural(q.gaps[g], "entry", "entries") + " with " + esc(g));
-  });
-  if ((s.unreferenced || []).length) {
-    unknown.push(plural(s.unreferenced.length, "resource")
-      + " present in the bundle but not referenced by any section");
-  }
-  if (!unknown.length) {
-    unknown.push("Nothing obvious - every entry is coded, dated and complete.");
-  }
-  h += '<ul class="nv-unknown"><li>' + unknown.join("</li><li>") + "</li></ul>";
-  return h + "</div>";
 }
 
 /* ---- B: clinical timeline ---- */
@@ -2817,42 +2765,31 @@ function viewDocument(d) {
 }
 
 const CV_VIEWS = {
-  narrative: { fn: viewNarrative, tag: "A", name: "Narrative handover note",
-    why: "Prose a clinician can read in one pass - shows whether the captured data"
-       + " adds up to a coherent clinical story." },
-  timeline: { fn: viewTimeline, tag: "B", name: "Clinical timeline",
-    why: "Chronology across every section - shows recency and whether the record"
-       + " is current enough to act on." },
-  dashboard: { fn: viewDashboard, tag: "C", name: "Safety dashboard",
-    why: "Risk and completeness first - answers what would stop you prescribing"
-       + " before you read anything else." },
-  document: { fn: viewDocument, tag: "", name: "Document", why: "" },
+  dashboard: viewDashboard,
+  timeline: viewTimeline,
+  document: viewDocument,
 };
-
-function cmpCol(key, d) {
-  const v = CV_VIEWS[key];
-  return '<div class="cmp-col"><h3>' + esc(v.tag + " · " + v.name) + "</h3>"
-    + '<p class="cmp-why">' + esc(v.why) + "</p>"
-    + '<div class="cmp-body">' + v.fn(d) + "</div></div>";
-}
 
 function renderClinicianDoc(d) {
   cvCurrent = d;
   const s = d.summary || {};
   const comp = s.composition || {};
   let html = "";
-  if (!d.pass) {
+  if (d.sample) {
+    html += '<div class="sample-banner"><strong>Example document.</strong> '
+      + esc(d.sample.disclaimer || cvDisclaimer)
+      + ' <a href="/api/samples/' + esc(d.sample.id)
+      + '/bundle" download>Download the FHIR bundle</a>.</div>';
+  } else if (!d.pass) {
     html += '<div class="warn-banner">Invalid submission - this document failed'
       + " validation and would be rejected in production. Content shown as-is.</div>";
   }
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
   html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
-    + " &middot; submitted " + new Date(d.ts).toLocaleString()
-    + (comp.date ? " &middot; document date " + esc(comp.date) : "") + "</p>";
-  html += cvMode === "compare"
-    ? '<div class="cmp-grid">' + cmpCol("narrative", d) + cmpCol("timeline", d)
-      + cmpCol("dashboard", d) + "</div>"
-    : (CV_VIEWS[cvMode] || CV_VIEWS.document).fn(d);
+    + (d.sample ? "" : " &middot; submitted " + new Date(d.ts).toLocaleString())
+    + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
+    + "</p>";
+  html += (CV_VIEWS[cvMode] || viewDashboard)(d);
   const doc = $("#cv-doc");
   doc.innerHTML = html;
   doc.style.display = "block";
@@ -2863,11 +2800,9 @@ document.querySelectorAll(".cv-mode").forEach((btn) => {
     cvMode = btn.dataset.mode;
     document.querySelectorAll(".cv-mode").forEach((b) =>
       b.classList.toggle("active", b === btn));
-    document.body.classList.toggle("cmp-wide", cvMode === "compare");
     if (cvCurrent) renderClinicianDoc(cvCurrent);
   });
 });
-document.body.classList.toggle("cmp-wide", cvMode === "compare");
 
 /* ---- interop testing ---- */
 function interopCurls() {
@@ -2944,7 +2879,7 @@ $("#io-partners").addEventListener("click", (ev) => {
   if (view) {
     ev.preventDefault();
     switchTab("clinician");
-    openSubmission(parseInt(view.dataset.id, 10));
+    openDoc("/api/submissions/" + parseInt(view.dataset.id, 10));
     return;
   }
   const btn = ev.target.closest(".io-confirm");
@@ -3006,6 +2941,7 @@ async function confirmPartner(card, btn) {
 
 /* initial state for the clinician panel */
 renderCvList();
+initSamples();
 </script>
 </body>
 </html>

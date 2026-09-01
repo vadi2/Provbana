@@ -871,14 +871,75 @@ def test_index_has_tabs_and_company_copy(client):
     assert "<th>Interop</th>" in text
 
 
-def test_index_offers_three_clinician_visualisations(client):
+def test_index_offers_dashboard_timeline_and_document_views(client):
     text = client.get("/").text
-    for mode in ("compare", "narrative", "timeline", "dashboard", "document"):
+    for mode in ("dashboard", "timeline", "document"):
         assert 'data-mode="%s"' % mode in text
-    for fn in ("function viewNarrative(", "function viewTimeline(",
-               "function viewDashboard(", "function viewDocument("):
+    for fn in ("function viewTimeline(", "function viewDashboard(",
+               "function viewDocument("):
         assert fn in text
-    assert "cmp-grid" in text
+    # the dashboard is what opens by default
+    assert 'class="cv-mode active" data-mode="dashboard"' in text
+    assert 'let cvMode = "dashboard";' in text
+    # the dropped visualisations left nothing behind
+    assert "viewNarrative" not in text
+    assert "cmp-grid" not in text
+
+
+# ------------------------------------------------------------- sample documents
+
+
+def test_sample_list_is_labelled_synthetic(client):
+    data = client.get("/api/samples").json()
+    assert "does not come from any real system" in data["disclaimer"]
+    ids = {s["id"] for s in data["samples"]}
+    assert ids == {"andrea-cross-border", "arne-complex-care"}
+    assert all(s["available"] for s in data["samples"])
+    assert all(s["name"] and s["tagline"] and s["scenario"] for s in data["samples"])
+
+
+def test_sample_detail_matches_submission_shape(client):
+    data = client.get("/api/samples/andrea-cross-border").json()
+    # the clinician renderer consumes samples and submissions through one path
+    assert set(data) >= {"team", "pass", "summary", "sample"}
+    assert data["pass"] is True
+    assert "does not come from any real system" in data["sample"]["disclaimer"]
+    summary = data["summary"]
+    assert summary["patient"]["name"] == "Andrea Lindqvist"
+    kinds = {s["kind"] for s in summary["sections"]}
+    assert {"allergy", "problem", "medication"} <= kinds
+
+
+def test_sample_asserts_nil_known_allergies_rather_than_omitting_them(client):
+    data = client.get("/api/samples/andrea-cross-border").json()
+    allergies = next(s for s in data["summary"]["sections"] if s["kind"] == "allergy")
+    assert allergies["items"] == []
+    assert allergies["empty_reason"]
+
+
+def test_swedish_sample_is_classified_by_loinc_not_title(client):
+    data = client.get("/api/samples/arne-complex-care").json()
+    sections = {s["kind"]: s for s in data["summary"]["sections"]}
+    assert sections["allergy"]["title"] == "Allergier och intoleranser"
+    assert sections["medication"]["title"] == "Lakemedelslista"
+    assert len(sections["problem"]["items"]) == 10
+    labels = " ".join(i["label"] for i in sections["allergy"]["items"])
+    assert "Penicillin" in labels
+
+
+def test_sample_bundle_downloads_as_fhir(client):
+    res = client.get("/api/samples/arne-complex-care/bundle")
+    assert res.headers["content-type"].startswith("application/fhir+json")
+    doc = res.json()
+    assert doc["type"] == "document"
+    assert doc["meta"]["profile"] == [
+        "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
+    ]
+
+
+def test_unknown_sample_is_404(client):
+    assert client.get("/api/samples/nope").status_code == 404
+    assert client.get("/api/samples/nope/bundle").status_code == 404
 
 
 def test_register_returns_company_note(client):
