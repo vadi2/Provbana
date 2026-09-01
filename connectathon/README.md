@@ -59,8 +59,8 @@ Sections are de-duplicated by their `code`, falling back to their `title`; secti
 neither collapse into one. Repeating a section or padding the bundle therefore earns
 nothing - richness has to be real.
 
-A team's score is its best submission. The first team ever to go valid keeps a one-time
-**+20 first blood** bonus. Interop adds **+25** per partner document the team proved it
+A team's score is its best submission. The first company ever to go valid keeps a one-time
+**+20 first pass** bonus. Interop adds **+25** per partner document the team proved it
 consumed and **+10** per team that consumed the team's own, capped at **+100** together;
 registration is open by design, so the cap is what stops a team farming the track with
 throwaway partners. Set `REGISTER_CODE` if you want registration closed as well.
@@ -88,7 +88,7 @@ Team endpoints authenticate with `X-Team-Token: TOKEN` (or `Authorization: Beare
 ### Registration
 
 ```
-# one team per company - keep the token, it is shown once
+# one registration per company - keep the token, it is shown once
 curl -X POST localhost:8095/api/register -H 'Content-Type: application/json' -d '{"team":"My Team"}'
 ```
 
@@ -139,7 +139,9 @@ curl localhost:8095/api/interop/matrix
 curl localhost:8095/api/leaderboard
 ```
 
-Live UI (leaderboard, clinician views, samples) at <http://localhost:8095/>.
+The whole API is described at `/openapi.json`, browsable at `/docs`.
+
+Live UI (leaderboard, clinical views, samples) at <http://localhost:8095/>.
 
 ### Samples
 

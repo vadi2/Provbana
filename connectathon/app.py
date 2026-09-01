@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 MATCHBOX_URL = os.environ.get("MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir")
@@ -58,7 +59,7 @@ SECTION_POINTS = 10    # per populated top-level Composition section
 RESOURCE_POINTS = 2    # per clinical resource (not Composition/Patient)
 RESOURCE_CAP = 60      # max points from clinical resources
 SECTION_CAP = 160      # max points from sections (the IPS set is ~16 sections)
-FIRST_BLOOD_BONUS = 20
+FIRST_PASS_BONUS = 20  # one-time, to the first company that submits a valid bundle
 INTEROP_CONSUMER_POINTS = 25   # per distinct partner whose document you consumed
 INTEROP_PRODUCER_POINTS = 10   # per distinct team that consumed your document
 # Registration is deliberately open, so a team could stand up throwaway partners
@@ -99,7 +100,7 @@ def init_db() -> None:
                 name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
                 slug        TEXT NOT NULL UNIQUE,
                 token       TEXT NOT NULL UNIQUE,
-                first_blood INTEGER NOT NULL DEFAULT 0,
+                first_pass  INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS submissions (
@@ -132,6 +133,12 @@ def init_db() -> None:
                 conn.execute(
                     f"ALTER TABLE submissions ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
                 )
+        # The bonus used to be called "first blood", which is not a phrase for a
+        # clinical event. CREATE TABLE IF NOT EXISTS leaves an existing table
+        # alone, so databases from before the rename need the column moved.
+        team_cols = {row["name"] for row in conn.execute("PRAGMA table_info(teams)")}
+        if "first_blood" in team_cols and "first_pass" not in team_cols:
+            conn.execute("ALTER TABLE teams RENAME COLUMN first_blood TO first_pass")
 
 
 def slugify(name: str) -> str:
@@ -231,16 +238,23 @@ def submission_score(passed: bool, sections: int, resources: int) -> int:
 
 MEDICATION_TYPES = ("MedicationStatement", "MedicationRequest", "MedicationDispense")
 
-# Friendly wording for the standard list-empty-reason codes (used when a
-# section's emptyReason carries only a code, no display text).
+# Friendly wording for the standard list-empty-reason codes. Bundles carry the
+# reason as a code ("nilknown"), as display text ("Nil Known") or as both, and
+# none of those are what a clinician wants to read, so the lookup is keyed on a
+# squashed form that all three spellings collapse into.
 EMPTY_REASON_LABELS = {
-    "nilknown": "None known",
+    "nilknown": "None reported",
     "notasked": "Not asked",
     "withheld": "Information withheld",
     "unavailable": "Unavailable",
     "notstarted": "Not started",
     "closed": "Closed",
 }
+
+
+def _squash(value: str) -> str:
+    """Lowercase, letters and digits only - "Nil Known" and "nilknown" alike."""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
 
 
 def _cc_display(cc) -> str | None:
@@ -912,7 +926,7 @@ def summarize_bundle(bundle) -> dict:
                     empty_reason = _cc_display(section.get("emptyReason"))
                     if empty_reason:
                         empty_reason = EMPTY_REASON_LABELS.get(
-                            empty_reason, empty_reason
+                            _squash(empty_reason), empty_reason
                         )
                 summary["sections"].append(
                     {
@@ -1072,7 +1086,12 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Nordic Hackathon 2026", lifespan=lifespan)
+APP_VERSION = "1.0.0"
+app = FastAPI(
+    title="Nordic Hackathon 2026 EPS service",
+    version=APP_VERSION,
+    lifespan=lifespan,
+)
 
 
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
@@ -1165,7 +1184,16 @@ def optional_team_from_token(
     return team_from_token(x_team_token, authorization)
 
 
-@app.post("/api/register")
+@app.post("/api/register",
+    tags=["Companies"],
+    summary="Register a company and get its token",
+    description=(
+        "One registration per company. The token comes back once and is not "
+        "retrievable afterwards, so share it inside the company rather than "
+        "registering again. Set REGISTER_CODE on the server to require a "
+        "`code` field in the body as well."
+    ),
+)
 def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
     if REGISTER_CODE:
         supplied = payload.get("code")
@@ -1193,13 +1221,22 @@ def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
         {
             "team": team,
             "token": token,
-            "note": "One team per company - company name = team name. Register "
-            "your company once and share this token with your colleagues.",
+            "note": "One registration per company. Register once and share "
+            "this token with your colleagues.",
         }
     )
 
 
-@app.post("/api/eps")
+@app.post("/api/eps",
+    tags=["Submissions"],
+    summary="Validate and score a bundle",
+    description=(
+        "Sends the bundle to Matchbox for validation against the EPS profile, "
+        "stores the result and returns the FHIR OperationOutcome. The score is "
+        "in the response headers, not the body. 413 if the bundle is larger "
+        "than MAX_BODY_BYTES, 502 if Matchbox cannot be reached."
+    ),
+)
 def submit_eps(
     body: bytes = Depends(bundle_body),
     team: sqlite3.Row = Depends(current_team),
@@ -1234,16 +1271,16 @@ def submit_eps(
     sections, resources = count_bundle_richness(bundle)
     score = submission_score(passed, sections, resources)
 
-    awarded_first_blood = False
+    awarded_first_pass = False
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if passed:
             cur = conn.execute(
-                "UPDATE teams SET first_blood = 1 WHERE id = ? "
-                "AND NOT EXISTS (SELECT 1 FROM teams WHERE first_blood = 1)",
+                "UPDATE teams SET first_pass = 1 WHERE id = ? "
+                "AND NOT EXISTS (SELECT 1 FROM teams WHERE first_pass = 1)",
                 (team["id"],),
             )
-            awarded_first_blood = cur.rowcount == 1
+            awarded_first_pass = cur.rowcount == 1
         conn.execute(
             "INSERT INTO submissions (team_id, ts, pass, errors, warnings, infos, "
             "score, sections, resources, filename) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -1261,7 +1298,7 @@ def submit_eps(
             ),
         )
 
-    effective_score = score + (FIRST_BLOOD_BONUS if awarded_first_blood else 0)
+    effective_score = score + (FIRST_PASS_BONUS if awarded_first_pass else 0)
     return Response(
         content=json.dumps(outcome),
         media_type="application/fhir+json",
@@ -1275,11 +1312,19 @@ def submit_eps(
     )
 
 
-@app.get("/api/leaderboard")
+@app.get("/api/leaderboard",
+    tags=["Submissions"],
+    summary="Current standings",
+    description=(
+        "One row per registered company, best score first. Companies that have "
+        "never submitted still appear, because interop points need no "
+        "submission."
+    ),
+)
 def leaderboard() -> list[dict]:
     with connect() as conn:
         teams = conn.execute(
-            "SELECT id, name, first_blood FROM teams"
+            "SELECT id, name, slug, first_pass FROM teams"
         ).fetchall()
         subs = conn.execute(
             "SELECT team_id, ts, pass, errors, score, sections, resources "
@@ -1307,7 +1352,7 @@ def leaderboard() -> list[dict]:
     rows = []
     for team in teams:
         team_subs = by_team.get(team["id"], [])
-        first_blood = bool(team["first_blood"])
+        first_pass = bool(team["first_pass"])
         # Interop track: points for consuming distinct partners' documents
         # plus points for each distinct team that consumed this team's own.
         interop = min(
@@ -1323,12 +1368,13 @@ def leaderboard() -> list[dict]:
             best = min(team_subs, key=lambda s: (-s["score"], s["ts"]))
             score = (
                 best["score"]
-                + (FIRST_BLOOD_BONUS if first_blood else 0)
+                + (FIRST_PASS_BONUS if first_pass else 0)
                 + interop
             )
             rows.append(
                 {
                     "team": team["name"],
+                    "team_slug": team["slug"],
                     "score": score,
                     "interop": interop,
                     "passed": any(s["pass"] for s in team_subs),
@@ -1337,7 +1383,7 @@ def leaderboard() -> list[dict]:
                     "best_sections": best["sections"],
                     "best_resources": best["resources"],
                     "last_submission": team_subs[-1]["ts"],
-                    "first_blood": first_blood,
+                    "first_pass": first_pass,
                     "_best_ts": best["ts"],
                 }
             )
@@ -1345,6 +1391,7 @@ def leaderboard() -> list[dict]:
             rows.append(
                 {
                     "team": team["name"],
+                    "team_slug": team["slug"],
                     "score": interop,  # consuming others needs no submission
                     "interop": interop,
                     "passed": False,
@@ -1353,7 +1400,7 @@ def leaderboard() -> list[dict]:
                     "best_sections": None,
                     "best_resources": None,
                     "last_submission": None,
-                    "first_blood": first_blood,
+                    "first_pass": first_pass,
                     "_best_ts": "9999",  # sorts after any real ISO timestamp
                 }
             )
@@ -1382,7 +1429,13 @@ def _submission_row(sub_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-@app.get("/api/submissions")
+@app.get("/api/submissions",
+    tags=["Submissions"],
+    summary="Submission history",
+    description=(
+        "Every company's attempts, newest first, or one company's with `team`."
+    ),
+)
 def list_submissions(team: str | None = None, limit: int = 100) -> list[dict]:
     limit = max(1, min(limit, 1000))
     query = (
@@ -1414,7 +1467,14 @@ def list_submissions(team: str | None = None, limit: int = 100) -> list[dict]:
     ]
 
 
-@app.get("/api/submissions/{sub_id}")
+@app.get("/api/submissions/{sub_id}",
+    tags=["Submissions"],
+    summary="One submission in full",
+    description=(
+        "The validation verdict plus a readable summary of the bundle: patient, "
+        "sections and the clinical items under each one."
+    ),
+)
 def submission_detail(sub_id: int) -> dict:
     row = _submission_row(sub_id)
     if row is None:
@@ -1442,7 +1502,11 @@ def submission_detail(sub_id: int) -> dict:
     }
 
 
-@app.get("/api/submissions/{sub_id}/bundle")
+@app.get("/api/submissions/{sub_id}/bundle",
+    tags=["Submissions"],
+    summary="Download the submitted bytes",
+    description="The exact bytes that were posted, unmodified.",
+)
 def submission_bundle(sub_id: int) -> Response:
     row = _submission_row(sub_id)
     if row is None:
@@ -1459,18 +1523,26 @@ def submission_bundle(sub_id: int) -> Response:
 # hand-authored to exercise the clinician views (nil-known assertions, stale
 # data, a non-English document) and do not come from any real system, record
 # or person.
+# scenario_url points at the organisers' brief on the event's resources page
+# (https://nordichackathon2026.blogs.dsv.su.se/resources/). The briefs are the
+# source these bundles were authored from, so they are linked rather than
+# paraphrased here - a paraphrase would be a second, drifting copy.
 SAMPLES = [
     {
         "id": "andrea-cross-border",
         "name": "Andrea Lindqvist, 24",
         "tagline": "Type 1 diabetes, seen in a Paris emergency department",
         "scenario": (
-            "A Swedish exchange student collapses in Paris. Her summary is "
+            "A Swedish exchange student is brought into a Paris emergency "
+            "department with runaway blood sugar. Her summary is "
             "complete and well coded, but the data behind it has gone stale: "
             "the last labs are eight months old and the follow-up that would "
             "have refreshed them was cancelled and never rebooked."
         ),
         "language": "English",
+        "scenario_name": "The Andrea Scenario",
+        "scenario_url":
+            "https://drive.google.com/file/d/1hzOACA3chu7E6aknBFni-hZWDJwvVGHx/view",
     },
     {
         "id": "arne-complex-care",
@@ -1479,11 +1551,12 @@ SAMPLES = [
         "scenario": (
             "A Swedish pensioner falls while visiting his son in Denmark and "
             "needs surgery. Ten conditions, ten medicines and a high-criticality "
-            "penicillin anaphylaxis have to survive the border. The document is "
-            "authored in Swedish, so section identity rests on the LOINC codes "
-            "rather than the titles."
+            "penicillin anaphylaxis have to survive the border."
         ),
         "language": "Swedish",
+        "scenario_name": "The Arne Scenario",
+        "scenario_url":
+            "https://drive.google.com/file/d/11dMseBg1439zSf2v8sRnWHSjrE18ZgLJ/view",
     },
 ]
 
@@ -1508,7 +1581,13 @@ def read_sample_bytes(sample_id: str) -> bytes | None:
         return None
 
 
-@app.get("/api/samples")
+@app.get("/api/samples",
+    tags=["Samples"],
+    summary="List the worked examples",
+    description=(
+        "Synthetic documents for the event scenarios. No real patient data."
+    ),
+)
 def list_samples() -> dict:
     return {
         "disclaimer": SAMPLE_DISCLAIMER,
@@ -1517,7 +1596,14 @@ def list_samples() -> dict:
     }
 
 
-@app.get("/api/samples/{sample_id}")
+@app.get("/api/samples/{sample_id}",
+    tags=["Samples"],
+    summary="One worked example",
+    description=(
+        "The same readable summary shape as a submission, plus the scenario it "
+        "illustrates."
+    ),
+)
 def sample_detail(sample_id: str) -> dict:
     meta = _sample_meta(sample_id)
     raw = read_sample_bytes(sample_id)
@@ -1537,7 +1623,11 @@ def sample_detail(sample_id: str) -> dict:
     }
 
 
-@app.get("/api/samples/{sample_id}/bundle")
+@app.get("/api/samples/{sample_id}/bundle",
+    tags=["Samples"],
+    summary="Download a worked example",
+    description="The example bundle as FHIR JSON, for use as test input.",
+)
 def sample_bundle(sample_id: str) -> Response:
     raw = read_sample_bytes(sample_id)
     if raw is None:
@@ -1548,7 +1638,15 @@ def sample_bundle(sample_id: str) -> Response:
 # ---------------------------------------------------------------- interop API
 
 
-@app.get("/api/exchange")
+@app.get("/api/exchange",
+    tags=["Interop"],
+    summary="Documents published for exchange",
+    description=(
+        "Each company's best valid submission is published automatically. "
+        "Reading the list needs no token; supply one to hide yourself and to "
+        "see which partners you have already consumed."
+    ),
+)
 def exchange_list(
     x_team_token: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
@@ -1589,7 +1687,14 @@ def exchange_list(
     return out
 
 
-@app.get("/api/exchange/{team_slug}")
+@app.get("/api/exchange/{team_slug}",
+    tags=["Interop"],
+    summary="Fetch a partner's document",
+    description=(
+        "The published bundle, ready to load into your own system. Open to "
+        "anonymous callers - a token is validated when supplied."
+    ),
+)
 def exchange_fetch(
     team_slug: str,
     x_team_token: str | None = Header(default=None),
@@ -1634,7 +1739,15 @@ def receipt_mismatches(
     return out
 
 
-@app.post("/api/interop/confirm")
+@app.post("/api/interop/confirm",
+    tags=["Interop"],
+    summary="Prove you consumed a document",
+    description=(
+        "Post back four facts read out of the partner's bundle. A mismatch "
+        "returns 422 with the fields that disagree, so you can see what your "
+        "parser got wrong. Add `exchange_id` to pin a specific submission."
+    ),
+)
 def interop_confirm(
     payload: dict = Depends(small_json_body),
     x_team_token: str | None = Header(default=None),
@@ -1746,7 +1859,11 @@ def interop_confirm(
     )
 
 
-@app.get("/api/interop/matrix")
+@app.get("/api/interop/matrix",
+    tags=["Interop"],
+    summary="Who has consumed whose document",
+    description="One row per confirmed consumer/producer pair.",
+)
 def interop_matrix() -> list[dict]:
     with connect() as conn:
         rows = conn.execute(
@@ -1761,7 +1878,14 @@ def interop_matrix() -> list[dict]:
     ]
 
 
-@app.get("/api/health")
+@app.get("/api/health",
+    tags=["Service"],
+    summary="Service and validator health",
+    description=(
+        "Reports whether Matchbox is reachable. Submissions fail while it is "
+        "down."
+    ),
+)
 def health() -> dict:
     matchbox = "down"
     try:
@@ -1773,9 +1897,29 @@ def health() -> dict:
     return {"status": "ok", "matchbox": matchbox}
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/favicon.svg", include_in_schema=False)
+def favicon() -> Response:
+    return Response(
+        content=FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def index() -> str:
     return INDEX_HTML
+
+
+# An ECG trace in the event's purple and yellow, on a 32-unit grid. Kept to a
+# single QRS spike with a heavy stroke: extra peaks and a finer line both blur
+# into an indistinct squiggle once the browser paints this at 16px.
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+<rect width="32" height="32" rx="7" fill="#503AA8"/>
+<path d="M4.5 17.5h4L11 11l4 11 2.4-4.5h6.1" fill="none" stroke="#FFEE58"
+stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+"""
 
 
 # ---------------------------------------------------------------- UI page
@@ -1795,6 +1939,7 @@ try {
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700;800&display=swap">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Nordic Hackathon 2026</title>
 <style>
 /* Nordic Hackathon 2026 - palette taken from the event site
@@ -1853,10 +1998,15 @@ header { max-width: 1060px; margin: 0 auto; padding: 48px 16px 6px; }
 .theme-toggle { display: flex; flex: none; margin-top: 5px;
   border: 1px solid var(--field-border); border-radius: var(--r-ctl);
   overflow: hidden; }
-.th-btn { font: inherit; font-size: 0.75rem; font-weight: 600;
-  letter-spacing: -0.01em; background: transparent; color: var(--muted);
+.th-btn { font: inherit; display: grid; place-items: center;
+  background: transparent; color: var(--muted);
   border: none; border-left: 1px solid var(--field-border); border-radius: 0;
-  padding: 5px 12px; cursor: pointer; }
+  padding: 6px 10px; cursor: pointer; }
+/* Icons carry no text, so they inherit the button's colour in every state -
+   hover and the pressed fill below both recolour the stroke for free. */
+.th-btn svg { display: block; width: 15px; height: 15px; fill: none;
+  stroke: currentColor; stroke-width: 1.6; stroke-linecap: round;
+  stroke-linejoin: round; }
 .th-btn:first-child { border-left: none; }
 .th-btn:hover { color: var(--accent); filter: none; }
 .th-btn[aria-pressed="true"] { background: var(--accent-fill); color: var(--accent-on); }
@@ -1988,7 +2138,8 @@ details.issue-fold[open] summary { margin-bottom: 6px; }
 .copied { color: var(--pass) !important; border-color: var(--pass) !important; }
 /* tabs */
 .tabs { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
-.tab-btn { background: transparent; color: var(--muted); border: 1px solid var(--field-border);
+.tab-btn { display: inline-block; background: transparent; color: var(--muted);
+  border: 1px solid var(--field-border); text-decoration: none; cursor: pointer;
   border-radius: var(--r-ctl); padding: 7px 16px; font-weight: 600; font-size: 0.88rem;
   letter-spacing: -0.01em; }
 .tab-btn:hover { color: var(--accent); filter: none; }
@@ -2001,7 +2152,7 @@ select, input[type=number] {
   border-radius: var(--r-ctl); background: var(--bg); color: var(--text); font: inherit;
 }
 select:focus, input[type=number]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
-/* clinician view */
+/* clinical view */
 .patient-card { background: var(--accent-soft); border: 1px solid var(--border);
   border-radius: var(--r-card); padding: 14px 16px; margin: 12px 0 6px; }
 .patient-name { font-size: 1.25rem; font-weight: 700; }
@@ -2022,42 +2173,34 @@ tr.cv-row:hover td { background: var(--accent-soft); }
 footer { max-width: 1100px; margin: 26px auto 40px; padding: 0 22px;
   font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
 footer a { color: var(--accent); }
-body.cmp-wide footer { max-width: 1560px; }
-/* side-by-side compare */
-.cmp-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px; margin-top: 14px; }
-@media (max-width: 1000px) { .cmp-grid { grid-template-columns: 1fr; } }
-.cmp-col { border: 1px solid var(--border); border-radius: var(--r-card); padding: 14px 16px;
-  min-width: 0; }
-.cmp-col > h3 { margin: 0; font-size: 0.95rem; }
-.cmp-col > p.cmp-why { margin: 2px 0 10px; font-size: 0.78rem; color: var(--muted);
-  line-height: 1.45; }
-.cmp-body { max-height: 68vh; overflow-y: auto; padding-right: 4px; }
-.cmp-col .db-grid { grid-template-columns: 1fr; }
-body.cmp-wide main, body.cmp-wide header { max-width: 1560px; }
-/* sample documents */
-.cv-samples { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  margin: 10px 0 4px; }
-.cv-sample { text-align: left; background: var(--card); border: 1px solid var(--border);
-  border-radius: var(--r-card); padding: 12px 14px; cursor: pointer; color: inherit;
-  display: flex; flex-direction: column; gap: 4px; }
-.cv-sample:hover { border-color: var(--accent); background: var(--accent-soft); filter: none; }
-.cv-sample .s-name { font-weight: 700; }
-.cv-sample .s-tag { font-size: 0.85rem; color: var(--muted); }
-.cv-sample .s-why { font-size: 0.78rem; color: var(--muted); }
+/* example documents, listed in the same table as everyone else's submissions */
+.cv-sub { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
+td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
+  color: var(--muted); }
 .sample-note { margin: 6px 0 0; font-size: 0.78rem; }
-.sample-banner { padding: 10px 14px; border-radius: var(--r-card); margin: 0 0 14px;
-  font-size: 0.85rem; color: var(--muted); background: var(--code-bg);
-  border: 1px solid var(--border); }
-/* clinician view modes */
-.cv-modes { display: flex; gap: 6px; flex-wrap: wrap; margin: 14px 0 0; }
-.cv-mode { background: transparent; color: var(--muted); border: 1px solid var(--field-border);
-  border-radius: var(--r-ctl); padding: 5px 13px; font-size: 0.82rem; font-weight: 600;
-  letter-spacing: -0.01em; cursor: pointer; }
+/* View switcher. It lives on the open document rather than in the picker card
+   so the control sits next to what it changes: floated so the title flows
+   beside it, sticky so it survives scrolling a long summary. */
+.cv-modes { float: right; position: sticky; top: 12px; z-index: 2;
+  display: flex; margin: 0 0 10px 18px; background: var(--card);
+  border: 1px solid var(--field-border); border-radius: var(--r-ctl);
+  overflow: hidden; }
+.cv-mode { background: transparent; color: var(--muted); border: none;
+  border-left: 1px solid var(--field-border); border-radius: 0;
+  padding: 6px 13px; font-size: 0.82rem; font-weight: 600;
+  letter-spacing: -0.01em; cursor: pointer; white-space: nowrap; }
+.cv-mode:first-child { border-left: none; }
 .cv-mode:hover { color: var(--accent); filter: none; }
-.cv-mode.active { background: var(--accent-fill); color: var(--accent-on);
-  border-color: var(--accent-fill); }
-.cv-hint { margin: 8px 0 0; font-size: 0.8rem; }
+.cv-mode.active { background: var(--accent-fill); color: var(--accent-on); }
+/* Floating it here would leave the title a useless sliver, so it goes back to
+   being a full-width row above the document. */
+@media (max-width: 640px) {
+  .cv-modes { float: none; position: static; margin: 0 0 12px; }
+  .cv-mode { flex: 1; text-align: center; }
+}
+/* the float is the last thing in the card, so the card has to be told to
+   contain it or it collapses behind the buttons */
+#cv-doc::after { content: ""; display: block; clear: both; }
 .chip.cvc { margin-left: 5px; text-transform: none; letter-spacing: 0; }
 .chip.risk { color: var(--fail); background: var(--fail-bg); }
 .chip.warn { color: var(--warn); background: var(--warn-bg); }
@@ -2145,21 +2288,29 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   <div class="head-row">
     <h1>Nordic Hackathon 2026 - Patient Summary Challenge</h1>
     <div class="theme-toggle" role="group" aria-label="Colour theme">
-      <button class="th-btn" data-theme-set="system">System</button>
-      <button class="th-btn" data-theme-set="light">Light</button>
-      <button class="th-btn" data-theme-set="dark">Dark</button>
+      <button class="th-btn" data-theme-set="system" title="System theme"
+              aria-label="System theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+        <rect x="1.8" y="2.8" width="12.4" height="8.4" rx="1.2"/>
+        <path d="M5.5 14h5M8 11.2V14"/></svg></button>
+      <button class="th-btn" data-theme-set="light" title="Light theme"
+              aria-label="Light theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.1"/>
+        <path d="M8 1.2v1.5M8 13.3v1.5M1.2 8h1.5M13.3 8h1.5M3.3 3.3l1.1 1.1M11.6
+        11.6l1.1 1.1M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1"/></svg></button>
+      <button class="th-btn" data-theme-set="dark" title="Dark theme"
+              aria-label="Dark theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M13.4 9.9A5.7 5.7 0 0 1 6.1 2.6a5.7 5.7 0 1 0 7.3 7.3z"/>
+        </svg></button>
     </div>
   </div>
   <p class="sub">Submit your European Patient Summary (FHIR R4 Bundle) and get it
-  validated against the HL7 EU EPS 1.0.0-ballot profile. Validity is the gate -
-  richness wins the game.</p>
-  <p class="sub"><strong>One team per company</strong> - register your company once
-  and share the token within it.</p>
+  validated against the <a href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
+  target="_blank" rel="noopener">HL7 EU EPS 1.0.0-ballot profile</a>.</p>
   <nav class="tabs">
-    <button class="tab-btn active" data-tab="leaderboard">Leaderboard</button>
-    <button class="tab-btn" data-tab="submit">Submit</button>
-    <button class="tab-btn" data-tab="clinician">Clinician view</button>
-    <button class="tab-btn" data-tab="interop">Interop testing</button>
+    <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard">Leaderboard</a>
+    <a class="tab-btn" data-tab="submit" href="#submit">Submit</a>
+    <a class="tab-btn" data-tab="interop" href="#interop">Interop testing</a>
+    <a class="tab-btn" data-tab="clinical" href="#clinical">Clinical view</a>
   </nav>
 </header>
 <main>
@@ -2177,7 +2328,8 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
     <tbody id="lb-body"></tbody>
   </table>
   </div>
-  <p class="muted" id="lb-empty" style="display:none">No companies yet - be the first to register.</p>
+  <p class="muted" id="lb-empty" style="display:none">No companies yet - be the
+  first to <a href="#submit">register</a>.</p>
 </section>
 
 <section class="card">
@@ -2192,18 +2344,16 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 <section class="card">
   <h2>How scoring works</h2>
   <p class="muted" style="margin:0">
-    Any <strong>error or fatal</strong> validation issue scores the submission
-    <strong>0</strong> - fix conformance first. A valid bundle earns
-    <strong>50</strong>, plus <strong>+10</strong> per <em>distinct</em>
-    Composition section that actually contains entries (capped at +160), plus
-    <strong>+2</strong> per clinical resource in the bundle (everything except
-    the Composition and Patient, capped at +60). Sections count once each -
-    repeating a section, or padding the bundle, does not make the document
-    richer. Your team score is your <strong>best submission</strong>; the first
-    team to go valid keeps a one-time <strong>+20 first blood</strong> bonus.
-    Interop adds on top: <strong>+25</strong> for every partner document your
-    team proves it consumed and <strong>+10</strong> for every team that
-    consumes yours, up to <strong>+100</strong> in total.
+    Fix conformance first, because any error or fatal validation issue scores
+    your submission 0. A valid bundle earns 50, plus +10 per distinct
+    Composition section that actually has entries (capped at +160), and +2 for
+    every clinical resource outside the Composition and Patient (capped at
+    +60). Sections only count once - repeating a section or padding the bundle
+    will not make it richer. Your company score is your best submission, plus a
+    one-time +20 "first pass" bonus for the first company to submit a valid
+    document. Interop adds on top, up to +100 in total: +25 for every partner
+    document your company proves it consumed, and +10 for each company that
+    consumes yours.
   </p>
 </section>
 
@@ -2214,8 +2364,8 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 <div class="grid">
   <section class="card">
     <h2>Register your company</h2>
-    <p class="muted" style="margin:0 0 4px">Company name = team name. One
-    registration per company; share the token with your colleagues.</p>
+    <p class="muted" style="margin:0 0 4px">One registration per company -
+    share the token with your colleagues.</p>
     <label for="reg-name">Company name</label>
     <div class="row">
       <input type="text" id="reg-name" maxlength="40" placeholder="e.g. FHIR Starters">
@@ -2227,9 +2377,9 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
         <code id="token-value"></code>
         <button class="ghost" id="token-copy">Copy</button>
       </div>
-      <p class="muted" style="margin:8px 0 0"><strong>Save this token now.</strong>
-      It is shown only once and is required for every submission. It has been
-      pre-filled in the submit form and stored in this browser.</p>
+      <p class="muted" style="margin:8px 0 0">Save this token, share it with
+      company colleagues, and use it with every submission to identify your
+      team.</p>
     </div>
   </section>
 
@@ -2260,7 +2410,11 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 
 <details class="card">
   <summary>Or use the API</summary>
-  <p class="muted">Register your company (one team per company):</p>
+  <p class="muted">Every endpoint is described in the
+  <a href="/openapi.json" target="_blank" rel="noopener">OpenAPI spec</a>, which
+  you can also browse and call from
+  <a href="/docs" target="_blank" rel="noopener">the interactive docs</a>.</p>
+  <p class="muted">Register your company:</p>
   <pre class="curl" id="curl-register"></pre>
   <p class="muted">Submit a bundle (response headers carry X-Pass / X-Score / X-Errors,
   body is the FHIR OperationOutcome):</p>
@@ -2271,28 +2425,12 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 
 </div>
 
-<div id="tab-clinician" class="tab-panel">
+<div id="tab-clinical" class="tab-panel">
 
 <section class="card">
-  <h2>Clinician view</h2>
-  <p class="muted" style="margin:0 0 4px">A readable rendering of submitted
-  patient summaries - what a clinician would actually see.</p>
-  <h3 class="cv-sec" style="margin-top:14px">Example documents</h3>
-  <div class="cv-samples" id="cv-samples"></div>
-  <p class="muted sample-note" id="cv-samples-note"></p>
-  <h3 class="cv-sec">Submitted documents</h3>
+  <h2>Clinical view of submitted documents</h2>
   <label for="cv-team">Company</label>
-  <select id="cv-team"><option value="">Select a company...</option></select>
-  <div class="cv-modes" id="cv-modes">
-    <button class="cv-mode active" data-mode="dashboard">Safety dashboard</button>
-    <button class="cv-mode" data-mode="timeline">Clinical timeline</button>
-    <button class="cv-mode" data-mode="compare">Side by side</button>
-    <button class="cv-mode" data-mode="document">Document</button>
-  </div>
-  <p class="muted cv-hint">The <em>safety dashboard</em> opens by default: risk and
-  completeness first. Switch to the <em>clinical timeline</em> to read the same data
-  as a chronology, <em>side by side</em> to weigh the two against each other, or
-  <em>document</em> for the plain section-by-section rendering.</p>
+  <select id="cv-team"></select>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
 
@@ -2304,31 +2442,39 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
 
 <section class="card">
   <h2>Interop testing</h2>
-  <p class="muted" style="margin:0 0 8px">Compliance proves you can
-  <em>produce</em> a valid patient summary; interop proves another system can
-  <em>consume</em> it. Your team's best valid submission is automatically
-  published as its exchange document.</p>
+  <p class="muted" style="margin:0 0 8px">Compliance proves you can produce a
+  valid patient summary, while interoperability testing proves another system
+  can consume it. Your team's best valid submission is automatically published
+  as its exchange document.</p>
   <ol class="steps">
-    <li>Fetch any team's document - no token needed, every published
-      document is open:
-      <code>GET /api/exchange/&lt;team-slug&gt;</code></li>
-    <li>Parse it in <strong>your</strong> system and extract the patient's family
-      name, birth date, and the number of medication and allergy entries.</li>
-    <li>Post the receipt to <code>POST /api/interop/confirm</code>. All four
-      values must match: you earn <strong>+25</strong>, the producer earns
+    <li>Pick a partner below and load their document into <strong>your</strong>
+      system - view it here, or download the bundle. No token needed to read
+      one; every published document is open.</li>
+    <li>Read four facts back out of <strong>your</strong> system: the patient's
+      family name, birth date, and how many medication and allergy entries the
+      document carries.</li>
+    <li>Type them into that partner's card and press <strong>Confirm</strong>.
+      All four must match: you earn <strong>+25</strong>, the producer earns
       <strong>+10</strong>.</li>
   </ol>
-  <p class="muted">Fetch a partner's exchange document:</p>
-  <pre class="curl" id="curl-exchange"></pre>
-  <p class="muted">Post your extraction receipt:</p>
-  <pre class="curl" id="curl-confirm"></pre>
 </section>
 
 <section class="card">
   <h2>Partners</h2>
-  <p class="muted" id="io-hint" style="margin:0"></p>
+  <label for="io-token">Team token</label>
+  <input type="text" id="io-token" placeholder="paste your team token"
+    autocomplete="off" spellcheck="false">
+  <p class="muted" id="io-hint" style="margin:8px 0 0"></p>
   <div id="io-partners"></div>
 </section>
+
+<details class="card">
+  <summary>Or use the API</summary>
+  <p class="muted">Fetch a partner's exchange document:</p>
+  <pre class="curl" id="curl-exchange"></pre>
+  <p class="muted">Post your extraction receipt:</p>
+  <pre class="curl" id="curl-confirm"></pre>
+</details>
 
 </div>
 
@@ -2362,8 +2508,12 @@ async function refreshLeaderboard() {
     $("#lb-body").innerHTML = rows.map((r) => `
       <tr class="${r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
-        <td>${esc(r.team)}${r.first_blood
-          ? ' <span title="First blood: first team to pass">\u{1F525}</span>' : ""}</td>
+        <td>${r.attempts
+          ? `<a href="#clinical/company/${encodeURIComponent(r.team_slug)}"
+               title="see this company's documents">${esc(r.team)}</a>`
+          : esc(r.team)}${r.first_pass
+          ? ' <span title="First pass: first company to submit a valid document">'
+            + '\u{1F525}</span>' : ""}</td>
         <td><strong>${r.score}</strong></td>
         <td>${r.interop || 0}</td>
         <td>${r.passed ? '<span class="badge pass">VALID</span>'
@@ -2412,17 +2562,63 @@ async function refreshMatrix() {
   } catch (e) { /* transient network error - retry on next tick */ }
 }
 
-/* ---- tabs ---- */
-function switchTab(name) {
+/* ---- routing ----
+   The hash is this app's address bar: #<tab>[/<kind>/<id>/<view>]. Tabs are
+   ordinary links and every in-app navigation goes through the hash, so Back,
+   Forward and a pasted link all arrive the same way. Nothing paints except
+   applyRoute. Under #clinical the kind is sample, submission or company - the
+   last one opens a company's list of documents without picking one, which is
+   where the leaderboard's company names point. */
+const TABS = ["leaderboard", "submit", "interop", "clinical"];
+const DEFAULT_SAMPLE = "arne-complex-care";
+
+function routeParts() {
+  return decodeURIComponent(location.hash.replace(/^#/, "")).split("/");
+}
+
+/* replace is for routes the user did not ask for by name - normalising a bare
+   #clinical to the document it opens, or recording a view switch. Neither is
+   somewhere you would want Back to stop at. */
+function go(route, replace) {
+  const hash = "#" + route;
+  if (replace || location.hash === hash) {
+    history.replaceState(null, "", hash);
+    applyRoute(false);
+  } else {
+    location.hash = hash;  // hashchange does the painting
+  }
+}
+
+function showTab(name) {
   document.querySelectorAll(".tab-btn").forEach((b) =>
     b.classList.toggle("active", b.dataset.tab === name));
   document.querySelectorAll(".tab-panel").forEach((p) =>
     p.classList.toggle("active", p.id === "tab-" + name));
-  if (name === "clinician") initClinician();
+  if (name === "clinical") initClinical();
   if (name === "interop") initInterop();
 }
-document.querySelectorAll(".tab-btn").forEach((btn) =>
-  btn.addEventListener("click", () => switchTab(btn.dataset.tab)));
+
+function applyRoute(scroll) {
+  const parts = routeParts();
+  const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0] : "leaderboard";
+  showTab(tab);
+  if (tab !== "clinical") return;
+  if (!parts[1]) {
+    go("clinical/sample/" + DEFAULT_SAMPLE + "/" + cvMode, true);
+    return;
+  }
+  if (CV_VIEWS[parts[3]]) cvMode = parts[3];
+  /* The tab link remembers the document you were reading, so a trip to the
+     leaderboard and back does not throw your place away. */
+  document.querySelector('.tab-btn[data-tab="clinical"]')
+    .setAttribute("href", location.hash);
+  /* initClinical, kicked off by showTab above, moves the picker onto the
+     company once the list has loaded; there is no document to show. */
+  if (parts[1] === "company") { hideDoc(); return; }
+  showDoc(parts[1], parts[2], scroll);
+}
+
+window.addEventListener("hashchange", () => applyRoute(true));
 
 /* ---- register ---- */
 $("#reg-btn").addEventListener("click", async () => {
@@ -2444,8 +2640,7 @@ $("#reg-btn").addEventListener("click", async () => {
     }
     $("#token-value").textContent = data.token;
     $("#token-box").style.display = "block";
-    $("#token").value = data.token;
-    localStorage.setItem("eps_token", data.token);
+    syncToken(data.token);
     localStorage.setItem("eps_team", data.team);
     refreshLeaderboard();
   } catch (e) {
@@ -2558,7 +2753,15 @@ function renderIssues(issues) {
 }
 
 /* ---- submit ---- */
-$("#token").value = localStorage.getItem("eps_token") || "";
+/* One token, two places to type it: the submit form and the interop tab.
+   Mirroring on input stops the two drifting apart, and localStorage carries it
+   across reloads. */
+function syncToken(value, from) {
+  if (from !== "token") $("#token").value = value;
+  if (from !== "io") $("#io-token").value = value;
+  try { localStorage.setItem("eps_token", value); } catch (e) { /* site data blocked */ }
+}
+syncToken(localStorage.getItem("eps_token") || "");
 $("#file").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
   if (f) $("#bundle").value = await f.text();
@@ -2613,7 +2816,7 @@ $("#submit-btn").addEventListener("click", async () => {
         + (sections * 10 > 160 ? " (capped at +160)" : "")
         + " + " + resources + " resource" + (resources === 1 ? "" : "s") + " ×2"
         + (resources * 2 > 60 ? " (capped at +60)" : "")
-        + (score > base ? " + 20 first blood" : "")
+        + (score > base ? " + 20 first pass" : "")
         + " = " + score;
     } else {
       text = "✖ INVALID - 0 pts - fix the " + errors + " error"
@@ -2645,37 +2848,51 @@ $("#curl-submit").textContent =
 $("#curl-leaderboard").textContent =
   "curl -s " + origin + "/api/leaderboard";
 
-/* ---- clinician view ---- */
+/* ---- clinical view ---- */
 let cvSubs = [];
+let cvSamples = [];
 let cvCurrent = null;
-let cvMode = "dashboard";
+let cvMode = "document";
 let cvDisclaimer = "";
+/* The worked examples are one more entry in the company picker rather than a
+   list of their own, so there is a single place to open a document from. */
+const SAMPLE_TEAM = "__samples";
 
 async function initSamples() {
-  let data;
   try {
     const res = await fetch("/api/samples");
     if (!res.ok) return;
-    data = await res.json();
-  } catch (e) { return; }
-  cvDisclaimer = data.disclaimer || "";
-  $("#cv-samples").innerHTML = (data.samples || [])
-    .filter((s) => s.available)
-    .map((s) => '<button class="cv-sample" data-sample="' + esc(s.id) + '">'
-      + '<span class="s-name">' + esc(s.name)
-      + '<span class="chip cvc">' + esc(s.language) + "</span></span>"
-      + '<span class="s-tag">' + esc(s.tagline) + "</span>"
-      + '<span class="s-why">' + esc(s.scenario) + "</span></button>").join("");
-  $("#cv-samples-note").textContent = cvDisclaimer;
+    const data = await res.json();
+    cvDisclaimer = data.disclaimer || "";
+    cvSamples = (data.samples || []).filter((s) => s.available);
+  } catch (e) { /* the picker says so when the list is empty */ }
 }
 
-$("#cv-samples").addEventListener("click", (ev) => {
-  const btn = ev.target.closest(".cv-sample");
-  if (btn) openDoc("/api/samples/" + btn.dataset.sample);
-});
+/* The picker follows the document, but only at the moment a different one
+   opens: browsing another company's list while reading a summary should not be
+   undone by a view switch, and Back onto someone else's document should not
+   leave the picker pointing at the company you came from. */
+function routeTeam() {
+  const parts = routeParts();
+  if (parts[1] === "company" && parts[2]) return parts[2];
+  if (parts[1] === "submission") {
+    const sub = cvSubs.find((s) => String(s.id) === parts[2]);
+    if (sub) return sub.team_slug;
+  }
+  return SAMPLE_TEAM;
+}
 
-async function initClinician() {
-  initSamples();
+function syncTeamPicker() {
+  const sel = $("#cv-team");
+  const want = routeTeam();
+  if (sel.value !== want && [...sel.options].some((o) => o.value === want)) {
+    sel.value = want;
+    renderCvList();
+  }
+}
+
+async function initClinical() {
+  if (!cvSamples.length) await initSamples();
   try {
     const res = await fetch("/api/submissions?limit=200");
     if (!res.ok) return;
@@ -2685,20 +2902,45 @@ async function initClinician() {
   cvSubs.forEach((s) => { if (!seen.has(s.team_slug)) seen.set(s.team_slug, s.team); });
   const sel = $("#cv-team");
   const current = sel.value;
-  sel.innerHTML = '<option value="">Select a company...</option>'
+  sel.innerHTML = '<option value="' + SAMPLE_TEAM + '">Example documents</option>'
     + [...seen.entries()].map(([slug, name]) =>
         '<option value="' + esc(slug) + '">' + esc(name) + "</option>").join("");
-  if (seen.has(current)) sel.value = current;
+  /* A #clinical/company route is an explicit request for that company, so it
+     wins over whatever the picker happened to be showing; otherwise a company
+     you had picked by hand survives a trip to another tab. */
+  const asked = routeParts()[1] === "company" ? routeParts()[2] : null;
+  sel.value = seen.has(asked) ? asked
+            : seen.has(current) ? current : routeTeam();
   renderCvList();
+}
+
+function renderSampleList(box) {
+  if (!cvSamples.length) {
+    box.innerHTML = '<p class="muted">No example documents are installed.</p>';
+    return;
+  }
+  box.innerHTML = '<div class="table-wrap"><table><thead><tr>'
+    + "<th>Patient</th><th>Language</th><th>Scenario</th>"
+    + "</tr></thead><tbody>"
+    + cvSamples.map((s) => '<tr class="cv-row" data-sample="' + esc(s.id)
+        + '" title="click to open"><td><strong>' + esc(s.name) + "</strong>"
+        + '<div class="cv-sub">' + esc(s.tagline) + "</div></td>"
+        + "<td>" + esc(s.language) + "</td>"
+        + '<td class="cv-scenario">' + esc(s.scenario)
+        + (s.scenario_url
+            ? ' <a href="' + esc(s.scenario_url) + '" target="_blank" rel="noopener">'
+              + esc(s.scenario_name || "Read the scenario") + " \u2197</a>"
+            : "")
+        + "</td></tr>").join("")
+    + "</tbody></table></div>"
+    + '<p class="muted sample-note">' + esc(cvDisclaimer) + "</p>";
 }
 
 function renderCvList() {
   const slug = $("#cv-team").value;
   const box = $("#cv-list");
-  if (!slug) {
-    box.innerHTML = '<p class="muted">Pick a company to see its submissions.</p>';
-    return;
-  }
+  if (!slug) { box.innerHTML = ""; return; }
+  if (slug === SAMPLE_TEAM) { renderSampleList(box); return; }
   const subs = cvSubs.filter((s) => s.team_slug === slug);
   if (!subs.length) {
     box.innerHTML = '<p class="muted">No submissions yet.</p>';
@@ -2718,19 +2960,40 @@ function renderCvList() {
 
 $("#cv-team").addEventListener("change", renderCvList);
 $("#cv-list").addEventListener("click", (ev) => {
+  if (ev.target.closest("a")) return;  // the scenario brief opens on its own
   const row = ev.target.closest("tr.cv-row");
-  if (row) openDoc("/api/submissions/" + parseInt(row.dataset.id, 10));
+  if (!row) return;
+  go("clinical/" + (row.dataset.sample ? "sample/" + row.dataset.sample
+                                       : "submission/" + row.dataset.id)
+     + "/" + cvMode);
 });
 
-async function openDoc(url) {
+/* Refetching on a view switch would be a round trip to redraw data already in
+   hand, so the loaded document is keyed and only replaced when the key moves. */
+let cvDocKey = null;
+
+async function showDoc(kind, id, scroll) {
+  const path = kind === "sample" ? "/api/samples/"
+             : kind === "submission" ? "/api/submissions/" : null;
+  if (!path || !id) { hideDoc(); return; }
+  const key = kind + "/" + id;
+  if (key === cvDocKey && cvCurrent) { renderClinicalDoc(cvCurrent); return; }
   let data;
   try {
-    const res = await fetch(url);
-    if (!res.ok) return;
+    const res = await fetch(path + encodeURIComponent(id));
+    if (!res.ok) { hideDoc(); return; }
     data = await res.json();
   } catch (e) { return; }
-  renderClinicianDoc(data);
-  $("#cv-doc").scrollIntoView({ behavior: "smooth" });
+  cvDocKey = key;
+  syncTeamPicker();
+  renderClinicalDoc(data);
+  if (scroll) $("#cv-doc").scrollIntoView({ behavior: "smooth" });
+}
+
+function hideDoc() {
+  cvDocKey = null;
+  cvCurrent = null;
+  $("#cv-doc").style.display = "none";
 }
 
 function cvItemHtml(item) {
@@ -3075,8 +3338,9 @@ function viewDocument(d) {
       + (meta ? "<div>" + meta + "</div>" : "")
       + (p.identifiers && p.identifiers.length
         ? '<div class="muted" style="font-size:0.8rem">'
-          + p.identifiers.map((i) => esc(i.value)
-              + (i.system ? " (" + esc(i.system) + ")" : "")).join(" &middot; ") + "</div>"
+          // the assigning authority's OID is plumbing; the number on the card
+          // is what identifies the patient to anyone reading this
+          + p.identifiers.map((i) => esc(i.value)).join(" &middot; ") + "</div>"
         : "")
       + "</div>";
   } else {
@@ -3102,34 +3366,36 @@ function viewDocument(d) {
   return html;
 }
 
+/* Insertion order is the order of the buttons, and the first one is what a
+   document opens in: the plain rendering is the thing being judged, so it comes
+   before the two interpretations of it. */
 const CV_VIEWS = {
-  dashboard: { fn: viewDashboard, name: "Safety dashboard",
-    why: "Risk and completeness first - answers what would stop you prescribing"
-       + " before you read anything else." },
-  timeline: { fn: viewTimeline, name: "Clinical timeline",
-    why: "Chronology across every section - shows recency and whether the record"
-       + " is current enough to act on." },
-  document: { fn: viewDocument, name: "Document", why: "" },
+  document: { fn: viewDocument, name: "Document view",
+    why: "The plain section-by-section rendering." },
+  dashboard: { fn: viewDashboard, name: "Dashboard view",
+    why: "Risk and completeness first - what would stop you prescribing, before"
+       + " you read anything else." },
+  timeline: { fn: viewTimeline, name: "Timeline view",
+    why: "Chronology across every section - shows recency, and whether the"
+       + " record is current enough to act on." },
 };
 
-function cmpCol(key, d) {
-  const v = CV_VIEWS[key];
-  return '<div class="cmp-col"><h3>' + esc(v.name) + "</h3>"
-    + '<p class="cmp-why">' + esc(v.why) + "</p>"
-    + '<div class="cmp-body">' + v.fn(d) + "</div></div>";
+/* Rebuilt with the document rather than parked in the picker card, so the
+   switcher is next to the thing it switches. The rationale that used to sit
+   under it as a paragraph is now the button's tooltip. */
+function cvModesHtml() {
+  return '<div class="cv-modes">' + Object.keys(CV_VIEWS).map((k) =>
+    '<button class="cv-mode' + (k === cvMode ? " active" : "")
+    + '" data-mode="' + k + '" title="' + esc(CV_VIEWS[k].why) + '">'
+    + esc(CV_VIEWS[k].name) + "</button>").join("") + "</div>";
 }
 
-function renderClinicianDoc(d) {
+function renderClinicalDoc(d) {
   cvCurrent = d;
   const s = d.summary || {};
   const comp = s.composition || {};
   let html = "";
-  if (d.sample) {
-    html += '<div class="sample-banner"><strong>Example document.</strong> '
-      + esc(d.sample.disclaimer || cvDisclaimer)
-      + ' <a href="/api/samples/' + esc(d.sample.id)
-      + '/bundle" download>Download the FHIR bundle</a>.</div>';
-  } else if (!d.pass) {
+  if (!d.sample && !d.pass) {
     html += '<div class="warn-banner">Invalid submission - this document failed'
       + " validation and would be rejected in production. Content shown as-is.</div>";
   }
@@ -3138,30 +3404,31 @@ function renderClinicianDoc(d) {
       + " JSON. The validation verdict below is the one recorded at submission"
       + " time; nothing under it was read from the file.</div>";
   }
+  html += cvModesHtml();
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
   html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
-    + (d.sample ? "" : " &middot; submitted " + new Date(d.ts).toLocaleString()
-        + ' &middot; <a href="/api/submissions/' + d.id
-        + '/bundle" download>download the FHIR bundle</a>')
+    + (d.sample
+        ? ' &middot; <a href="/api/samples/' + esc(d.sample.id)
+          + '/bundle" download>download the FHIR bundle</a>'
+        : " &middot; submitted " + new Date(d.ts).toLocaleString()
+          + ' &middot; <a href="/api/submissions/' + d.id
+          + '/bundle" download>download the FHIR bundle</a>')
     + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
     + "</p>";
-  html += cvMode === "compare"
-    ? '<div class="cmp-grid">' + cmpCol("dashboard", d) + cmpCol("timeline", d)
-      + "</div>"
-    : (CV_VIEWS[cvMode] || CV_VIEWS.dashboard).fn(d);
+  html += (CV_VIEWS[cvMode] || CV_VIEWS.document).fn(d);
   const doc = $("#cv-doc");
   doc.innerHTML = html;
   doc.style.display = "block";
 }
 
-document.querySelectorAll(".cv-mode").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    cvMode = btn.dataset.mode;
-    document.querySelectorAll(".cv-mode").forEach((b) =>
-      b.classList.toggle("active", b === btn));
-    document.body.classList.toggle("cmp-wide", cvMode === "compare");
-    if (cvCurrent) renderClinicianDoc(cvCurrent);
-  });
+// delegated: the buttons are rebuilt with every document render
+$("#cv-doc").addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".cv-mode");
+  if (!btn) return;
+  cvMode = btn.dataset.mode;
+  const parts = routeParts();
+  if (parts[1] && parts[2]) go(["clinical", parts[1], parts[2], cvMode].join("/"), true);
+  else if (cvCurrent) renderClinicalDoc(cvCurrent);
 });
 
 /* ---- interop testing ---- */
@@ -3178,7 +3445,17 @@ function interopCurls() {
     "  -d '{\"partner\": \"PARTNER_SLUG\", \"patient_family\": \"...\"," +
     " \"birth_date\": \"YYYY-MM-DD\", \"medications\": 0, \"allergies\": 0}'";
 }
-$("#token").addEventListener("input", interopCurls);
+$("#token").addEventListener("input", (ev) => {
+  syncToken(ev.target.value, "token");
+  interopCurls();
+});
+$("#io-token").addEventListener("input", (ev) => {
+  syncToken(ev.target.value, "io");
+  interopCurls();
+});
+// on change, not input: reloading the partner list per keystroke is a fetch
+// per character, and the token is only usable once it is complete anyway
+$("#io-token").addEventListener("change", initInterop);
 
 function partnerCard(p, canConfirm) {
   return '<div class="io-partner" data-slug="' + esc(p.team_slug)
@@ -3192,7 +3469,7 @@ function partnerCard(p, canConfirm) {
     + "</div>"
     + '<p class="muted" style="margin:6px 0 0">Document #' + p.exchange_id
     + " · " + p.sections + " sections · " + p.resources + " resources · "
-    + '<a href="#" class="io-view" data-id="' + p.exchange_id + '">View document</a>'
+    + '<a href="#clinical/submission/' + p.exchange_id + '">View document</a>'
     + ' · <a href="/api/submissions/' + p.exchange_id
     + '/bundle" download>download bundle</a></p>'
     + (canConfirm
@@ -3224,11 +3501,11 @@ async function initInterop() {
     const partners = await res.json();
     hint.textContent = partners.length
       ? (token
-          ? "These companies have published a valid exchange document. Fetch one,"
-            + " parse it in your system, then post back what you extracted."
+          ? "These companies have published a valid exchange document. Load one"
+            + " into your system, then type back what you extracted."
           : "Every published exchange document, free to download and test"
-            + " against. Paste your team token in the Submit tab to confirm the"
-            + " ones your system can consume.")
+            + " against. Paste your team token above to confirm the ones your"
+            + " system can consume.")
       : "No company has a valid submission yet - check back soon.";
     box.innerHTML = partners.map((p) => partnerCard(p, !!token)).join("");
   } catch (e) {
@@ -3237,13 +3514,6 @@ async function initInterop() {
 }
 
 $("#io-partners").addEventListener("click", (ev) => {
-  const view = ev.target.closest(".io-view");
-  if (view) {
-    ev.preventDefault();
-    switchTab("clinician");
-    openDoc("/api/submissions/" + parseInt(view.dataset.id, 10));
-    return;
-  }
   const btn = ev.target.closest(".io-confirm");
   if (btn) confirmPartner(btn.closest(".io-partner"), btn);
 });
@@ -3328,14 +3598,178 @@ function initTheme() {
   }));
 }
 
-/* initial state for the clinician panel */
+/* initial state: the hash decides what is shown, including on a cold load */
 initTheme();
-renderCvList();
-initSamples();
+applyRoute(false);
 </script>
 </body>
 </html>
 """
+
+
+# ---------------------------------------------------------------- OpenAPI
+
+# Three endpoints read their body straight off the request (a raw FHIR bundle,
+# or a small dict validated by hand) rather than through a Pydantic model, so
+# FastAPI has nothing to introspect and generates an empty requestBody for
+# them. The shapes are described here instead. Handwriting the whole document
+# would be a second source of truth that drifts; this patches only the parts
+# the framework cannot see.
+OPENAPI_BODIES = {
+    ("/api/register", "post"): {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["team"],
+                    "properties": {
+                        "team": {
+                            "type": "string",
+                            "minLength": 2,
+                            "maxLength": 40,
+                            "description": "Company name, shown on the leaderboard.",
+                        },
+                        "code": {
+                            "type": "string",
+                            "description": "Only when the server sets REGISTER_CODE.",
+                        },
+                    },
+                },
+                "example": {"team": "FHIR Starters"},
+            }
+        },
+    },
+    ("/api/eps", "post"): {
+        "required": True,
+        "content": {
+            "application/fhir+json": {
+                "schema": {
+                    "type": "object",
+                    "description": "A FHIR R4 Bundle of type 'document'.",
+                },
+                "example": {"resourceType": "Bundle", "type": "document", "entry": []},
+            },
+            "application/json": {"schema": {"type": "object"}},
+        },
+    },
+    ("/api/interop/confirm", "post"): {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": [
+                        "partner",
+                        "patient_family",
+                        "birth_date",
+                        "medications",
+                        "allergies",
+                    ],
+                    "properties": {
+                        "partner": {
+                            "type": "string",
+                            "description": "team_slug from /api/exchange.",
+                        },
+                        "exchange_id": {
+                            "type": "integer",
+                            "description": "Pin a specific submission of the partner's.",
+                        },
+                        "patient_family": {"type": "string"},
+                        "birth_date": {"type": "string", "format": "date"},
+                        "medications": {"type": "integer"},
+                        "allergies": {"type": "integer"},
+                    },
+                },
+                "example": {
+                    "partner": "my-partner",
+                    "patient_family": "Musterfrau",
+                    "birth_date": "1961-12-24",
+                    "medications": 3,
+                    "allergies": 1,
+                },
+            }
+        },
+    },
+}
+
+# Score and verdict ride on headers so a client can act on them without parsing
+# the OperationOutcome. FastAPI only documents headers it was told about.
+SUBMIT_RESPONSE_HEADERS = {
+    "X-Pass": ("true when the bundle had no error or fatal issue", "string"),
+    "X-Score": ("points this submission earned, bonuses included", "integer"),
+    "X-Errors": ("count of error and fatal issues", "integer"),
+    "X-Sections": ("distinct populated Composition sections", "integer"),
+    "X-Resources": ("clinical resources counted for richness", "integer"),
+}
+
+# Endpoints that read X-Team-Token. Anything else is open.
+TOKEN_REQUIRED = {
+    ("/api/eps", "post"),
+    ("/api/interop/confirm", "post"),
+}
+TOKEN_OPTIONAL = {
+    ("/api/exchange", "get"),
+    ("/api/exchange/{team_slug}", "get"),
+}
+
+
+def custom_openapi() -> dict:
+    """FastAPI's generated document, corrected where introspection falls short."""
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=APP_VERSION,
+        summary="Validate and score European Patient Summary bundles.",
+        description=(
+            "Register a company, submit FHIR R4 EPS bundles for validation "
+            "against `%s`, and exchange documents with other companies to "
+            "score the interop track.\n\n"
+            "Team endpoints take the token from `POST /api/register`, sent as "
+            "`X-Team-Token: TOKEN` or `Authorization: Bearer TOKEN`."
+        ) % PROFILE,
+        routes=app.routes,
+    )
+    schema["components"] = schema.get("components", {})
+    schema["components"]["securitySchemes"] = {
+        "TeamToken": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Team-Token",
+            "description": "The token returned by POST /api/register.",
+        }
+    }
+    for path, operations in schema["paths"].items():
+        for verb, op in operations.items():
+            key = (path, verb)
+            # The token headers are declared as ordinary parameters because
+            # they arrive through Header() dependencies; the security scheme
+            # says the same thing better, so drop the duplicates.
+            op["parameters"] = [
+                p for p in op.get("parameters", [])
+                if p.get("name", "").lower() not in ("x-team-token", "authorization")
+            ] or None
+            if op["parameters"] is None:
+                del op["parameters"]
+            if key in TOKEN_REQUIRED:
+                op["security"] = [{"TeamToken": []}]
+            elif key in TOKEN_OPTIONAL:
+                op["security"] = [{"TeamToken": []}, {}]
+            if key in OPENAPI_BODIES:
+                op["requestBody"] = OPENAPI_BODIES[key]
+    submit = schema["paths"]["/api/eps"]["post"]["responses"]["200"]
+    submit["description"] = "The Matchbox OperationOutcome for this bundle."
+    submit["content"] = {"application/fhir+json": {"schema": {"type": "object"}}}
+    submit["headers"] = {
+        name: {"description": desc, "schema": {"type": kind}}
+        for name, (desc, kind) in SUBMIT_RESPONSE_HEADERS.items()
+    }
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
 
 
 if __name__ == "__main__":

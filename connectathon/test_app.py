@@ -6,7 +6,7 @@ pytest tmp dir so every test gets a fresh SQLite database and audit log.
 Scoring model under test: error/fatal issues gate the score to 0; a valid
 submission earns 50 + 10 per populated Composition section + 2 per clinical
 resource (capped at +60). Team score = max submission score (+20 one-time
-first blood for the first team ever to go valid).
+first pass for the first team ever to go valid).
 """
 
 import io
@@ -104,9 +104,9 @@ def submit(client, token, oc, monkeypatch, body=BUNDLE):
                                 "Content-Type": "application/fhir+json"})
 
 
-def consume_first_blood(client, monkeypatch):
-    """Burn the global first blood bonus so scoring asserts stay clean."""
-    tok = register(client, "First Blood Sink")
+def consume_first_pass(client, monkeypatch):
+    """Burn the global first pass bonus so scoring asserts stay clean."""
+    tok = register(client, "First Pass Sink")
     res = submit(client, tok, outcome(), monkeypatch)
     assert res.headers["X-Score"] == "70"  # 50 + 20, sanity
 
@@ -195,7 +195,7 @@ def test_submit_oversized_body_413(client, monkeypatch):
 # ---------------------------------------------------------------- scoring
 
 def test_empty_but_valid_scores_exactly_50(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
     body = bundle(sections=0, empty_sections=5, resources=0)
     res = submit(client, token, outcome(warnings=1, infos=2), monkeypatch, body=body)
@@ -210,7 +210,7 @@ def test_empty_but_valid_scores_exactly_50(client, monkeypatch):
 
 
 def test_rich_valid_bundle_scoring(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
     body = bundle(sections=3, empty_sections=2, resources=4)
     res = submit(client, token, outcome(), monkeypatch, body=body)
@@ -221,7 +221,7 @@ def test_rich_valid_bundle_scoring(client, monkeypatch):
 
 
 def test_resource_points_capped_at_60(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
     body = bundle(sections=0, resources=40)  # 40*2 = 80 -> capped to 60
     res = submit(client, token, outcome(), monkeypatch, body=body)
@@ -279,17 +279,17 @@ def test_submission_audit_file_written(client, monkeypatch):
         assert json.load(fh)["resourceType"] == "Bundle"
 
 
-# ---------------------------------------------------------------- first blood
+# ---------------------------------------------------------------- first pass
 
-def test_first_blood_only_first_valid_team_only_once(client, monkeypatch):
+def test_first_pass_only_first_valid_team_only_once(client, monkeypatch):
     tok_a = register(client, "Alpha")
     tok_b = register(client, "Beta")
 
-    # Beta submits first but invalid: no first blood for invalid, score 0
+    # Beta submits first but invalid: no first pass for invalid, score 0
     res = submit(client, tok_b, outcome(errors=3), monkeypatch,
                  body=bundle(sections=4, resources=10))
     assert res.headers["X-Score"] == "0"
-    # Alpha goes valid first: 50 + 20 first blood
+    # Alpha goes valid first: 50 + 20 first pass
     res_a = submit(client, tok_a, outcome(), monkeypatch)
     assert res_a.headers["X-Score"] == "70"
     # Beta goes valid later: no bonus
@@ -300,16 +300,16 @@ def test_first_blood_only_first_valid_team_only_once(client, monkeypatch):
     assert res_a2.headers["X-Score"] == "50"
 
     lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
-    assert lb["Alpha"]["first_blood"] is True
+    assert lb["Alpha"]["first_pass"] is True
     assert lb["Alpha"]["score"] == 70   # max(50, 50) + 20, not stacked
-    assert lb["Beta"]["first_blood"] is False
+    assert lb["Beta"]["first_pass"] is False
     assert lb["Beta"]["score"] == 50
 
 
 # ---------------------------------------------------------------- leaderboard
 
 def test_team_score_is_max_across_submissions(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
     submit(client, token, outcome(), monkeypatch,
            body=bundle(sections=3, resources=4))                    # 88
@@ -339,13 +339,13 @@ def test_best_errors_is_fewest_for_failing_team(client, monkeypatch):
 
 
 def test_leaderboard_ordering_and_fields(client, monkeypatch):
-    tok_a = register(client, "Alpha")   # valid rich + first blood -> top
+    tok_a = register(client, "Alpha")   # valid rich + first pass -> top
     tok_b = register(client, "Beta")    # reaches 50 first -> above Gamma
     tok_c = register(client, "Gamma")   # reaches 50 later
     register(client, "Idle")            # no submissions
 
     submit(client, tok_a, outcome(), monkeypatch,
-           body=bundle(sections=2, resources=3))            # 76 + 20 first blood
+           body=bundle(sections=2, resources=3))            # 76 + 20 first pass
     submit(client, tok_b, outcome(errors=1), monkeypatch)   # 0
     submit(client, tok_b, outcome(), monkeypatch)           # 50
     submit(client, tok_c, outcome(), monkeypatch)           # 50
@@ -359,9 +359,9 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
     assert [r["rank"] for r in lb] == [1, 2, 3, 4]
 
     alpha = lb[0]
-    assert alpha["score"] == 96          # 50 + 2*10 + 3*2 + 20 first blood
+    assert alpha["score"] == 96          # 50 + 2*10 + 3*2 + 20 first pass
     assert alpha["passed"] is True
-    assert alpha["first_blood"] is True
+    assert alpha["first_pass"] is True
     assert alpha["best_sections"] == 2
     assert alpha["best_resources"] == 3
     assert alpha["last_submission"]
@@ -376,7 +376,7 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
 
 
 def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     tok_a = register(client, "Early")
     tok_b = register(client, "Late")
     submit(client, tok_a, outcome(), monkeypatch)          # 50, reached first
@@ -807,7 +807,7 @@ def test_exchange_fetch_bundle_headers_and_404s(client, monkeypatch):
 
 
 def test_interop_confirm_success_points_and_matrix(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     tok_p, tok_c = interop_setup(client, monkeypatch)
     res = confirm(client, tok_c)
     assert res.status_code == 200, res.text
@@ -831,7 +831,7 @@ def test_interop_confirm_success_points_and_matrix(client, monkeypatch):
 
 
 def test_interop_confirm_idempotent(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     tok_p, tok_c = interop_setup(client, monkeypatch)
     assert confirm(client, tok_c).json()["result"] == "confirmed"
     again = confirm(client, tok_c)
@@ -909,7 +909,7 @@ def test_interop_exchange_id_validation(client, monkeypatch):
 
 
 def test_leaderboard_interop_points_math(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     tok_a = register(client, "Aaa")
     tok_b = register(client, "Bbb")
     tok_c = register(client, "Ccc")
@@ -940,24 +940,79 @@ def test_index_serves_html(client):
 
 def test_index_has_tabs_and_company_copy(client):
     text = client.get("/").text
-    for label in ("Leaderboard", "Submit", "Clinician view", "Interop testing"):
+    for label in ("Leaderboard", "Submit", "Clinical view", "Interop testing"):
         assert label in text
-    assert "One team per company" in text
+    assert "One registration per company" in text
     assert "Register your company" in text
     assert "<th>Company</th>" in text
     assert "<th>Interop</th>" in text
+    # a team is formed between companies at the event, so no copy may equate
+    # the two - a company registers once, and teams are built on top of that
+    assert "One team per company" not in text
 
 
 def test_index_offers_dashboard_timeline_and_document_views(client):
     text = client.get("/").text
-    for mode in ("dashboard", "timeline", "compare", "document"):
-        assert 'data-mode="%s"' % mode in text
     for fn in ("function viewTimeline(", "function viewDashboard(",
-               "function viewDocument(", "function cmpCol("):
+               "function viewDocument("):
         assert fn in text
-    # the dashboard is what opens by default
-    assert 'class="cv-mode active" data-mode="dashboard"' in text
-    assert 'let cvMode = "dashboard";' in text
+    for key, name in (("document", "Document view"), ("dashboard", "Dashboard view"),
+                      ("timeline", "Timeline view")):
+        assert "%s: { fn: view" % key in text
+        assert 'name: "%s"' % name in text
+    # side by side is gone; nothing may still reach for it
+    for leftover in ("cmpCol", "cmp-grid", "cmp-col", "cmp-wide",
+                     'data-mode="compare"'):
+        assert leftover not in text
+    # the plain document rendering is what opens by default
+    assert 'let cvMode = "document";' in text
+    # the switcher is rebuilt with each document rather than parked in the
+    # picker card, so it has to come from the render path
+    assert "function cvModesHtml(" in text
+    assert "html += cvModesHtml();" in text
+
+
+def test_index_navigates_through_the_hash(client):
+    text = client.get("/").text
+    # tabs are real links, so Back and Forward move between them and a view
+    # can be pasted to someone else
+    for tab in ("leaderboard", "submit", "interop", "clinical"):
+        assert 'href="#%s"' % tab in text
+    assert 'window.addEventListener("hashchange"' in text
+    # a bare #clinical opens the Arne example rather than an empty picker
+    assert 'const DEFAULT_SAMPLE = "arne-complex-care";' in text
+    # and a partner's document is linked, not opened by a click handler
+    assert "'<a href=\"#clinical/submission/'" in text
+
+
+def test_index_hides_identifier_assigning_authorities(client):
+    """The OID behind a patient identifier is plumbing. The API still carries
+    it - machines need it - but no reader is shown it."""
+    text = client.get("/").text
+    assert "urn:oid" not in text
+    assert 'esc(i.system)' not in text
+    detail = client.get("/api/samples/arne-complex-care").json()
+    systems = [i.get("system") for i in detail["summary"]["patient"]["identifiers"]]
+    assert any(systems), "the API should still expose what the UI omits"
+
+
+def test_samples_link_to_their_scenario_briefs(client):
+    """Each worked example names the organisers' brief it was written from,
+    rather than restating it in copy that would drift."""
+    samples = {s["id"]: s for s in client.get("/api/samples").json()["samples"]}
+    assert samples["andrea-cross-border"]["scenario_name"] == "The Andrea Scenario"
+    assert samples["arne-complex-care"]["scenario_name"] == "The Arne Scenario"
+    for sample in samples.values():
+        assert sample["scenario_url"].startswith("https://")
+
+
+def test_index_lists_examples_as_a_company(client):
+    """The examples are one more entry in the company picker, so there is a
+    single place to open a document from."""
+    text = client.get("/").text
+    assert 'const SAMPLE_TEAM = "__samples";' in text
+    assert "Example documents</option>" in text
+    assert "function renderSampleList(" in text
 
 
 def test_index_offers_bundle_downloads_and_anonymous_partner_browsing(client):
@@ -1036,7 +1091,7 @@ def test_register_returns_company_note(client):
 # ------------------------------------------------- asserted-empty sections
 
 def test_empty_reason_codes_map_to_clinician_labels():
-    for code, label in [("nilknown", "None known"), ("notasked", "Not asked"),
+    for code, label in [("nilknown", "None reported"), ("notasked", "Not asked"),
                         ("withheld", "Information withheld"),
                         ("unavailable", "Unavailable"),
                         ("notstarted", "Not started"), ("closed", "Closed")]:
@@ -1047,6 +1102,18 @@ def test_empty_reason_codes_map_to_clinician_labels():
     s = app_module.summarize_bundle(json.loads(bundle_with_section(
         {"title": "S", "emptyReason": {"coding": [{"code": "novel-code"}]}})))
     assert s["sections"][0]["empty_reason"] == "novel-code"
+
+
+def test_empty_reason_display_text_is_relabelled_too():
+    """Real bundles spell the reason out as display text or CodeableConcept
+    text - "Nil Known" - and the code is often absent. Keying the table on the
+    code alone let that spelling through to the reader untouched."""
+    for reason in ({"coding": [{"code": "nilknown", "display": "Nil Known"}]},
+                   {"coding": [{"display": "Nil Known"}]},
+                   {"text": "Nil known"}):
+        s = app_module.summarize_bundle(json.loads(bundle_with_section(
+            {"title": "S", "emptyReason": reason})))
+        assert s["sections"][0]["empty_reason"] == "None reported", reason
 
 
 def test_empty_reason_is_only_reported_when_the_section_is_actually_empty():
@@ -1067,7 +1134,7 @@ def test_asserted_empty_section_is_distinguishable_from_an_absent_one():
     asserted = app_module.summarize_bundle(json.loads(bundle_with_section(
         {"title": "Allergies", "emptyReason": {"coding": [{"code": "nilknown"}]}})))
     assert [x["title"] for x in asserted["sections"]] == ["Allergies"]
-    assert asserted["sections"][0]["empty_reason"] == "None known"
+    assert asserted["sections"][0]["empty_reason"] == "None reported"
     absent = app_module.summarize_bundle(json.loads(bundle()))
     assert absent["sections"] == []
 
@@ -1080,7 +1147,7 @@ def test_a_section_with_no_entry_and_no_empty_reason_asserts_nothing():
 
 
 def test_empty_sections_never_earn_points(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
     body = bundle_with_section(
         {"title": "Allergies", "emptyReason": {"coding": [{"code": "nilknown"}]}})
@@ -1142,7 +1209,7 @@ def test_section_points_are_capped():
 
 
 def test_padding_a_document_cannot_outscore_a_real_one(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     token = register(client, "Padder")
     padded = {"title": "Allergies", "entry": [{"reference": "urn:uuid:res-0"}]}
     body = bundle_with_section(*[dict(padded)] * 200, resources=1)
@@ -1218,7 +1285,7 @@ def test_registration_code_gates_when_set(client, monkeypatch):
 # ------------------------------------------------------------- interop bounds
 
 def test_interop_points_are_capped(client, monkeypatch):
-    consume_first_blood(client, monkeypatch)
+    consume_first_pass(client, monkeypatch)
     tok_c = register(client, "Consumer")
     for i in range(6):
         tok_p = register(client, f"Prod{i}")
@@ -1403,3 +1470,104 @@ def test_health_reports_matchbox_up_and_down(client, monkeypatch):
     body = client.get("/api/health").json()
     # the service itself is still ok - only the validator is down
     assert body == {"status": "ok", "matchbox": "down"}
+
+
+# ---------------------------------------------------------------- OpenAPI
+
+def test_openapi_describes_the_bodies_fastapi_cannot_see(client):
+    """Three endpoints read the request body by hand, so FastAPI has no model
+    to introspect and would publish them as taking nothing at all."""
+    spec = client.get("/openapi.json").json()
+    register_body = spec["paths"]["/api/register"]["post"]["requestBody"]
+    props = register_body["content"]["application/json"]["schema"]["properties"]
+    assert set(props) == {"team", "code"}
+    eps_body = spec["paths"]["/api/eps"]["post"]["requestBody"]
+    assert "application/fhir+json" in eps_body["content"]
+    receipt = spec["paths"]["/api/interop/confirm"]["post"]["requestBody"]
+    required = receipt["content"]["application/json"]["schema"]["required"]
+    assert required == ["partner", "patient_family", "birth_date",
+                        "medications", "allergies"]
+
+
+def test_openapi_documents_the_score_headers(client):
+    """The verdict rides on headers, so a generated client that only sees the
+    body would have no way to read the score."""
+    ok = client.get("/openapi.json").json()["paths"]["/api/eps"]["post"]
+    headers = ok["responses"]["200"]["headers"]
+    assert set(headers) == {"X-Pass", "X-Score", "X-Errors", "X-Sections",
+                            "X-Resources"}
+
+
+def test_openapi_declares_the_team_token_as_a_security_scheme(client):
+    spec = client.get("/openapi.json").json()
+    scheme = spec["components"]["securitySchemes"]["TeamToken"]
+    assert scheme["in"] == "header" and scheme["name"] == "X-Team-Token"
+    # required where a token is required, optional where it only adds context
+    assert spec["paths"]["/api/eps"]["post"]["security"] == [{"TeamToken": []}]
+    assert {} in spec["paths"]["/api/exchange"]["get"]["security"]
+    # ...and the raw header parameters are not also listed alongside it
+    names = [p["name"].lower()
+             for p in spec["paths"]["/api/exchange"]["get"].get("parameters", [])]
+    assert "x-team-token" not in names and "authorization" not in names
+
+
+def test_openapi_leaves_the_ui_out(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    assert "/" not in paths and "/favicon.svg" not in paths
+    assert all(p.startswith("/api/") for p in paths)
+
+
+def test_index_links_the_machine_readable_api(client):
+    text = client.get("/").text
+    assert 'href="/openapi.json"' in text
+
+
+# ------------------------------------------- leaderboard -> clinical view
+
+def test_leaderboard_carries_the_slug_its_rows_link_with(client, monkeypatch):
+    tok = register(client, "Alpha Team")
+    submit(client, tok, outcome(), monkeypatch)
+    row = client.get("/api/leaderboard").json()[0]
+    assert row["team_slug"] == "alpha-team"
+    # the slug is what /api/submissions groups by, so the link lands somewhere
+    subs = client.get("/api/submissions").json()
+    assert subs[0]["team_slug"] == row["team_slug"]
+
+
+def test_index_links_leaderboard_companies_to_their_documents(client):
+    """A company name on the leaderboard is the obvious way in to that
+    company's submissions, so it is a link rather than plain text."""
+    text = client.get("/").text
+    assert '#clinical/company/${encodeURIComponent(r.team_slug)}' in text
+    # the clinical panel has to know the route kind, and it opens no document
+    assert 'if (parts[1] === "company") { hideDoc(); return; }' in text
+    # a company with nothing submitted has nothing to link to
+    assert "${r.attempts" in text
+
+
+# ---------------------------------------------------------------- samples
+
+def test_samples_do_not_code_an_identifier_type_the_value_set_lacks():
+    """The examples used v2-0203 NI, which is not in the R4 identifier-type
+    value set, so every validation of them carried a terminology warning. The
+    assigning authority OID already says which identifier this is."""
+    for sample in app_module.SAMPLES:
+        raw = app_module.read_sample_bytes(sample["id"])
+        assert raw is not None, sample["id"]
+        for entry in json.loads(raw)["entry"]:
+            resource = entry.get("resource") or {}
+            if resource.get("resourceType") != "Patient":
+                continue
+            for ident in resource.get("identifier") or []:
+                assert "type" not in ident
+                assert ident.get("system")
+
+
+def test_index_drops_the_example_banner_but_keeps_the_bundle(client):
+    """The disclaimer under the examples table says the documents are
+    synthetic; repeating it over every rendering was noise. The download it
+    used to carry moves onto the document's own byline."""
+    text = client.get("/").text
+    assert "sample-banner" not in text
+    assert "Example document." not in text
+    assert "'/bundle\" download>download the FHIR bundle</a>'" in text
