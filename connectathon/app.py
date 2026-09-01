@@ -1034,6 +1034,22 @@ def team_from_token(
     return team
 
 
+def optional_team_from_token(
+    x_team_token: str | None, authorization: str | None
+) -> sqlite3.Row | None:
+    """team_from_token, but an absent credential is anonymous rather than 401.
+
+    A credential that is present but wrong still raises: quietly downgrading a
+    mistyped token to anonymous would drop the team's own confirmations from
+    the response without telling them why.
+    """
+    if not x_team_token and not (
+        authorization and authorization.lower().startswith("bearer ")
+    ):
+        return None
+    return team_from_token(x_team_token, authorization)
+
+
 @app.post("/api/register")
 def register(payload: dict = Body(...)) -> JSONResponse:
     team = payload.get("team")
@@ -1419,21 +1435,24 @@ def exchange_list(
     x_team_token: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> list[dict]:
-    me = team_from_token(x_team_token, authorization)
+    me = optional_team_from_token(x_team_token, authorization)
     out = []
     with connect() as conn:
         teams = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
         ).fetchall()
-        confirmed = {
-            row["producer_id"]
-            for row in conn.execute(
-                "SELECT producer_id FROM interop_confirmations WHERE consumer_id = ?",
-                (me["id"],),
-            )
-        }
+        confirmed = set()
+        if me is not None:
+            confirmed = {
+                row["producer_id"]
+                for row in conn.execute(
+                    "SELECT producer_id FROM interop_confirmations "
+                    "WHERE consumer_id = ?",
+                    (me["id"],),
+                )
+            }
         for team in teams:
-            if team["id"] == me["id"]:
+            if me is not None and team["id"] == me["id"]:
                 continue
             best = best_valid_submission(conn, team["id"])
             if best is None:
@@ -1458,7 +1477,9 @@ def exchange_fetch(
     x_team_token: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
 ) -> Response:
-    team_from_token(x_team_token, authorization)  # any registered team may fetch
+    # Published documents are the shared test corpus - anyone may fetch one. A
+    # token is still checked when supplied so a mistyped one is not ignored.
+    optional_team_from_token(x_team_token, authorization)
     with connect() as conn:
         producer = conn.execute(
             "SELECT id, name, slug FROM teams WHERE slug = ?", (team_slug,)
@@ -2076,7 +2097,8 @@ table.matrix td.yes { color: var(--pass); font-weight: 700; }
   <em>consume</em> it. Your team's best valid submission is automatically
   published as its exchange document.</p>
   <ol class="steps">
-    <li>Fetch a partner's document with your token:
+    <li>Fetch any team's document - no token needed, every published
+      document is open:
       <code>GET /api/exchange/&lt;team-slug&gt;</code></li>
     <li>Parse it in <strong>your</strong> system and extract the patient's family
       name, birth date, and the number of medication and allergy entries.</li>
@@ -2825,7 +2847,9 @@ function renderClinicianDoc(d) {
   }
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
   html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
-    + (d.sample ? "" : " &middot; submitted " + new Date(d.ts).toLocaleString())
+    + (d.sample ? "" : " &middot; submitted " + new Date(d.ts).toLocaleString()
+        + ' &middot; <a href="/api/submissions/' + d.id
+        + '/bundle" download>download the FHIR bundle</a>')
     + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
     + "</p>";
   html += cvMode === "compare"
@@ -2851,10 +2875,9 @@ document.querySelectorAll(".cv-mode").forEach((btn) => {
 function interopCurls() {
   const tok = $("#token").value.trim() || "YOUR_TOKEN";
   $("#curl-exchange").textContent =
-    "curl -s " + origin + "/api/exchange/PARTNER_SLUG \\\n" +
-    "  -H 'X-Team-Token: " + tok + "' -o partner-eps.json\n" +
-    "# list available partners first: curl -s " + origin + "/api/exchange" +
-    " -H 'X-Team-Token: " + tok + "'";
+    "curl -s " + origin + "/api/exchange/PARTNER_SLUG -o partner-eps.json\n" +
+    "# list every published document first:\n" +
+    "curl -s " + origin + "/api/exchange";
   $("#curl-confirm").textContent =
     "curl -s -X POST " + origin + "/api/interop/confirm \\\n" +
     "  -H 'Content-Type: application/json' \\\n" +
@@ -2864,26 +2887,30 @@ function interopCurls() {
 }
 $("#token").addEventListener("input", interopCurls);
 
-function partnerCard(p) {
+function partnerCard(p, canConfirm) {
   return '<div class="io-partner" data-slug="' + esc(p.team_slug)
     + '" data-exid="' + p.exchange_id + '">'
     + '<div class="row" style="justify-content:space-between;flex-wrap:wrap">'
     + "<strong>" + esc(p.team) + "</strong>"
-    + (p.consumed_by_you ? '<span class="badge pass">CONFIRMED</span>'
-                         : '<span class="muted">not confirmed yet</span>')
+    + (canConfirm
+        ? (p.consumed_by_you ? '<span class="badge pass">CONFIRMED</span>'
+                             : '<span class="muted">not confirmed yet</span>')
+        : "")
     + "</div>"
     + '<p class="muted" style="margin:6px 0 0">Document #' + p.exchange_id
     + " · " + p.sections + " sections · " + p.resources + " resources · "
     + '<a href="#" class="io-view" data-id="' + p.exchange_id + '">View document</a>'
     + ' · <a href="/api/submissions/' + p.exchange_id
     + '/bundle" target="_blank">raw bundle</a></p>'
-    + '<div class="io-form">'
-    + '<div><label>Patient family name</label><input type="text" class="io-family"></div>'
-    + '<div><label>Birth date</label><input type="text" class="io-birth" placeholder="YYYY-MM-DD"></div>'
-    + '<div><label>Medication entries</label><input type="number" class="io-meds" min="0"></div>'
-    + '<div><label>Allergy entries</label><input type="number" class="io-alls" min="0"></div>'
-    + '<div><button class="io-confirm">Confirm</button></div>'
-    + "</div>"
+    + (canConfirm
+        ? '<div class="io-form">'
+          + '<div><label>Patient family name</label><input type="text" class="io-family"></div>'
+          + '<div><label>Birth date</label><input type="text" class="io-birth" placeholder="YYYY-MM-DD"></div>'
+          + '<div><label>Medication entries</label><input type="number" class="io-meds" min="0"></div>'
+          + '<div><label>Allergy entries</label><input type="number" class="io-alls" min="0"></div>'
+          + '<div><button class="io-confirm">Confirm</button></div>'
+          + "</div>"
+        : "")
     + '<div class="io-result"></div></div>';
 }
 
@@ -2892,14 +2919,9 @@ async function initInterop() {
   const token = $("#token").value.trim();
   const hint = $("#io-hint");
   const box = $("#io-partners");
-  if (!token) {
-    hint.textContent = "Paste your team token in the Submit tab first"
-      + " (it is remembered by this browser).";
-    box.innerHTML = "";
-    return;
-  }
   try {
-    const res = await fetch("/api/exchange", { headers: { "X-Team-Token": token } });
+    const res = await fetch("/api/exchange",
+      token ? { headers: { "X-Team-Token": token } } : undefined);
     if (res.status === 401) {
       hint.textContent = "That token was not recognised - check the Submit tab.";
       box.innerHTML = "";
@@ -2908,10 +2930,14 @@ async function initInterop() {
     if (!res.ok) return;
     const partners = await res.json();
     hint.textContent = partners.length
-      ? "These companies have published a valid exchange document. Fetch one,"
-        + " parse it in your system, then post back what you extracted."
-      : "No other company has a valid submission yet - check back soon.";
-    box.innerHTML = partners.map(partnerCard).join("");
+      ? (token
+          ? "These companies have published a valid exchange document. Fetch one,"
+            + " parse it in your system, then post back what you extracted."
+          : "Every published exchange document, free to download and test"
+            + " against. Paste your team token in the Submit tab to confirm the"
+            + " ones your system can consume.")
+      : "No company has a valid submission yet - check back soon.";
+    box.innerHTML = partners.map((p) => partnerCard(p, !!token)).join("");
   } catch (e) {
     hint.textContent = "Network error: " + e.message;
   }

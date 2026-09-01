@@ -687,10 +687,37 @@ def confirm(client, token, **overrides):
                        headers={"X-Team-Token": token})
 
 
-def test_exchange_requires_auth(client):
-    assert client.get("/api/exchange").status_code == 401
-    assert client.get("/api/exchange/anyone").status_code == 401
+def test_confirming_requires_auth_but_reading_does_not(client):
     assert client.post("/api/interop/confirm", json=RECEIPT).status_code == 401
+    assert client.get("/api/exchange").status_code == 200
+    assert client.get("/api/exchange/anyone").status_code == 404  # unknown team
+
+
+def test_a_wrong_token_is_still_rejected_on_read(client):
+    bad = {"X-Team-Token": "not-a-real-token"}
+    assert client.get("/api/exchange", headers=bad).status_code == 401
+    assert client.get("/api/exchange/anyone", headers=bad).status_code == 401
+
+
+def test_anonymous_readers_see_every_published_document(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_c, outcome(), monkeypatch, body=CLINICAL_BODY)
+    # A team's own document is hidden from them but not from a bystander.
+    assert [p["team"] for p in
+            client.get("/api/exchange", headers={"X-Team-Token": tok_c}).json()] \
+        == ["Producer"]
+    listing = client.get("/api/exchange").json()
+    assert [p["team"] for p in listing] == ["Consumer", "Producer"]
+    assert all(p["consumed_by_you"] is False for p in listing)
+
+
+def test_anyone_can_download_a_published_bundle(client, monkeypatch):
+    interop_setup(client, monkeypatch)
+    res = client.get("/api/exchange/producer")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("application/fhir+json")
+    assert res.headers["X-Producer"] == "producer"
+    assert json.loads(res.content)["resourceType"] == "Bundle"
 
 
 def test_exchange_lists_other_teams_with_valid_docs_only(client, monkeypatch):
@@ -886,6 +913,13 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     assert "grid-template-columns: repeat(2, minmax(0, 1fr))" in text
     # the dropped narrative view left nothing behind
     assert "viewNarrative" not in text
+
+
+def test_index_offers_bundle_downloads_and_anonymous_partner_browsing(client):
+    text = client.get("/").text
+    assert '/bundle" download>download the FHIR bundle</a>' in text
+    assert "partnerCard(p, !!token)" in text
+    assert 'fetch("/api/exchange",' in text
 
 
 def test_index_credits_matchbox(client):
