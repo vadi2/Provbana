@@ -2406,7 +2406,7 @@ input[type=file] { font-size: 0.84rem; color: var(--muted); }
 @keyframes pulse { 50% { opacity: 0.3; } }
 #issues-wrap { display: none; margin-top: 14px; }
 .issue-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
-.issues-scroll { max-height: 50vh; overflow-y: auto; border: 1px solid var(--border);
+.issues-scroll { max-height: 50vh; overflow: auto; border: 1px solid var(--border);
   border-radius: var(--r-ctl); }
 table.issues { font-size: 0.82rem; }
 table.issues thead th { position: sticky; top: 0; background: var(--card); z-index: 1; }
@@ -2415,8 +2415,12 @@ table.issues td.msg { overflow-wrap: anywhere; }
 table.issues td.loc {
   font-family: var(--font-mono);
   font-size: 0.72rem; color: var(--muted); overflow-wrap: anywhere;
-  max-width: 240px;
+  max-width: 260px;
 }
+/* Without a floor the location collapses to the width of "line 698" and the
+   path underneath wraps a syllable at a time. */
+table.issues td.loc, table.issues th.loc-h { min-width: 190px; }
+.loc-where { display: block; margin-top: 2px; overflow-wrap: anywhere; }
 .count-badge { display: inline-block; font-size: 0.68rem; font-weight: 600;
   color: var(--muted); border: 1px solid var(--border); border-radius: 999px;
   padding: 0 6px; margin-left: 4px; white-space: nowrap; }
@@ -2429,6 +2433,44 @@ details.issue-fold summary { font-size: 0.86rem; font-weight: 600;
   color: var(--muted); }
 details.issue-fold[open] summary { margin-bottom: 6px; }
 .no-errors { color: var(--pass); font-weight: 600; margin: 4px 0; }
+/* The submitted document, printed with each finding on the line it lands on.
+   A validator location like Bundle.entry[9].resource.dosage[0] is only useful
+   after somebody has counted entries by hand; this does the counting. */
+#doc-wrap { margin-top: 12px; }
+.doc-head { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  margin: 0 0 6px; }
+.doc-head .muted { margin: 0; }
+.doc-toggle { display: inline-flex; align-items: center; gap: 5px; margin: 0;
+  font-size: 0.8rem; color: var(--muted); cursor: pointer; white-space: nowrap; }
+.doc-toggle input { width: auto; margin: 0; }
+.doc-scroll { position: relative; max-height: 60vh; overflow: auto;
+  border: 1px solid var(--border); border-radius: var(--r-ctl);
+  background: var(--code-bg); font-family: var(--font-mono);
+  font-size: 0.72rem; line-height: 1.6; }
+.jl, .jd { display: flex; }
+.jl .ln, .jd .ln { flex: 0 0 4.2em; text-align: right; padding-right: 9px;
+  color: var(--muted); opacity: 0.6; user-select: none;
+  border-right: 1px solid var(--border); }
+.jl .jc { padding-left: 10px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.jl.hit { background: var(--card); }
+.jl.hit .ln { font-weight: 700; opacity: 1; }
+.jl.fatal, .jl.error { box-shadow: inset 3px 0 0 var(--fail); }
+.jl.warning { box-shadow: inset 3px 0 0 var(--warn); }
+.jl.information { box-shadow: inset 3px 0 0 var(--info); }
+.jl.flash { animation: jflash 1.6s ease-out; }
+@keyframes jflash { from { background: var(--accent-soft); } }
+.jd { padding-bottom: 3px; }
+.jd .jt { padding-left: 10px; white-space: normal; overflow-wrap: anywhere;
+  font-family: var(--font-sans); }
+.jd.fatal .jt, .jd.error .jt { color: var(--fail); }
+.jd.warning .jt { color: var(--warn); }
+.jgap { padding: 4px 0 4px calc(4.2em + 19px); color: var(--muted);
+  opacity: 0.7; font-style: italic; }
+button.loc-jump { background: transparent; border: 0; padding: 0; margin: 0;
+  font: inherit; font-weight: 600; white-space: nowrap; color: var(--accent);
+  text-align: left; cursor: pointer; text-decoration: underline;
+  text-underline-offset: 2px; }
+button.loc-jump:hover { filter: none; text-decoration-thickness: 2px; }
 .copied { color: var(--pass) !important; border-color: var(--pass) !important; }
 /* tabs */
 .tabs { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
@@ -2712,6 +2754,15 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <div id="issues-wrap">
       <div class="issue-summary" id="issue-summary"></div>
       <div id="issue-groups"></div>
+      <details id="doc-wrap" class="issue-fold" hidden>
+        <summary id="doc-summary">Your document, with the findings in place</summary>
+        <div class="doc-head">
+          <span class="muted" id="doc-note"></span>
+          <label class="doc-toggle"><input type="checkbox" id="doc-flagged">
+            Flagged lines only</label>
+        </div>
+        <div class="doc-scroll" id="doc-body"></div>
+      </details>
     </div>
   </section>
 </div>
@@ -2984,6 +3035,122 @@ function cleanExpr(expr) {
   return expr.replace(/\/\*[\s\S]*?\*\//g, "").trim();
 }
 
+/* ---- locations: from a validator expression to a place in the document ----
+
+   Matchbox reports where a finding sits as a FHIRPath-shaped locator, e.g.
+   Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose.ofType(Quantity).value
+
+   A FHIRPath engine is the wrong tool for reading these. It answers with the
+   value at a path, and the question here is the opposite one - whereabouts in
+   the bytes the participant submitted does that value live - which no engine
+   returns. It would also choke on the two things Matchbox writes that are not
+   FHIRPath: the inline Type/id comment it splices into the path, and the
+   dose[x] choice marker. So the locator is walked against the parsed document
+   instead, which is a dozen lines and yields the one thing that matters: a
+   path that can be turned into a line number. */
+
+function splitSegments(expr) {
+  // Dots inside a function argument - where(system='http://a.b/c') - are not
+  // separators, so depth has to be tracked rather than String.split(".").
+  const out = [];
+  let depth = 0, cur = "";
+  for (const ch of expr) {
+    if (ch === "(") depth++;
+    else if (ch === ")") depth--;
+    if (ch === "." && depth === 0) { out.push(cur); cur = ""; }
+    else cur += ch;
+  }
+  out.push(cur);
+  return out.filter(Boolean);
+}
+
+/* dose[x] in a locator is doseQuantity, doseRange... in the JSON. */
+function choiceKey(node, stem) {
+  if (!node || typeof node !== "object") return null;
+  return Object.keys(node).find((k) => k.length > stem.length
+    && k.startsWith(stem) && k[stem.length] !== k[stem.length].toLowerCase()) || null;
+}
+
+/* Path to the addressed node, as an array of keys and indices. A locator that
+   runs off the end of the document - the validator naming an element that is
+   missing, which is most of what it complains about - resolves to the deepest
+   part that does exist, because that is the place to look. */
+function locateExpr(root, expr) {
+  const segs = splitSegments(expr.replace(/\/\*[\s\S]*?\*\//g, ""));
+  let node = root, path = [], deepest = [];
+  for (let i = 1; i < segs.length; i++) {
+    const m = segs[i].match(/^([A-Za-z][A-Za-z0-9_]*)(?:\[(x|\d+)\])?$/);
+    if (!m || !node || typeof node !== "object") break;
+    let key = m[1];
+    const oft = i + 1 < segs.length
+      && segs[i + 1].match(/^ofType\(([A-Za-z][A-Za-z0-9_]*)\)$/);
+    if (oft) { key += oft[1]; i++; }
+    else if (m[2] === "x") key = choiceKey(node, key);
+    if (key === null || !(key in node)) break;
+    node = node[key];
+    path.push(key);
+    deepest = path.slice();
+    if (m[2] !== undefined && m[2] !== "x") {
+      const n = Number(m[2]);
+      if (!Array.isArray(node) || !(n in node)) break;
+      node = node[n];
+      path.push(n);
+      deepest = path.slice();
+    }
+  }
+  return deepest;
+}
+
+/* The locator usually stops at the resource while the message names the element
+   inside it - "Composition.section: minimum required = 5, but only found 4",
+   "Slice 'Bundle.entry:patient': a matching slice is required". Following that
+   name moves the marker off the resource header and onto the element at fault. */
+function refineByMessage(root, path, message) {
+  const m = message.match(/^(?:Slice ')?([A-Z][A-Za-z0-9_]*)\.([a-z][A-Za-z0-9_.]*)/);
+  if (!m) return path;
+  let node = root;
+  for (const k of path) node = node[k];
+  const type = path.length ? (node && node.resourceType) : (root && root.resourceType);
+  if (!node || typeof node !== "object" || type !== m[1]) return path;
+  const out = path.slice();
+  for (const part of m[2].split(".")) {
+    if (!node || typeof node !== "object" || !(part in node)) break;
+    node = node[part];
+    out.push(part);
+  }
+  return out;
+}
+
+/* JSON.stringify(doc, null, 2) prints exactly this text and then forgets where
+   every node ended up, and the line number is the whole point, so the printing
+   is done here with the positions kept. */
+function layoutJson(root) {
+  const lines = [];
+  const at = new Map();   // "/entry/9/resource" -> {start, end}
+  function walk(v, path, prefix, indent, comma) {
+    const pad = "  ".repeat(indent);
+    const start = lines.length;
+    if (v && typeof v === "object") {
+      const arr = Array.isArray(v);
+      const keys = arr ? v.map((_, i) => i) : Object.keys(v);
+      if (!keys.length) {
+        lines.push(pad + prefix + (arr ? "[]" : "{}") + comma);
+      } else {
+        lines.push(pad + prefix + (arr ? "[" : "{"));
+        keys.forEach((k, n) => walk(v[k], path + "/" + k,
+          arr ? "" : JSON.stringify(String(k)) + ": ",
+          indent + 1, n === keys.length - 1 ? "" : ","));
+        lines.push(pad + (arr ? "]" : "}") + comma);
+      }
+    } else {
+      lines.push(pad + prefix + JSON.stringify(v === undefined ? null : v) + comma);
+    }
+    at.set(path, { start: start, end: lines.length - 1 });
+  }
+  walk(root, "", "", 0, "");
+  return { lines: lines, at: at };
+}
+
 function groupIssues(issues) {
   // Dedupe identical (severity, expression, message); Matchbox repeats each
   // finding once per profile (eps + IPS), so keep the distinct profiles.
@@ -3016,12 +3183,18 @@ function issueTable(groups) {
       + '<td><span class="chip ' + esc(g.severity) + '">' + esc(g.severity) + "</span>"
       + (g.count > 1 ? '<span class="count-badge" title="reported '
          + g.count + ' times">×' + g.count + "</span>" : "") + "</td>"
-      + '<td class="loc" title="' + esc(g.exprFull) + '">' + esc(g.exprShort) + "</td>"
+      + '<td class="loc" title="' + esc(g.exprFull) + '">'
+      + (g.line === undefined ? esc(g.exprShort)
+         : '<button type="button" class="loc-jump" data-jump="' + g.line
+           + '">line ' + (g.line + 1) + '</button><span class="loc-where">'
+           /* break the path at its own punctuation rather than mid-word */
+           + esc(g.where).replace(/([.\]])/g, "$1<wbr>") + "</span>") + "</td>"
       + '<td class="msg">' + esc(g.message) + chips + "</td>"
       + "</tr>";
   }).join("");
   return '<div class="issues-scroll"><table class="issues"><thead><tr>'
-    + '<th scope="col">Severity</th><th scope="col">Location</th><th scope="col">Message</th></tr></thead><tbody>'
+    + '<th scope="col">Severity</th><th scope="col" class="loc-h">Location</th>'
+    + '<th scope="col">Message</th></tr></thead><tbody>'
     + rows + "</tbody></table></div>";
 }
 
@@ -3030,7 +3203,144 @@ function foldedGroup(label, groups) {
     + issueTable(groups) + "</details>";
 }
 
-function renderIssues(issues) {
+/* "MedicationStatement #9 · dosage[0].doseAndRate[0].doseQuantity.value" is
+   what the participant is looking for; Bundle.entry[9].resource.dosage[0]... is
+   how the validator had to say it. Built from the resolved path, so it names
+   what the document actually holds at that spot. */
+function pathLabel(doc, path) {
+  let head = (doc && doc.resourceType) || "Bundle";
+  let tail = path;
+  if (path[0] === "entry" && typeof path[1] === "number" && path[2] === "resource") {
+    const r = doc.entry[path[1]].resource;
+    head = ((r && r.resourceType) || "resource") + " #" + path[1];
+    tail = path.slice(3);
+  }
+  const text = tail.reduce((acc, k) => typeof k === "number"
+    ? acc + "[" + k + "]" : (acc ? acc + "." + k : k), "");
+  return text ? head + " · " + text : head;
+}
+
+/* Past this many lines the whole document is more DOM than a laptop on venue
+   wifi should be asked to lay out, so only the flagged neighbourhoods print. */
+const DOC_MAX_LINES = 12000;
+const DOC_CONTEXT = 4;
+let docState = null;
+
+/* Information findings are almost entirely "this element does not match any
+   known slice", one per entry; drawn in the margin they would bury the errors.
+   They still get a line number, so their location in the table still jumps. */
+const MARK_INLINE = new Set(["fatal", "error", "warning"]);
+
+function worstSeverity(hits) {
+  return hits.reduce((a, h) =>
+    (SEV_ORDER[h.severity] ?? 9) < (SEV_ORDER[a] ?? 9) ? h.severity : a,
+    hits[0].severity);
+}
+
+/* Fills in group.line for every finding that could be placed, and leaves the
+   printed document plus its margin marks in docState. */
+function buildDoc(bundleText, groups) {
+  docState = null;
+  let doc;
+  try { doc = JSON.parse(bundleText); } catch (e) { return; }
+  if (!doc || typeof doc !== "object") return;
+  const laid = layoutJson(doc);
+  const marks = new Map();
+  const placed = new Set();
+  for (const g of groups) {
+    if (g.exprFull === "-") continue;
+    let path;
+    try { path = refineByMessage(doc, locateExpr(doc, g.exprFull), g.message); }
+    catch (e) { continue; }
+    const spot = laid.at.get(path.map((k) => "/" + k).join(""));
+    if (!spot) continue;
+    g.line = spot.start;
+    g.where = pathLabel(doc, path);
+    placed.add(spot.start);
+    if (!MARK_INLINE.has(g.severity)) continue;
+    if (!marks.has(spot.start)) marks.set(spot.start, []);
+    marks.get(spot.start).push(g);
+  }
+  if (!placed.size) return;
+  docState = { lines: laid.lines, marks: marks, placed: placed };
+}
+
+function renderDoc(flaggedOnly) {
+  const wrap = $("#doc-wrap");
+  if (!docState) { wrap.hidden = true; return; }
+  const lines = docState.lines, marks = docState.marks;
+  const big = lines.length > DOC_MAX_LINES;
+  /* A document too big to print keeps the neighbourhood of every reported
+     location, so that every jump in the table still has somewhere to land;
+     asking for flagged lines keeps only what is actually marked. */
+  const keep = big ? docState.placed
+    : (flaggedOnly && marks.size ? new Set(marks.keys()) : null);
+  let show = null;
+  if (keep) {
+    show = new Set();
+    for (const n of keep)
+      for (let i = Math.max(0, n - DOC_CONTEXT);
+           i <= Math.min(lines.length - 1, n + DOC_CONTEXT); i++) show.add(i);
+  }
+  const out = [];
+  let gap = 0;
+  const flushGap = () => {
+    if (!gap) return;
+    out.push('<div class="jgap">' + gap + " line" + (gap === 1 ? "" : "s")
+      + " not shown</div>");
+    gap = 0;
+  };
+  for (let i = 0; i < lines.length; i++) {
+    if (show && !show.has(i)) { gap++; continue; }
+    flushGap();
+    const hits = marks.get(i);
+    out.push('<div class="jl' + (hits ? " hit " + worstSeverity(hits) : "")
+      + '" id="jl-' + i + '"><span class="ln">' + (i + 1) + "</span>"
+      + '<span class="jc">' + esc(lines[i]) + "</span></div>");
+    for (const h of hits || [])
+      out.push('<div class="jd ' + esc(h.severity) + '"><span class="ln"></span>'
+        + '<span class="jt"><span class="chip ' + esc(h.severity) + '">'
+        + esc(h.severity) + "</span> " + esc(h.message) + "</span></div>");
+  }
+  flushGap();
+  $("#doc-body").innerHTML = out.join("");
+  $("#doc-note").textContent = big
+    ? "Document is " + lines.length
+      + " lines - showing only around what the validator reported."
+    : marks.size
+      ? "Errors and warnings are marked where they land."
+      : "Nothing to mark; the locations above still jump into it.";
+  $("#doc-flagged").disabled = big || !marks.size;
+  wrap.hidden = false;
+  wrap.open = marks.size > 0;
+}
+
+function jumpToLine(n) {
+  const wrap = $("#doc-wrap");
+  if (wrap.hidden) return;
+  wrap.open = true;
+  let el = document.getElementById("jl-" + n);
+  if (!el && $("#doc-flagged").checked) {
+    $("#doc-flagged").checked = false;
+    renderDoc(false);
+    wrap.open = true;
+    el = document.getElementById("jl-" + n);
+  }
+  if (!el) return;
+  const box = $("#doc-body");
+  box.scrollTop = el.offsetTop - box.clientHeight / 3;
+  el.classList.remove("flash");
+  void el.offsetWidth;   // restart the animation when the same line is clicked twice
+  el.classList.add("flash");
+}
+
+$("#doc-flagged").addEventListener("change", (ev) => renderDoc(ev.target.checked));
+$("#issue-groups").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("[data-jump]");
+  if (btn) jumpToLine(Number(btn.dataset.jump));
+});
+
+function renderIssues(issues, bundleText) {
   const known = issues.filter((i) => i.severity in SEV_ORDER);
   const wrap = $("#issues-wrap");
   if (!known.length) { wrap.style.display = "none"; return; }
@@ -3048,6 +3358,9 @@ function renderIssues(issues) {
   $("#issue-summary").innerHTML = chips.join("");
 
   const groups = groupIssues(known);
+  /* Placing the findings first, because it is what gives each row its line
+     number, and the table is built with that number in it. */
+  buildDoc(bundleText, groups);
   const errG = groups.filter((g) => g.severity === "fatal" || g.severity === "error");
   const warnG = groups.filter((g) => g.severity === "warning");
   const infoG = groups.filter((g) => g.severity === "information");
@@ -3058,6 +3371,7 @@ function renderIssues(issues) {
     + (counts.warning === 1 ? "" : "s"), warnG);
   if (infoG.length) html += foldedGroup(counts.information + " information", infoG);
   $("#issue-groups").innerHTML = html;
+  renderDoc($("#doc-flagged").checked);
   wrap.style.display = "block";
 }
 
@@ -3122,6 +3436,8 @@ $("#submit-btn").addEventListener("click", async () => {
   errBox.style.display = "none";
   $("#banner").className = "banner";
   $("#issues-wrap").style.display = "none";
+  $("#doc-wrap").hidden = true;
+  docState = null;
   if (!token) {
     errBox.textContent = "A company token is required - register your company first.";
     errBox.style.display = "block";
@@ -3173,7 +3489,7 @@ $("#submit-btn").addEventListener("click", async () => {
         + (errors === 1 ? "" : "s") + " below first";
     }
     banner.innerHTML = esc(text) + '<span class="score">' + score + " pts</span>";
-    renderIssues(outcome.issue || []);
+    renderIssues(outcome.issue || [], body);
     refreshLeaderboard();
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
@@ -3927,7 +4243,6 @@ function partnerCard(p) {
     + 'the medication list dropped every dose."></textarea>'
     + '<div class="io-actions"><button data-upload="' + esc(p.team_slug)
     + '">Upload</button>'
-    + '<span class="muted">Needs your company token, and it is not scored.</span>'
     + '</div><p class="shot-status" hidden></p></div>')
     + '<div class="shots" hidden data-gallery="' + p.exchange_id + '"></div></div>';
 }

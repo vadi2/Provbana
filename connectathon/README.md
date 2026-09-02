@@ -134,6 +134,18 @@ bundle exceeds `MAX_BODY_BYTES`, **502** if Matchbox is unreachable or fails on 
 side (a 5xx from the validator is never scored against the bundle). Only attempts that
 got a verdict are recorded and kept in the audit log.
 
+The web form does more with that same outcome than the API can. A location like
+`Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose[x].value` is a locator, and
+turning it into a place in the file is otherwise counting entries by hand, so the page
+prints the bundle you submitted and puts every error and warning on the line it names,
+with the issue table's Location column reading `line 698 / MedicationStatement #9 ·
+dosage[0].doseAndRate[0].doseQuantity.value` and jumping there. Where the location only
+reaches the enclosing resource, the message is read for the element it names
+(`Composition.section: minimum required = 5`) and the marker moves onto it. Findings
+about something that is not in the document at all land on the nearest thing that is.
+All of it happens in the browser, against the JSON it has just sent - nothing is
+uploaded twice and the server keeps no extra state.
+
 ```
 # submission history (all teams, or one team by its team_slug; limit 1-1000, default 100)
 curl 'localhost:8095/api/submissions?team=my-team&limit=20'
@@ -197,7 +209,8 @@ curl localhost:8095/api/leaderboard
 
 The whole API is described at `/openapi.json`, browsable at `/docs`.
 
-Live UI (leaderboard, clinical views, samples) at <http://localhost:8095/>.
+Live UI (leaderboard, submission with inline findings, clinical views, interop
+screenshots, samples) at <http://localhost:8095/>.
 
 ### Samples
 

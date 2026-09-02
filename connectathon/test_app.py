@@ -13,7 +13,10 @@ import io
 import http.client
 import json
 import os
+import re
+import shutil
 import struct
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2159,3 +2162,126 @@ def test_the_interop_tab_offers_screenshots(client):
     assert 'box.className = "shot-edit"' in text
     assert "prompt(" not in text
     assert "Withdraw - tap to confirm" in text
+    assert "Needs your company token, and it is not scored." not in text
+
+
+# ---- validator locations mapped onto the document
+
+LOCATOR_FUNCS = ("splitSegments", "choiceKey", "locateExpr", "refineByMessage",
+                 "layoutJson", "pathLabel")
+
+HARNESS = r"""
+const [doc, cases] = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const laid = layoutJson(doc);
+console.log(JSON.stringify(cases.map(([expr, msg]) => {
+  const path = refineByMessage(doc, locateExpr(doc, expr), msg || "");
+  const key = path.map((k) => "/" + k).join("");
+  const spot = laid.at.get(key);
+  return [key, spot ? spot.start + 1 : null, spot ? laid.lines[spot.start] : null,
+          pathLabel(doc, path)];
+})));
+"""
+
+
+def run_locator(client, doc, cases):
+    """Resolve validator locations with the page's own code, in node.
+
+    Lifting the functions out of the served page rather than a copy is the
+    point: what is tested is the locator participants actually run.
+    Returns one [json path, line number, line text, readable label] per case.
+    """
+    blocks = re.findall(r"<script>\n(.*?)\n</script>", client.get("/").text, re.S)
+    js = max(blocks, key=len)
+    parts = []
+    for name in LOCATOR_FUNCS:
+        start = js.index("function %s(" % name)
+        parts.append(js[start:js.index("\n}", start) + 2])
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + HARNESS],
+                          input=json.dumps([doc, cases]),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+LOCATOR_DOC = {
+    "resourceType": "Bundle",
+    "entry": [
+        {"resource": {"resourceType": "Composition",
+                      "section": [{"title": "Problems", "entry": [{"reference": "x"}]}]}},
+        {"resource": {"resourceType": "Patient", "gender": "other",
+                      "communication": [{"language": {"coding": [{"system": "urn:x"}]}}]}},
+        {"resource": {"resourceType": "MedicationStatement",
+                      "dosage": [{"doseAndRate": [{"doseQuantity": {"value": 5}}]}],
+                      "effectivePeriod": {"start": "2020-01-01"}}},
+    ],
+}
+
+needs_node = pytest.mark.skipif(shutil.which("node") is None,
+                                reason="node is not installed")
+
+
+@needs_node
+def test_a_validator_location_resolves_to_a_line_in_the_document(client):
+    """The four shapes Matchbox emits: plain paths, its /*Type/id*/ annotation,
+    ofType(Quantity) and the dose[x] choice marker."""
+    got = run_locator(client, LOCATOR_DOC, [
+        ["Bundle.entry[1].resource/*Patient/abc*/.gender", ""],
+        ["Bundle.entry[1].resource.communication[0].language.coding[0].system", ""],
+        ["Bundle.entry[2].resource.dosage[0].doseAndRate[0].dose.ofType(Quantity).value", ""],
+        ["Bundle.entry[2].resource.dosage[0].doseAndRate[0].dose[x].value", ""],
+        ["Bundle.entry[2].resource.effective.ofType(Period)", ""],
+        ["Bundle.entry[0].resource.section[0].entry[0]", ""],
+    ])
+    assert [p for p, _, _, _ in got] == [
+        "/entry/1/resource/gender",
+        "/entry/1/resource/communication/0/language/coding/0/system",
+        "/entry/2/resource/dosage/0/doseAndRate/0/doseQuantity/value",
+        "/entry/2/resource/dosage/0/doseAndRate/0/doseQuantity/value",
+        "/entry/2/resource/effectivePeriod",
+        "/entry/0/resource/section/0/entry/0",
+    ]
+    # the line number has to point at the element, not merely exist
+    assert got[0][2].strip().rstrip(",") == '"gender": "other"'
+    assert got[2][2].strip().rstrip(",") == '"value": 5'
+    assert got[4][2].strip().startswith('"effectivePeriod": {')
+    assert all(line for _, line, _, _ in got)
+    # and the row says where that is in words the document itself supports
+    assert got[0][3] == "Patient #1 \u00b7 gender"
+    assert got[2][3] == ("MedicationStatement #2 \u00b7 "
+                         "dosage[0].doseAndRate[0].doseQuantity.value")
+
+
+@needs_node
+def test_a_location_for_something_missing_lands_on_the_nearest_real_element(client):
+    """Most findings name an element that is not there - a required slice, a
+    minimum cardinality. The marker belongs on the nearest thing that is."""
+    got = run_locator(client, LOCATOR_DOC, [
+        # the message names the element the location only encloses
+        ["Bundle", "Slice 'Bundle.entry:patient': a matching slice is required"],
+        ["Bundle.entry[0].resource", "Composition.section: minimum required = 5, but only found 1"],
+        # Patient.name is absent, so the resource itself is as close as we get
+        ["Bundle.entry[1].resource", "Patient.name: minimum required = 1, but only found 0"],
+        # a location running off the end of the document
+        ["Bundle.entry[9].resource.dosage[0]", ""],
+        # a message about some other resource type must not drag the marker
+        ["Bundle.entry[1].resource", "Observation.value: whatever"],
+    ])
+    assert [p for p, _, _, _ in got] == [
+        "/entry",
+        "/entry/0/resource/section",
+        "/entry/1/resource",
+        "/entry",
+        "/entry/1/resource",
+    ]
+    assert got[1][2].strip().startswith('"section": [')
+    assert [got[0][3], got[1][3]] == ["Bundle \u00b7 entry", "Composition #0 \u00b7 section"]
+
+
+def test_the_submit_tab_shows_findings_inside_the_document(client):
+    text = client.get("/").text
+    assert 'id="doc-body"' in text and 'id="doc-flagged"' in text
+    assert "function jumpToLine(" in text
+    assert "renderIssues(outcome.issue || [], body)" in text     # the submitted bytes
+    assert 'class="loc-jump"' in text                            # location jumps to the line
+    assert "DOC_MAX_LINES" in text                               # a huge bundle stays usable
+
