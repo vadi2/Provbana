@@ -10,7 +10,8 @@ event instance.
 
 The team list below is chosen to cover the states the UI can be in: teams that
 pass, teams that only ever fail, teams that never submit, and a score tie that
-exercises the ranking tiebreak. Bundles come from ./examples and ./samples, so
+exercises the ranking tiebreak. The names are deliberately fictitious ones -
+no real hospital, region or vendor appears on the demo leaderboard. Bundles come from ./examples and ./samples, so
 no patient data is invented here, and the interop screenshots are drawn by this
 script rather than being real grabs of anyone's product.
 """
@@ -45,46 +46,46 @@ BUNDLES = {
 # submit something valid takes the one-time first-pass bonus, so the richest
 # bundle goes first and the badge lands somewhere visible at the top.
 PLAN = [
-    ("Karolinska Interop Lab", ["rich"]),
-    ("Sahlgrenska Digital", ["arne"]),
-    ("Rigshospitalet EHR", ["andrea"]),
+    ("Contoso Interop Lab", ["rich"]),
+    ("Fabrikam Digital", ["arne"]),
+    ("Litware EHR", ["andrea"]),
     # Two attempts: a failure followed by a fix, so the attempts column and
     # "best submission wins" behaviour are both visible on one row.
-    ("Tromso Journal AS", ["broken", "official"]),
-    ("Oulu Health Tech", ["official"]),
-    # Same bundle as Oulu -> identical score, which exercises the rank
+    ("Northwind Journal AS", ["broken", "official"]),
+    ("Proseware Health Tech", ["official"]),
+    # Same bundle as Proseware -> identical score, which exercises the rank
     # tiebreak (earliest best submission, then name).
-    ("Reykjavik Care Systems", ["official"]),
+    ("Relecloud Care Systems", ["official"]),
     # minor-example fails the EPS profile, with a different error count from
     # broken-example - two shapes of failure rather than one repeated.
-    ("Tallinn Terviseandmed", ["minor"]),
+    ("Trey Research Halsodata", ["minor"]),
     # Never gets past the validator: NOT YET status with a real error count.
-    ("Aarhus MedTech", ["broken", "broken"]),
+    ("Woodgrove MedTech", ["broken", "broken"]),
     # Registered, never submitted: every richness column falls back to "-".
-    ("Helsinki HealthOS", []),
-    ("Uppsala Vardsystem", []),
+    ("Lamna HealthOS", []),
+    ("VanArsdel Vardsystem", []),
 ]
 
 # (who tested it, whose document, what they saw). Every producer here is a team
 # above whose first bundle passes, because only a published document can be
-# rendered. Karolinska's is deliberately shown by two systems, so the gallery
+# rendered. Contoso's is deliberately shown by two systems, so the gallery
 # has one document with several screenshots side by side.
 RENDERINGS = [
-    ("Sahlgrenska Digital", "Karolinska Interop Lab",
+    ("Fabrikam Digital", "Contoso Interop Lab",
      "Imports clean. All four allergies are there, but criticality is blank on "
      "every one of them - our list sorts by it, so they come out in file order."),
-    ("Rigshospitalet EHR", "Karolinska Interop Lab",
+    ("Litware EHR", "Contoso Interop Lab",
      "Medication section renders, dose text does not: we only read "
      "dosageInstruction.doseAndRate, and these carry the dose in the free text."),
-    ("Oulu Health Tech", "Sahlgrenska Digital",
+    ("Proseware Health Tech", "Fabrikam Digital",
      "Full summary in one screen. The problem list dates show as 2026-01 because "
      "we drop the day when onsetDateTime has no time zone."),
-    ("Karolinska Interop Lab", "Rigshospitalet EHR",
+    ("Contoso Interop Lab", "Litware EHR",
      "Cross-border case opens as expected. Note the immunisation section is "
      "empty rather than absent - worth deciding which one we all mean."),
-    ("Tromso Journal AS", "Oulu Health Tech",
+    ("Northwind Journal AS", "Proseware Health Tech",
      "Nothing to report - this one came through complete."),
-    ("Reykjavik Care Systems", "Tromso Journal AS",
+    ("Relecloud Care Systems", "Northwind Journal AS",
      "Patient banner is blank: we key the header off name.family and this "
      "document only has name.text."),
 ]

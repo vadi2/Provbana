@@ -628,7 +628,7 @@ def build_andrea():
 
 # ================================================================== ARNE
 # Complex care: 83-year-old Swede who falls at his son's home in Denmark. This is
-# the Swedish summary Rigshospitalet retrieves before he goes to theatre. Written
+# the Swedish summary the Danish hospital retrieves before he goes to theatre. Written
 # in Swedish, as a Swedish-sourced summary would be - the LOINC section codes,
 # not the titles, are what carry the meaning across the border.
 
