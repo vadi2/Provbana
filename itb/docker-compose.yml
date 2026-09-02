@@ -1,7 +1,7 @@
-# Matchbox - the FHIR validator the connectathon service calls.
+# Matchbox - the FHIR validator the hackathon service calls.
 #
 # The project name below fixes the network name to "itb_default", which the
-# connectathon container joins with `docker run --network itb_default ...` and
+# service container joins with `docker run --network itb_default ...` and
 # where it resolves the validator as http://matchbox:8080/matchboxv3/fhir.
 # Renaming the project renames the network, so leave `name: itb` alone.
 #
@@ -9,18 +9,31 @@
 #   -> http://localhost:8090/matchboxv3/fhir
 #
 # The GITB/ITB test bed that used to live here has been retired - the
-# connectathon service is the whole platform now. The connectathon service
-# itself is deliberately not defined here either: an organiser runs one
-# instance by hand (see connectathon/README.md) and a second copy of it here
-# would fight over host port 8095.
+# hackathon service in connectathon/ is the whole platform now. That service
+# is deliberately not defined here either: an organiser runs one instance by
+# hand (see connectathon/README.md) and a second copy of it here would fight
+# over host port 8095.
+#
+# application.yaml is read once at boot. After editing it (adding an IG, say)
+# recreate the container, or the running validator keeps the old package list:
+#   docker compose -p itb up -d --force-recreate matchbox
 
 name: itb
 
 services:
   matchbox:
-    image: europe-west6-docker.pkg.dev/ahdis-ch/ahdis/matchbox:latest
+    # Pinned for the same reason as the service's base image: a validator that
+    # changes under the participants mid-event changes the scores.
+    image: europe-west6-docker.pkg.dev/ahdis-ch/ahdis/matchbox:v4.1.14
     restart: unless-stopped
     ports:
       - "8090:8080"
     volumes:
       - ../matchbox/config:/config
+    # Matchbox ships with OpenTelemetry export on and nothing listening, so the
+    # log fills with "Failed to export" noise that buries the package-loading
+    # lines an organiser actually needs to see.
+    environment:
+      OTEL_TRACES_EXPORTER: none
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none

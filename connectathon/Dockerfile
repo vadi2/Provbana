@@ -10,11 +10,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
-COPY samples ./samples
+# Only the bundles: generate.py is the authoring tool, not part of the service.
+COPY samples/*.json ./samples/
 
 ENV DATA_DIR=/data
 # PORT is honoured by app.py's __main__ entry point, which also binds 0.0.0.0.
 ENV PORT=8095
 EXPOSE 8095
 
+# Runs as root, which is acceptable for a single-purpose container on a closed
+# event network; /data must be writable by whatever user you switch to if you
+# add a USER line.
 CMD ["python", "app.py"]

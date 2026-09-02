@@ -4,15 +4,22 @@
   "meta": {
     "profile": [
       "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
+    ],
+    "tag": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v3-ActReason",
+        "code": "HTEST",
+        "display": "test health data"
+      }
     ]
   },
   "language": "sv",
   "identifier": {
-    "system": "urn:ietf:rfc:9562",
-    "value": "cfd0c04f-2d93-5a89-984d-82fb99596505"
+    "system": "urn:ietf:rfc:3986",
+    "value": "urn:uuid:cfd0c04f-2d93-5a89-984d-82fb99596505"
   },
   "type": "document",
-  "timestamp": "2026-08-19T09:00:00+01:00",
+  "timestamp": "2026-08-19T09:00:00+02:00",
   "entry": [
     {
       "fullUrl": "urn:uuid:f7cd6d12-0095-5131-a4c0-d8dfe5ee2a0d",
@@ -25,8 +32,8 @@
         },
         "language": "sv",
         "identifier": {
-          "system": "urn:ietf:rfc:9562",
-          "value": "54aadd13-92a2-5f5e-b509-96710f11c214"
+          "system": "urn:ietf:rfc:3986",
+          "value": "urn:uuid:54aadd13-92a2-5f5e-b509-96710f11c214"
         },
         "status": "final",
         "type": {
@@ -42,7 +49,7 @@
         "subject": {
           "reference": "urn:uuid:6c176c67-1aed-5cda-9a51-7833bc0e1246"
         },
-        "date": "2026-08-19T09:00:00+01:00",
+        "date": "2026-08-19T09:00:00+02:00",
         "author": [
           {
             "reference": "urn:uuid:ceea7732-62c2-5b68-8594-ab25d0ab74a9"
@@ -241,7 +248,7 @@
             },
             "text": {
               "status": "generated",
-              "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"sv\" lang=\"sv\"><table><thead><tr><th>Analys</th><th>Datum</th><th>Resultat</th><th>Tolkning</th></tr></thead><tbody><tr><td>Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol</td><td>2026-06-12</td><td>58 mmol/mol</td><td>High</td></tr><tr><td>Creatinine [Mass/volume] in Serum or Plasma</td><td>2026-06-12</td><td>118 umol/L</td><td>High</td></tr><tr><td>Glomerular filtration rate/1.73 sq M.predicted</td><td>2026-06-12</td><td>46 mL/min/{1.73_m2}</td><td>Low</td></tr><tr><td>Hemoglobin [Mass/volume] in Blood</td><td>2026-06-12</td><td>112 g/L</td><td>Low</td></tr><tr><td>Potassium [Moles/volume] in Serum or Plasma</td><td>2026-06-12</td><td>4.4 mmol/L</td><td>Inom referens</td></tr><tr><td>Natriuretic peptide B prohormone N-Terminal [Mass/volume] in Serum or Plasma</td><td>2026-06-12</td><td>1840 ng/L</td><td>High</td></tr><tr><td>Prostate specific Ag [Mass/volume] in Serum or Plasma</td><td>2026-05-04</td><td>12.4 ug/L</td><td>High</td></tr></tbody></table></div>"
+              "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"sv\" lang=\"sv\"><table><thead><tr><th>Analys</th><th>Datum</th><th>Resultat</th><th>Tolkning</th></tr></thead><tbody><tr><td>Hemoglobin A1c/Hemoglobin.total standardized per IFCC-RMP for CDT in Blood</td><td>2026-06-12</td><td>58 mmol/mol</td><td>High</td></tr><tr><td>Creatinine [Moles/volume] in Serum or Plasma</td><td>2026-06-12</td><td>118 umol/L</td><td>High</td></tr><tr><td>Glomerular filtration rate [Volume Rate/Area] in Serum, Plasma or Blood by Creatinine-based formula (CKD-EPI)/1.73 sq M</td><td>2026-06-12</td><td>46 mL/min/{1.73_m2}</td><td>Low</td></tr><tr><td>Hemoglobin [Mass/volume] in Blood</td><td>2026-06-12</td><td>112 g/L</td><td>Low</td></tr><tr><td>Potassium [Moles/volume] in Serum or Plasma</td><td>2026-06-12</td><td>4.4 mmol/L</td><td>Inom referens</td></tr><tr><td>Natriuretic peptide.B prohormone N-Terminal [Mass/volume] in Serum or Plasma</td><td>2026-06-12</td><td>1840 ng/L</td><td>High</td></tr><tr><td>Prostate specific Ag [Mass/volume] in Serum or Plasma</td><td>2026-05-04</td><td>12.4 ug/L</td><td>High</td></tr></tbody></table></div>"
             },
             "entry": [
               {
@@ -321,7 +328,7 @@
         "id": "f7cd6d12-0095-5131-a4c0-d8dfe5ee2a0d",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"sv\" lang=\"sv\"><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Document</td><td>Patientöversikt (European Patient Summary)</td></tr><tr><td>Patient</td><td>Arne Bergström</td></tr><tr><td>Document date</td><td>2026-08-19</td></tr><tr><td>Sections</td><td>Allergier och intoleranser, Problemlista, Läkemedelslista, Genomgångna åtgärder, Vaccinationer, Laboratorieresultat, Medicintekniska produkter, Vårdplan</td></tr></tbody></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"sv\" lang=\"sv\"><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody><tr><td>Document</td><td>Patientöversikt (European Patient Summary)</td></tr><tr><td>Patient</td><td>Arne Bergström</td></tr><tr><td>Document date</td><td>2026-08-19</td></tr><tr><td>Sections</td><td>Allergier och intoleranser, Problemlista, Läkemedelslista, Genomgångna åtgärder, Vaccinationer, Laboratorieresultat, Medicintekniska produkter, Vårdplan</td></tr><tr><td>Note</td><td>Synthetic example generated for the Nordic Hackathon 2026 - not a real patient.</td></tr></tbody></table></div>"
         }
       }
     },
@@ -338,7 +345,7 @@
         "identifier": [
           {
             "system": "http://electronichealth.se/identifier/personnummer",
-            "value": "19430211-0000"
+            "value": "194302110004"
           }
         ],
         "name": [
@@ -423,7 +430,7 @@
         "id": "6c176c67-1aed-5cda-9a51-7833bc0e1246",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Name</th><td>Arne Bergström</td></tr><tr><th>Gender</th><td>male</td></tr><tr><th>Date of birth</th><td>1943-02-11</td></tr><tr><th>Identifier</th><td>19430211-0000</td></tr><tr><th>Preferred language</th><td>Swedish</td></tr><tr><th>Address</th><td>Ängsbacken 8 A, Falkenberg, SE</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Name</th><td>Arne Bergström</td></tr><tr><th>Gender</th><td>male</td></tr><tr><th>Date of birth</th><td>1943-02-11</td></tr><tr><th>Identifier</th><td>194302110004</td></tr><tr><th>Preferred language</th><td>Swedish</td></tr><tr><th>Address</th><td>Ängsbacken 8 A, Falkenberg, SE</td></tr></table></div>"
         }
       }
     },
@@ -440,11 +447,11 @@
         "identifier": [
           {
             "system": "urn:oid:1.2.752.29.4.19",
-            "value": "SE2321000000-1002"
+            "value": "SE2321000107-1002"
           },
           {
             "system": "urn:oid:2.5.4.97",
-            "value": "232100-0001"
+            "value": "2321000107"
           }
         ],
         "name": "Vårdcentralen Kvarnängen",
@@ -475,7 +482,7 @@
         "identifier": [
           {
             "system": "urn:oid:1.2.752.29.4.19",
-            "value": "SE2321000000-2002"
+            "value": "SE2321000107-2002"
           }
         ],
         "name": [
@@ -2212,10 +2219,10 @@
             {
               "system": "http://loinc.org",
               "code": "59261-8",
-              "display": "Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol"
+              "display": "Hemoglobin A1c/Hemoglobin.total standardized per IFCC-RMP for CDT in Blood"
             }
           ],
-          "text": "Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol"
+          "text": "Hemoglobin A1c/Hemoglobin.total standardized per IFCC-RMP for CDT in Blood"
         },
         "subject": {
           "reference": "urn:uuid:6c176c67-1aed-5cda-9a51-7833bc0e1246"
@@ -2263,7 +2270,7 @@
         "id": "a4daa378-9283-578d-85ac-6f2486c56fda",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>58 mmol/mol</td></tr><tr><th>Interpretation</th><td>High</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Hemoglobin A1c/Hemoglobin.total standardized per IFCC-RMP for CDT in Blood</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>58 mmol/mol</td></tr><tr><th>Interpretation</th><td>High</td></tr></table></div>"
         }
       }
     },
@@ -2293,11 +2300,11 @@
           "coding": [
             {
               "system": "http://loinc.org",
-              "code": "2160-0",
-              "display": "Creatinine [Mass/volume] in Serum or Plasma"
+              "code": "14682-9",
+              "display": "Creatinine [Moles/volume] in Serum or Plasma"
             }
           ],
-          "text": "Creatinine [Mass/volume] in Serum or Plasma"
+          "text": "Creatinine [Moles/volume] in Serum or Plasma"
         },
         "subject": {
           "reference": "urn:uuid:6c176c67-1aed-5cda-9a51-7833bc0e1246"
@@ -2345,7 +2352,7 @@
         "id": "ba73fa79-db42-5b18-b1ae-f8689ade9347",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Creatinine [Mass/volume] in Serum or Plasma</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>118 umol/L</td></tr><tr><th>Interpretation</th><td>High</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Creatinine [Moles/volume] in Serum or Plasma</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>118 umol/L</td></tr><tr><th>Interpretation</th><td>High</td></tr></table></div>"
         }
       }
     },
@@ -2375,11 +2382,11 @@
           "coding": [
             {
               "system": "http://loinc.org",
-              "code": "33914-3",
-              "display": "Glomerular filtration rate/1.73 sq M.predicted"
+              "code": "62238-1",
+              "display": "Glomerular filtration rate [Volume Rate/Area] in Serum, Plasma or Blood by Creatinine-based formula (CKD-EPI)/1.73 sq M"
             }
           ],
-          "text": "Glomerular filtration rate/1.73 sq M.predicted"
+          "text": "Glomerular filtration rate [Volume Rate/Area] in Serum, Plasma or Blood by Creatinine-based formula (CKD-EPI)/1.73 sq M"
         },
         "subject": {
           "reference": "urn:uuid:6c176c67-1aed-5cda-9a51-7833bc0e1246"
@@ -2421,7 +2428,7 @@
         "id": "403a7c85-d3d0-57db-a10f-830f2f9d3501",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Glomerular filtration rate/1.73 sq M.predicted</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>46 mL/min/{1.73_m2}</td></tr><tr><th>Interpretation</th><td>Low</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Glomerular filtration rate [Volume Rate/Area] in Serum, Plasma or Blood by Creatinine-based formula (CKD-EPI)/1.73 sq M</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>46 mL/min/{1.73_m2}</td></tr><tr><th>Interpretation</th><td>Low</td></tr></table></div>"
         }
       }
     },
@@ -2604,10 +2611,10 @@
             {
               "system": "http://loinc.org",
               "code": "33762-6",
-              "display": "Natriuretic peptide B prohormone N-Terminal [Mass/volume] in Serum or Plasma"
+              "display": "Natriuretic peptide.B prohormone N-Terminal [Mass/volume] in Serum or Plasma"
             }
           ],
-          "text": "Natriuretic peptide B prohormone N-Terminal [Mass/volume] in Serum or Plasma"
+          "text": "Natriuretic peptide.B prohormone N-Terminal [Mass/volume] in Serum or Plasma"
         },
         "subject": {
           "reference": "urn:uuid:6c176c67-1aed-5cda-9a51-7833bc0e1246"
@@ -2649,7 +2656,7 @@
         "id": "35d97d89-ce6b-5ffb-97d1-c2e96d52df88",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Natriuretic peptide B prohormone N-Terminal [Mass/volume] in Serum or Plasma</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>1840 ng/L</td></tr><tr><th>Interpretation</th><td>High</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Test</th><td>Natriuretic peptide.B prohormone N-Terminal [Mass/volume] in Serum or Plasma</td></tr><tr><th>Date</th><td>2026-06-12</td></tr><tr><th>Result</th><td>1840 ng/L</td></tr><tr><th>Interpretation</th><td>High</td></tr></table></div>"
         }
       }
     },

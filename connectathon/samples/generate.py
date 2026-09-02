@@ -5,8 +5,9 @@ person - the bundles only illustrate how such a summary could look, and exist so
 the clinician views have something rich to render.
 
 Every SNOMED CT code used here was verified against a live Snowstorm terminology
-server; ATC codes are WHO ATC 2025. Both bundles validate against
-bundle-eu-eps with zero errors.
+server, every LOINC code against tx.fhir.org (moles-per-volume codes for the
+SI units Swedish labs report); ATC codes are WHO ATC 2025. Both bundles
+validate against bundle-eu-eps with zero errors.
 
 The people and places also claim the HL7 Sweden base profiles (hl7se.fhir.base),
 so the Swedish shape of the data - personnummer namespace, HSA-id, organisation
@@ -17,6 +18,8 @@ and phone numbers here are.
     python3 samples/generate.py
 """
 import json, uuid, html, os
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 SCT = "http://snomed.info/sct"
 LOINC = "http://loinc.org"
@@ -33,6 +36,22 @@ SEBASE = "http://hl7.se/fhir/ig/base/StructureDefinition/"
 SE_PERSONNUMMER = "http://electronichealth.se/identifier/personnummer"
 SE_HSAID = "urn:oid:1.2.752.29.4.19"
 SE_ORGNR = "urn:oid:2.5.4.97"
+
+# Every timestamp is Swedish local time; the offset follows the calendar (+02:00
+# in summer) instead of being typed in, because a hard-coded "+01:00" on an
+# August document is exactly the kind of thing a receiving system checks.
+STOCKHOLM = ZoneInfo("Europe/Stockholm")
+
+# Marks the bundle itself as test data, so a downloaded file still says so
+# once it has left the UI and its disclaimer behind.
+TEST_DATA_TAG = {"system": THL7 + "v3-ActReason", "code": "HTEST",
+                 "display": "test health data"}
+SYNTHETIC_NOTE = ("Synthetic example generated for the Nordic Hackathon 2026 - "
+                  "not a real patient.")
+
+
+def local_datetime(date):
+    return datetime.fromisoformat(date + "T09:00:00").replace(tzinfo=STOCKHOLM).isoformat()
 
 def cc(system, code, display, text=None):
     return {"coding": [{"system": system, "code": code, "display": display}],
@@ -198,11 +217,12 @@ class BundleBuilder:
             "resourceType": "Composition",
             "meta": {"profile": [EPS + "composition-eu-eps"]},
             "language": self.language,
-            "identifier": {"system": "urn:ietf:rfc:9562", "value": self.uid("comp-id")},
+            "identifier": {"system": "urn:ietf:rfc:3986",
+                           "value": "urn:uuid:" + self.uid("comp-id")},
             "status": "final",
             "type": cc(LOINC, "60591-5", "Patient summary Document"),
             "subject": {"reference": self.pat_ref},
-            "date": self.doc_date + "T09:00:00+01:00",
+            "date": local_datetime(self.doc_date),
             "author": [{"reference": self.role_ref}],
             "title": self.title,
             "confidentiality": "N",
@@ -214,17 +234,19 @@ class BundleBuilder:
             ["Field", "Value"],
             [["Document", self.title], ["Patient", self.pat_display],
              ["Document date", self.doc_date],
-             ["Sections", ", ".join(s["title"] for s in self.sections)]],
+             ["Sections", ", ".join(s["title"] for s in self.sections)],
+             ["Note", SYNTHETIC_NOTE]],
             self.language)}
         self.entries.insert(0, {"fullUrl": "urn:uuid:" + comp["id"], "resource": comp})
         return {
             "resourceType": "Bundle",
             "id": self.uid("bundle"),
-            "meta": {"profile": [EPS + "bundle-eu-eps"]},
+            "meta": {"profile": [EPS + "bundle-eu-eps"], "tag": [TEST_DATA_TAG]},
             "language": self.language,
-            "identifier": {"system": "urn:ietf:rfc:9562", "value": self.uid("bundle-id")},
+            "identifier": {"system": "urn:ietf:rfc:3986",
+                           "value": "urn:uuid:" + self.uid("bundle-id")},
             "type": "document",
-            "timestamp": self.doc_date + "T09:00:00+01:00",
+            "timestamp": local_datetime(self.doc_date),
             "entry": self.entries,
         }
 
@@ -437,7 +459,7 @@ def build_andrea():
                                  SEBASE + "SEBasePatient"]},
             "identifier": [{
                 "system": SE_PERSONNUMMER,
-                "value": "20020317-0000",
+                "value": "200203170006",
             }],
             "name": [{"text": "Andrea Lindqvist", "family": "Lindqvist",
                       "given": ["Andrea"]}],
@@ -460,15 +482,15 @@ def build_andrea():
             "resourceType": "Practitioner",
             "meta": {"profile": [EUBASE + "practitioner-eu",
                                  SEBASE + "SEBasePractitioner"]},
-            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-2001"}],
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000008-2001"}],
             "name": [{"family": "Sundström", "given": ["Åsa"], "prefix": ["Dr"]}],
         }},
         org={
             "resourceType": "Organization",
             "meta": {"profile": [EUBASE + "organization-eu",
                                  SEBASE + "SEBaseOrganization"]},
-            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-1001"},
-                           {"system": SE_ORGNR, "value": "232100-0000"}],
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000008-1001"},
+                           {"system": SE_ORGNR, "value": "2321000008"}],
             "name": "Vårdcentralen Norrskogen",
             "address": [{"city": "Uppsala", "postalCode": "752 28", "country": "SE"}],
         },
@@ -542,17 +564,17 @@ def build_andrea():
     # that Andrea stopped attending follow-up, and the views should say so.
     labs = [
         dict(loinc="59261-8",
-             display="Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol",
+             display="Hemoglobin A1c/Hemoglobin.total standardized per IFCC-RMP for CDT in Blood",
              date="2025-12-09", value=68, unit="mmol/mol", low=27, high=42,
              interpretation=("H", "High"), performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
-        dict(loinc="2160-0", display="Creatinine [Mass/volume] in Serum or Plasma",
+        dict(loinc="14682-9", display="Creatinine [Moles/volume] in Serum or Plasma",
              date="2025-12-09", value=71, unit="umol/L", low=45, high=90,
              performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
-        dict(loinc="14959-1",
-             display="Microalbumin/Creatinine [Mass Ratio] in Urine",
+        dict(loinc="32294-1",
+             display="Albumin/Creatinine [Ratio] in Urine",
              date="2025-12-09", value=4.1, unit="mg/mmol", high=3.0,
              interpretation=("H", "High"), performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
-        dict(loinc="2093-3", display="Cholesterol [Mass/volume] in Serum or Plasma",
+        dict(loinc="14647-2", display="Cholesterol [Moles/volume] in Serum or Plasma",
              date="2025-12-09", value=4.4, unit="mmol/L", high=5.0,
              performer="Klinisk kemi, Sävelunds sjukhus, Uppsala"),
     ]
@@ -623,7 +645,7 @@ def build_arne():
                                  SEBASE + "SEBasePatient"]},
             "identifier": [{
                 "system": SE_PERSONNUMMER,
-                "value": "19430211-0000",
+                "value": "194302110004",
             }],
             "name": [{"text": "Arne Bergström", "family": "Bergström",
                       "given": ["Arne", "Gustav"]}],
@@ -648,15 +670,15 @@ def build_arne():
             "resourceType": "Practitioner",
             "meta": {"profile": [EUBASE + "practitioner-eu",
                                  SEBASE + "SEBasePractitioner"]},
-            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-2002"}],
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000107-2002"}],
             "name": [{"family": "Lövgren", "given": ["Märta"], "prefix": ["Dr"]}],
         }},
         org={
             "resourceType": "Organization",
             "meta": {"profile": [EUBASE + "organization-eu",
                                  SEBASE + "SEBaseOrganization"]},
-            "identifier": [{"system": SE_HSAID, "value": "SE2321000000-1002"},
-                           {"system": SE_ORGNR, "value": "232100-0001"}],
+            "identifier": [{"system": SE_HSAID, "value": "SE2321000107-1002"},
+                           {"system": SE_ORGNR, "value": "2321000107"}],
             "name": "Vårdcentralen Kvarnängen",
             "address": [{"city": "Falkenberg", "postalCode": "311 32",
                          "country": "SE"}],
@@ -798,14 +820,15 @@ def build_arne():
     # for first, so they are current rather than historic.
     labspec = [
         dict(loinc="59261-8",
-             display="Hemoglobin A1c/Hemoglobin.total in Blood by IFCC protocol",
+             display="Hemoglobin A1c/Hemoglobin.total standardized per IFCC-RMP for CDT in Blood",
              date="2026-06-12", value=58, unit="mmol/mol", low=27, high=42,
              interpretation=("H", "High")),
-        dict(loinc="2160-0", display="Creatinine [Mass/volume] in Serum or Plasma",
+        dict(loinc="14682-9", display="Creatinine [Moles/volume] in Serum or Plasma",
              date="2026-06-12", value=118, unit="umol/L", low=60, high=105,
              interpretation=("H", "High")),
-        dict(loinc="33914-3",
-             display="Glomerular filtration rate/1.73 sq M.predicted",
+        dict(loinc="62238-1",
+             display="Glomerular filtration rate [Volume Rate/Area] in Serum, Plasma or "
+                     "Blood by Creatinine-based formula (CKD-EPI)/1.73 sq M",
              date="2026-06-12", value=46, unit="mL/min/{1.73_m2}", low=60,
              interpretation=("L", "Low")),
         dict(loinc="718-7", display="Hemoglobin [Mass/volume] in Blood",
@@ -814,7 +837,7 @@ def build_arne():
         dict(loinc="2823-3", display="Potassium [Moles/volume] in Serum or Plasma",
              date="2026-06-12", value=4.4, unit="mmol/L", low=3.5, high=4.6),
         dict(loinc="33762-6",
-             display="Natriuretic peptide B prohormone N-Terminal [Mass/volume] in Serum or Plasma",
+             display="Natriuretic peptide.B prohormone N-Terminal [Mass/volume] in Serum or Plasma",
              date="2026-06-12", value=1840, unit="ng/L", high=300,
              interpretation=("H", "High")),
         dict(loinc="2857-1",

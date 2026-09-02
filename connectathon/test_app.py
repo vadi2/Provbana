@@ -10,6 +10,7 @@ first pass for the first team ever to go valid).
 """
 
 import io
+import http.client
 import json
 import os
 import urllib.error
@@ -22,7 +23,13 @@ import app as app_module
 
 
 def bundle(sections=0, resources=0, empty_sections=0):
-    """Build a document Bundle with N populated sections, M clinical resources."""
+    """Build a document Bundle with N populated sections, M clinical resources.
+
+    Section i points at resource i, so a populated section needs the bundle to
+    carry at least that many clinical resources - which is exactly the rule
+    the scorer applies.
+    """
+    assert sections <= resources, "a populated section needs a resource to point at"
     comp = {"resourceType": "Composition", "status": "final", "section": []}
     for i in range(sections):
         comp["section"].append(
@@ -38,7 +45,10 @@ def bundle(sections=0, resources=0, empty_sections=0):
         {"resource": {"resourceType": "Patient", "id": "p1"}},
     ]
     for i in range(resources):
-        entries.append({"resource": {"resourceType": "Observation", "id": f"o{i}"}})
+        entries.append({
+            "fullUrl": f"urn:uuid:res-{i}",
+            "resource": {"resourceType": "Observation", "id": f"o{i}"},
+        })
     return json.dumps({"resourceType": "Bundle", "type": "document", "entry": entries})
 
 
@@ -77,6 +87,19 @@ def outcome(errors=0, warnings=0, infos=0, fatals=0):
         issues = [{"severity": "information", "code": "informational",
                    "diagnostics": "All OK"}]
     return {"resourceType": "OperationOutcome", "issue": issues}
+
+
+@pytest.fixture(autouse=True)
+def _pin_env(monkeypatch):
+    """The suite asserts literal limits, open registration and the default IG
+    list; a shell that exports REGISTER_CODE, MAX_BODY_BYTES or VALIDATION_IGS
+    for a local run must not turn it red."""
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "")
+    monkeypatch.setattr(app_module, "VALIDATION_IGS", ["hl7se.fhir.base#1.1.0"])
+    monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 5 * 1024 * 1024)
+    monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 64 * 1024)
+    monkeypatch.setattr(app_module, "SAMPLES_DIR",
+                        os.path.join(os.path.dirname(app_module.__file__), "samples"))
 
 
 @pytest.fixture()
@@ -314,7 +337,7 @@ def test_team_score_is_max_across_submissions(client, monkeypatch):
     submit(client, token, outcome(), monkeypatch,
            body=bundle(sections=3, resources=4))                    # 88
     submit(client, token, outcome(), monkeypatch,
-           body=bundle(sections=1, resources=0))                    # 60
+           body=bundle(sections=1, resources=1))                    # 62
     submit(client, token, outcome(errors=4), monkeypatch,
            body=bundle(sections=5, resources=30))                   # 0
 
@@ -413,15 +436,45 @@ def test_count_bundle_richness_edge_cases():
                           "section": [
                               {"entry": []},                        # empty list
                               {"emptyReason": {"text": "none"}},    # no entries
-                              {"entry": [{"reference": "a"}]},      # counts
+                              {"entry": [{"reference": "Condition/c1"}]},  # counts
+                              {"title": "by fullUrl",              # counts
+                               "entry": [{"reference": "urn:uuid:ms-1"}]},
+                              {"title": "by urn from id",          # counts
+                               "entry": [{"reference": "urn:uuid:c1#frag"}]},
+                              {"title": "outside the bundle",      # ignored
+                               "entry": [{"reference": "Condition/elsewhere"}]},
+                              {"title": "display only",            # ignored
+                               "entry": [{"display": "see attached"}]},
+                              {"title": "points at the patient",   # ignored
+                               "entry": [{"reference": "Patient/p1"}]},
+                              {"title": "not a reference",         # ignored
+                               "entry": ["Condition/c1", 7, None]},
                               "garbage",                            # ignored
                           ]}},
-            {"resource": {"resourceType": "Patient"}},
-            {"resource": {"resourceType": "Condition"}},
-            {"resource": {"resourceType": "MedicationStatement"}},
+            {"resource": {"resourceType": "Patient", "id": "p1"}},
+            {"resource": {"resourceType": "Condition", "id": "c1"}},
+            {"fullUrl": "urn:uuid:ms-1",
+             "resource": {"resourceType": "MedicationStatement"}},
             {"request": {"method": "POST"}},                        # no resource
         ]
-    }) == (1, 2)
+    }) == (3, 2)
+
+
+def test_section_pointing_at_nothing_in_the_bundle_does_not_score(client, monkeypatch):
+    """entry[] with a dangling or display-only reference is padding, not content."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Padder")
+    sections = [
+        {"title": "Allergies", "entry": [{"reference": "urn:uuid:res-0"}]},  # resolves
+        {"title": "Problems", "entry": [{"reference": "urn:uuid:nowhere"}]},
+        {"title": "Medications", "entry": [{"display": "see attached PDF"}]},
+        {"title": "Procedures", "entry": [{"reference": "Patient/p1"}]},
+    ]
+    body = bundle_with_section(*sections, resources=1)
+    res = submit(client, token, outcome(), monkeypatch, body=body)
+    assert res.headers["X-Sections"] == "1"
+    assert res.headers["X-Resources"] == "1"
+    assert res.headers["X-Score"] == "62"
 
 
 # ---------------------------------------------------------------- clinician summary
@@ -819,9 +872,9 @@ def test_index_has_tabs_and_company_copy(client):
         assert label in text
     assert "One registration per company" in text
     assert "Register your company" in text
-    assert "<th>Company</th>" in text
+    assert '<th scope="col">Company</th>' in text
     # interop is unscored, so it has no leaderboard column and no receipt form
-    assert "<th>Interop</th>" not in text
+    assert '<th scope="col">Interop</th>' not in text
     assert "Interop testing is not scored." in text
     for leftover in ("io-form", "io-result", "interop/confirm", "interop/matrix",
                      "Interop matrix", "io-token"):
@@ -1299,15 +1352,107 @@ def test_matchbox_health_url_drops_the_fhir_suffix(monkeypatch):
     assert "/fhir/" not in app_module.matchbox_health_url()
 
 
+def fake_urlopen_by_url(monkeypatch, routes):
+    """routes: [(url substring, result)] - the first match answers."""
+    def _open(req, timeout=None):
+        url = req if isinstance(req, str) else req.full_url
+        for needle, result in routes:
+            if needle in url:
+                if isinstance(result, Exception):
+                    raise result
+                return result
+        raise AssertionError("unexpected URL " + url)
+    monkeypatch.setattr(urllib.request, "urlopen", _open)
+
+
+def ig_bundle(*packages):
+    """What Matchbox answers to GET ImplementationGuide: one entry per loaded
+    package, carrying packageId and version."""
+    entries = []
+    for spec in packages:
+        package, _, version = spec.partition("#")
+        entries.append({"resource": {"resourceType": "ImplementationGuide",
+                                     "packageId": package, "version": version}})
+    return json.dumps({"resourceType": "Bundle", "entry": entries}).encode()
+
+
+def matchbox_alive(monkeypatch, ig_list):
+    fake_urlopen_by_url(monkeypatch, [("/actuator/health", FakeResponse(b"{}")),
+                                      ("/ImplementationGuide", ig_list)])
+
+
 def test_health_reports_matchbox_up_and_down(client, monkeypatch):
-    fake_urlopen(monkeypatch, FakeResponse(b"{}", status=200))
-    assert client.get("/api/health").json() == {"status": "ok", "matchbox": "up"}
+    matchbox_alive(monkeypatch, FakeResponse(
+        ig_bundle(*app_module.VALIDATION_IGS, "hl7.fhir.eu.eps#1.0.0-ballot")))
+    body = client.get("/api/health").json()
+    assert body["status"] == "ok"
+    assert body["matchbox"] == "up"
+    assert body["missing_igs"] == []
+    # the UI reads these to warn before a doomed request
+    assert body["max_body_bytes"] == 5 * 1024 * 1024
+    assert body["register_code_required"] is False
     fake_urlopen(monkeypatch, FakeResponse(b"{}", status=503))
     assert client.get("/api/health").json()["matchbox"] == "down"
     fake_urlopen(monkeypatch, urllib.error.URLError("refused"))
     body = client.get("/api/health").json()
     # the service itself is still ok - only the validator is down
-    assert body == {"status": "ok", "matchbox": "down"}
+    assert (body["status"], body["matchbox"]) == ("ok", "down")
+
+
+def test_health_is_degraded_when_a_validation_ig_is_not_loaded(client, monkeypatch):
+    """Matchbox reads application.yaml at boot; a package added later is
+    silently absent and every claim from it goes unchecked. That is a state
+    worth a name of its own, not "up"."""
+    matchbox_alive(monkeypatch, FakeResponse(ig_bundle("hl7.fhir.eu.eps#1.0.0-ballot")))
+    body = client.get("/api/health").json()
+    assert body["matchbox"] == "degraded"
+    assert body["missing_igs"] == list(app_module.VALIDATION_IGS)
+
+
+def test_health_is_degraded_when_matchbox_loaded_nothing(client, monkeypatch):
+    """A searchset with zero matches carries no "entry" at all. That is the
+    answer "nothing is loaded" - the exact state this probe exists to catch -
+    not an unreadable reply to shrug at."""
+    matchbox_alive(monkeypatch, FakeResponse(json.dumps(
+        {"resourceType": "Bundle", "type": "searchset", "total": 0}).encode()))
+    body = client.get("/api/health").json()
+    assert body["matchbox"] == "degraded"
+    assert body["missing_igs"] == list(app_module.VALIDATION_IGS)
+    # a reply that is not a Bundle at all is still "unknown", so stays "up"
+    matchbox_alive(monkeypatch, FakeResponse(json.dumps(
+        {"resourceType": "OperationOutcome", "issue": []}).encode()))
+    assert client.get("/api/health").json()["matchbox"] == "up"
+
+
+def test_health_accepts_a_package_listed_without_a_version(client, monkeypatch):
+    package = app_module.VALIDATION_IGS[0].partition("#")[0]
+    matchbox_alive(monkeypatch, FakeResponse(json.dumps({
+        "resourceType": "Bundle",
+        "entry": [{"resource": {"resourceType": "ImplementationGuide",
+                                "packageId": package}}]}).encode()))
+    # a versionless listing cannot be checked, so it is trusted rather than
+    # reported missing
+    assert client.get("/api/health").json()["missing_igs"] == []
+
+
+def test_health_stays_up_when_the_ig_list_is_unreadable(client, monkeypatch):
+    matchbox_alive(monkeypatch, FakeResponse(b"not json"))
+    assert client.get("/api/health").json()["matchbox"] == "up"
+    matchbox_alive(monkeypatch, urllib.error.URLError("search timed out"))
+    assert client.get("/api/health").json()["matchbox"] == "up"
+    matchbox_alive(monkeypatch, FakeResponse(b"[1, 2]"))
+    assert client.get("/api/health").json()["matchbox"] == "up"
+
+
+def test_health_reports_a_register_code_requirement(client, monkeypatch):
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "sesame")
+    fake_urlopen(monkeypatch, urllib.error.URLError("refused"))
+    assert client.get("/api/health").json()["register_code_required"] is True
+
+
+def test_health_survives_a_half_open_connection(client, monkeypatch):
+    fake_urlopen(monkeypatch, http.client.RemoteDisconnected("gone mid-handshake"))
+    assert client.get("/api/health").json()["matchbox"] == "down"
 
 
 # ---------------------------------------------------------------- OpenAPI
@@ -1376,7 +1521,7 @@ def test_index_links_leaderboard_companies_to_their_documents(client):
     text = client.get("/").text
     assert '#clinical/company/${encodeURIComponent(r.team_slug)}' in text
     # the clinical panel has to know the route kind, and it opens no document
-    assert 'if (parts[1] === "company") { hideDoc(); return; }' in text
+    assert 'if (parts[1] === "company") { hideDoc(); selectCompany(parts[2]); return; }' in text
     # a company with nothing submitted has nothing to link to
     assert "${r.attempts" in text
 
@@ -1407,3 +1552,361 @@ def test_index_drops_the_example_banner_but_keeps_the_bundle(client):
     assert "sample-banner" not in text
     assert "Example document." not in text
     assert "'/bundle\" download>download the FHIR bundle</a>'" in text
+
+
+# ---------------------------------------------------------------- QA pass additions
+
+def http_error(code, payload):
+    return urllib.error.HTTPError("http://matchbox/$validate", code, "boom",
+                                  {}, io.BytesIO(payload))
+
+
+def test_matchbox_4xx_with_a_non_outcome_body_is_a_validator_failure(monkeypatch):
+    fake_urlopen(monkeypatch, http_error(400, b"[1, 2]"))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+    fake_urlopen(monkeypatch, http_error(400, b'{"resourceType": "Bundle"}'))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+    fake_urlopen(monkeypatch, http_error(400, b"<html>bad gateway</html>"))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+
+
+def test_matchbox_5xx_is_never_the_bundles_fault(monkeypatch):
+    """Matchbox wraps its own crashes in an OperationOutcome with a 500. That
+    is the validator falling over, not a verdict, and must not score 0."""
+    fake_urlopen(monkeypatch, http_error(500, json.dumps(outcome(errors=1)).encode()))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+
+
+def test_matchbox_4xx_with_an_outcome_is_the_submitters_verdict(monkeypatch):
+    fake_urlopen(monkeypatch, http_error(422, json.dumps(outcome(errors=2)).encode()))
+    result = app_module.validate_with_matchbox(b"{}")
+    assert len(result["issue"]) == 2
+
+
+def test_matchbox_non_object_success_body_is_a_validator_failure(monkeypatch):
+    fake_urlopen(monkeypatch, FakeResponse(b"[]"))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+    fake_urlopen(monkeypatch, FakeResponse(b"null"))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+
+
+def test_matchbox_half_open_connection_is_a_validator_failure(monkeypatch):
+    fake_urlopen(monkeypatch, http.client.RemoteDisconnected("closed"))
+    with pytest.raises(app_module.MatchboxError):
+        app_module.validate_with_matchbox(b"{}")
+
+
+def test_validate_honours_the_timeout_and_asks_for_fhir_json(monkeypatch):
+    captured = []
+    monkeypatch.setattr(app_module, "MATCHBOX_TIMEOUT", 7.5)
+    fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
+    app_module.validate_with_matchbox(b"{}")
+    (req, timeout), = captured
+    assert timeout == 7.5
+    assert req.get_header("Accept") == "application/fhir+json"
+    assert req.get_header("Content-type") == "application/fhir+json"
+
+
+def test_502_leaves_no_trace(client, monkeypatch):
+    tok = register(client, "Unlucky")
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body: (_ for _ in ()).throw(app_module.MatchboxError("down")))
+    res = client.post("/api/eps", content=BUNDLE, headers={"X-Team-Token": tok})
+    assert res.status_code == 502
+    audit_root = os.path.join(client.data_dir, "submissions")
+    assert [f for _, _, files in os.walk(audit_root) for f in files] == []
+    assert client.get("/api/submissions").json() == []
+    (row,) = client.get("/api/leaderboard").json()
+    assert row["attempts"] == 0
+
+
+def test_non_object_json_body_is_rejected_before_validation(client, monkeypatch):
+    tok = register(client, "Listy")
+    called = []
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body: called.append(body) or outcome())
+    for body in (b"[1, 2, 3]", b'"a bundle"', b"42", b"null"):
+        res = client.post("/api/eps", content=body, headers={"X-Team-Token": tok})
+        assert res.status_code == 400, body
+        assert "object" in res.json()["detail"]
+    assert called == []
+    assert client.get("/api/leaderboard").json()[0]["attempts"] == 0
+
+
+def test_outcome_without_issues_is_a_clean_pass(client, monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    tok = register(client, "Silent")
+    res = submit(client, tok, {"resourceType": "OperationOutcome"}, monkeypatch)
+    assert res.status_code == 200
+    assert res.headers["X-Pass"] == "true"
+    assert res.headers["X-Errors"] == "0"
+    assert res.headers["X-Score"] == "50"
+
+
+def test_malformed_issues_do_not_crash_scoring(client, monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    tok = register(client, "Odd Outcome")
+    res = submit(client, tok, {"resourceType": "OperationOutcome",
+                               "issue": ["not a dict", {"severity": 3}, {}]}, monkeypatch)
+    assert res.status_code == 200
+    assert res.headers["X-Pass"] == "true"
+    res = submit(client, tok, {"resourceType": "OperationOutcome", "issue": "nope"},
+                 monkeypatch)
+    assert res.status_code == 200
+
+
+def test_register_collapses_whitespace_and_dedupes_on_it(client):
+    res = client.post("/api/register", json={"team": "  Alpha \t Team  "})
+    assert res.status_code == 200
+    assert res.json()["team"] == "Alpha Team"
+    for clash in ("alpha team", "ALPHA   TEAM", " Alpha Team"):
+        assert client.post("/api/register", json={"team": clash}).status_code == 409, clash
+
+
+def test_register_rejects_non_string_and_missing_names(client):
+    for payload in ({"team": 42}, {"team": None}, {"team": ["x"]}, {}, {"name": "x"}):
+        res = client.post("/api/register", json=payload)
+        assert res.status_code == 400, payload
+
+
+def test_register_code_gate(client, monkeypatch):
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "sesame")
+    assert client.post("/api/register", json={"team": "Gated"}).status_code == 403
+    assert client.post("/api/register",
+                       json={"team": "Gated", "code": "wrong"}).status_code == 403
+    assert client.post("/api/register",
+                       json={"team": "Gated", "code": 123}).status_code == 403
+    assert client.post("/api/register",
+                       json={"team": "Gated", "code": "sesame"}).status_code == 200
+    # the wrong-code attempts did not reserve the name
+    assert client.get("/api/leaderboard").json()[0]["team"] == "Gated"
+
+
+def test_slugify_folds_nordic_letters_and_never_returns_empty():
+    slugify = app_module.slugify
+    assert slugify("Åland Hälsa") == "aland-halsa"
+    assert slugify("Ærø Sundhed") == "aero-sundhed"
+    assert slugify("Þór & Björk ehf.") == "thor-bjork-ehf"
+    assert slugify("Straße 9") == "strasse-9"
+    assert slugify("Łódź") == "lodz"
+    assert slugify("北京") == "team"
+    assert slugify("   ") == "team"
+    assert slugify("--Hi--") == "hi"
+
+
+def test_colliding_slugs_stay_unique(client):
+    for name in ("Åland Hälsa", "Aland Halsa", "aland  halsa!", "北京", "上海"):
+        assert client.post("/api/register", json={"team": name}).status_code == 200, name
+    slugs = [r["team_slug"] for r in client.get("/api/leaderboard").json()]
+    assert len(slugs) == len(set(slugs))
+    assert sorted(slugs) == ["aland-halsa", "aland-halsa-2", "aland-halsa-3",
+                             "team", "team-2"]
+
+
+def test_second_composition_in_a_bundle_is_ignored():
+    b = {"resourceType": "Bundle", "type": "document", "entry": [
+        {"resource": {"resourceType": "Composition", "section": []}},
+        {"resource": {"resourceType": "Patient", "id": "p"}},
+        {"fullUrl": "urn:uuid:o1",
+         "resource": {"resourceType": "Observation", "id": "o1"}},
+        # a second Composition claiming three populated sections
+        {"resource": {"resourceType": "Composition", "section": [
+            {"title": f"s{i}", "entry": [{"reference": "urn:uuid:o1"}]} for i in range(3)]}},
+    ]}
+    sections, resources = app_module.count_bundle_richness(b)
+    assert sections == 0
+    # ... and not counted as clinical payload either
+    assert resources == 1
+
+
+def test_exchange_publishes_the_best_document_not_the_latest(client, monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    tok = register(client, "Best Foot")
+    rich = submit(client, tok, outcome(), monkeypatch, body=bundle(sections=2, resources=2))
+    assert rich.headers["X-Score"] == "74"
+    plain = submit(client, tok, outcome(), monkeypatch, body=bundle())
+    assert plain.headers["X-Score"] == "50"
+    rich_id = client.get("/api/submissions?team=best-foot").json()[-1]["id"]
+    (entry,) = [e for e in client.get("/api/exchange").json() if e["team"] == "Best Foot"]
+    assert entry["exchange_id"] == rich_id
+    res = client.get("/api/exchange/best-foot")
+    assert res.status_code == 200
+    assert res.headers["X-Exchange-Id"] == str(rich_id)
+    assert res.headers["X-Producer"] == "best-foot"
+    assert json.loads(res.content) == json.loads(bundle(sections=2, resources=2))
+
+
+def test_submissions_limit_bounds(client, monkeypatch):
+    tok = register(client, "Bounded")
+    for _ in range(3):
+        submit(client, tok, outcome(), monkeypatch)
+    assert len(client.get("/api/submissions?limit=2").json()) == 2
+    assert len(client.get("/api/submissions?limit=1000").json()) == 3
+    # out-of-range limits are clamped to 1..1000, as the README says
+    assert len(client.get("/api/submissions?limit=0").json()) == 1
+    assert len(client.get("/api/submissions?limit=-5").json()) == 1
+    assert len(client.get("/api/submissions?limit=1001").json()) == 3
+    assert client.get("/api/submissions?limit=ten").status_code == 422
+    assert client.get("/api/submissions?team=nobody").json() == []
+
+
+def test_missing_samples_dir_degrades_to_unavailable(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "SAMPLES_DIR", str(tmp_path / "nowhere"))
+    listing = client.get("/api/samples").json()
+    assert listing["samples"], "the catalogue itself is static"
+    assert all(s["available"] is False for s in listing["samples"])
+    sample_id = listing["samples"][0]["id"]
+    assert client.get(f"/api/samples/{sample_id}").status_code == 404
+    assert client.get(f"/api/samples/{sample_id}/bundle").status_code == 404
+
+
+def test_sample_ids_cannot_escape_the_samples_dir(client):
+    assert app_module.read_sample_bytes("../app") is None
+    assert app_module.read_sample_bytes("..") is None
+    assert app_module.read_sample_bytes("") is None
+    for bad in ("..%2Fapp", "%2e%2e", "..%2F..%2Fapp.py"):
+        assert client.get(f"/api/samples/{bad}").status_code == 404, bad
+        assert client.get(f"/api/samples/{bad}/bundle").status_code == 404, bad
+
+
+def test_summariser_crash_does_not_take_the_detail_endpoint_down(client, monkeypatch):
+    tok = register(client, "Fragile")
+    assert submit(client, tok, outcome(), monkeypatch).status_code == 200
+    sub_id = client.get("/api/submissions").json()[0]["id"]
+    real = app_module.summarize_bundle
+
+    def boom(bundle):
+        if bundle is None:
+            return real(None)
+        raise RuntimeError("unexpected shape")
+
+    monkeypatch.setattr(app_module, "summarize_bundle", boom)
+    res = client.get(f"/api/submissions/{sub_id}")
+    assert res.status_code == 200
+    assert res.json()["summary"] == real(None)
+    res = client.get("/api/samples/andrea-cross-border")
+    assert res.status_code == 200
+    assert res.json()["summary"] == real(None)
+
+
+def test_favicon_is_an_svg(client):
+    res = client.get("/favicon.svg")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("image/svg+xml")
+    assert b"<svg" in res.content
+
+
+def test_care_plan_shows_the_activity_not_the_plan(client):
+    """Andrea's plan is active but its one visit was cancelled and never
+    rebooked - the cancellation and the note are what a clinician needs."""
+    summary = client.get("/api/samples/andrea-cross-border").json()["summary"]
+    items = [i for sec in summary["sections"] for i in sec.get("items", [])]
+    plans = [i for i in items if (i.get("detail") or "").startswith("scheduled ")]
+    assert plans, [i.get("label") for i in items]
+    plan = plans[0]
+    assert plan["status"] == "cancelled"
+    assert "plan since" in plan["detail"]
+    assert plan["note"]
+
+
+def test_device_use_shows_when_the_device_went_in(client):
+    summary = client.get("/api/samples/arne-complex-care").json()["summary"]
+    items = [i for sec in summary["sections"] for i in sec.get("items", [])]
+    devices = [i for i in items if (i.get("detail") or "").startswith("in use since ")]
+    assert devices, [i.get("detail") for i in items]
+
+
+def _items(bundle):
+    return [i for sec in app_module.summarize_bundle(bundle)["sections"]
+            for i in sec.get("items", [])]
+
+
+def _doc(section_code, section_title, resource):
+    return {"resourceType": "Bundle", "type": "document", "entry": [
+        {"resource": {"resourceType": "Composition", "section": [
+            {"title": section_title, "code": {"coding": [
+                {"system": "http://loinc.org", "code": section_code}]},
+             "entry": [{"reference": resource["resourceType"] + "/" + resource["id"]}]}]}},
+        {"resource": {"resourceType": "Patient", "id": "p"}},
+        {"resource": resource},
+    ]}
+
+
+def test_a_period_with_only_an_end_is_not_a_start():
+    """"since <date>" must point at a start; an end-only period says "until",
+    and recordedOn is when the statement was written, not when use began."""
+    plan = _items(_doc("18776-5", "Plan of care", {
+        "resourceType": "CarePlan", "id": "cp", "status": "completed",
+        "intent": "plan", "period": {"end": "2025-01-31"}}))
+    assert plan[0]["detail"] == "plan until 2025-01-31"
+    until = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d1", "status": "completed",
+        "device": {"display": "Insulin pump"}, "timingPeriod": {"end": "2024-06-01"}}))
+    assert until[0]["detail"] == "in use until 2024-06-01"
+    span = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d2", "status": "completed",
+        "device": {"display": "Insulin pump"},
+        "timingPeriod": {"start": "2023-01-01", "end": "2024-06-01"}}))
+    assert span[0]["detail"] == "in use 2023-01-01 to 2024-06-01"
+    recorded = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d3", "status": "active",
+        "device": {"display": "Hearing aid"}, "recordedOn": "2022-02-02"}))
+    assert recorded[0]["detail"] == "recorded 2022-02-02"
+    nothing = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d4", "status": "active",
+        "device": {"display": "Hearing aid"}}))
+    assert nothing[0]["detail"] is None
+
+
+def test_notes_are_surfaced_and_normalised():
+    items = app_module.summarize_bundle({
+        "resourceType": "Bundle", "type": "document", "entry": [
+            {"resource": {"resourceType": "Composition", "section": [
+                {"title": "Problems", "code": {"coding": [
+                    {"system": "http://loinc.org", "code": "11450-4"}]},
+                 "entry": [{"reference": "Condition/c1"}]}]}},
+            {"resource": {"resourceType": "Patient", "id": "p"}},
+            {"resource": {"resourceType": "Condition", "id": "c1",
+                          "code": {"text": "Gout"},
+                          "note": [{"text": "  flares\n twice   a year "},
+                                   {"text": "second note"}]}},
+        ]})["sections"][0]["items"]
+    assert items[0]["note"] == "flares twice a year"
+    no_note = app_module.summarize_bundle({
+        "resourceType": "Bundle", "type": "document", "entry": [
+            {"resource": {"resourceType": "Composition", "section": [
+                {"title": "Problems", "entry": [{"reference": "Condition/c1"}]}]}},
+            {"resource": {"resourceType": "Condition", "id": "c1",
+                          "note": [{"text": "   "}, "junk", {"author": "x"}]}},
+        ]})["sections"][0]["items"]
+    assert no_note[0]["note"] is None
+
+
+def test_index_reads_health_and_links_rows(client):
+    text = client.get("/").text
+    assert "/api/health" in text
+    assert "/api/leaderboard" in text
+    assert "/api/submissions?limit=200" not in text  # the picker no longer truncates
+    assert 'aria-current="page"' in text
+    assert 'role="alert"' in text
+    assert "Object.hasOwn(CV_VIEWS" in text
+    assert "eps_team" not in text
+    assert "@supports not (color: light-dark(" in text
+    assert "prefers-reduced-motion" in text
+    assert 'class="cv-open"' in text
+    # list links carry no view segment, so they cannot revert a view picked later
+    assert "href=\"#clinical/submission/'\n      + s.id + '\">'" in text
+    assert "href=\"#clinical/sample/'\n        + esc(s.id) + '\">'" in text
+    assert "function showUnknownCompany(slug)" in text
+    assert "if (cvInitPending) return;" in text
+    assert "cvCurrent = data;  // routeTeam reads" in text
+    assert 'if (ev.target.closest("a")) return;' in text
+    assert 'if (routeParts()[1] === "company") {' in text  # the picker keeps the URL honest
+    assert "Company token" in text
+    assert "team token" not in text.lower()

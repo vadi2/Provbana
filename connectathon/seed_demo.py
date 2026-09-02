@@ -1,7 +1,7 @@
 """Fill a local instance with demo data so every UI state can be previewed.
 
 Local preview only. It drives the public API exactly as a participant would -
-register, submit, confirm receipts - so every row it creates is real data
+register, then submit - so every row it creates is real data
 scored by the real validator, not hand-written rows in the database. That also
 means it needs Matchbox up, and that it must never be pointed at the live
 event instance.
@@ -10,7 +10,7 @@ event instance.
 
 The team list below is chosen to cover the states the UI can be in: teams that
 pass, teams that only ever fail, teams that never submit, and a score tie that
-exercises the ranking tiebreak. Bundles come from ../examples and ./samples, so
+exercises the ranking tiebreak. Bundles come from ./examples and ./samples, so
 no patient data is invented here.
 """
 
@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-EXAMPLES = os.path.join(HERE, os.pardir, "examples")
+EXAMPLES = os.path.join(HERE, "examples")
 SAMPLES = os.path.join(HERE, "samples")
 
 # Bundles by the shape they produce, so the plan below reads by intent.
@@ -97,7 +97,9 @@ def main():
         help="delete DATA_DIR first (the service must be stopped, and is left "
         "for you to restart)",
     )
-    ap.add_argument("--data-dir", default=os.environ.get("DATA_DIR", "./data"))
+    # Anchored to this file, not the shell's cwd: --reset deletes it.
+    ap.add_argument("--data-dir",
+                    default=os.environ.get("DATA_DIR") or os.path.join(HERE, "data"))
     args = ap.parse_args()
     base = args.url.rstrip("/")
 
@@ -113,6 +115,13 @@ def main():
     status, health, _ = call(base + "/api/health")
     if status != 200:
         print("cannot reach %s - is the service running?" % base, file=sys.stderr)
+        return 1
+    if health.get("matchbox") == "degraded":
+        print("matchbox is up but has not loaded %s - the demo scores would be "
+              "wrong; recreate it with `cd ../itb && docker compose -p itb up -d "
+              "--force-recreate matchbox` and wait for it to load its IGs"
+              % ", ".join(health.get("missing_igs") or ["a required package"]),
+              file=sys.stderr)
         return 1
     if health.get("matchbox") != "up":
         print("matchbox is %s - submissions would fail; start it with "
@@ -133,11 +142,10 @@ def main():
             json.dumps({"team": name}).encode(),
         )
         if status != 200:
-            print("  register %-26s SKIP (%s)" % (name, body.get("detail", status)))
+            detail = body.get("detail", status) if isinstance(body, dict) else status
+            print("  register %-26s SKIP (%s)" % (name, detail))
             continue
         tokens[name] = body["token"]
-        # The server derives the slug; mirroring its rule here would be a
-        # second source of truth, so read it back from the exchange list later.
         print("register %-26s ok" % name)
 
         for key in submissions:

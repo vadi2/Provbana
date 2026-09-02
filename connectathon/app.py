@@ -4,11 +4,13 @@ Teams register, submit EPS bundles, Matchbox validates, leaderboard keeps score.
 Stdlib sqlite3 + FastAPI, no other runtime deps.
 """
 
+import http.client
 import json
 import os
 import re
 import secrets
 import sqlite3
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -19,7 +21,9 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-MATCHBOX_URL = os.environ.get("MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir")
+MATCHBOX_URL = os.environ.get(
+    "MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir"
+).rstrip("/")
 PROFILE = os.environ.get(
     "PROFILE", "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
 )
@@ -127,8 +131,21 @@ def init_db() -> None:
             conn.execute("ALTER TABLE teams RENAME COLUMN first_blood TO first_pass")
 
 
+# Letters NFKD cannot decompose into an ASCII base, so "Åland Hälsa" does not
+# come out as "land-h-lsa". Nordic first, then the rest of Latin-1.
+SLUG_TRANSLITERATIONS = str.maketrans(
+    {"æ": "ae", "ø": "o", "œ": "oe", "ß": "ss", "ð": "d", "þ": "th", "ł": "l",
+     "đ": "d", "ı": "i"}
+)
+
+
 def slugify(name: str) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+    """URL-safe [a-z0-9-] identity for a team name; "team" if nothing survives."""
+    folded = unicodedata.normalize("NFKD", name.lower()).translate(
+        SLUG_TRANSLITERATIONS
+    )
+    ascii_only = folded.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_only).strip("-")
     return slug or "team"
 
 
@@ -164,18 +181,59 @@ def section_key(section: dict) -> str:
     return "u:"
 
 
+def _clinical_targets(entries: list) -> set[str]:
+    """Every way a section entry may point at a clinical resource in the bundle.
+
+    fullUrl, "Type/id" and "urn:uuid:<id>" all resolve per the FHIR bundle
+    rules; Composition and Patient are excluded because pointing a section at
+    them is not clinical content.
+    """
+    targets: set[str] = set()
+    for entry in entries:
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        rtype = resource.get("resourceType")
+        if not isinstance(rtype, str) or rtype in ("Composition", "Patient"):
+            continue
+        full_url = entry.get("fullUrl")
+        if isinstance(full_url, str) and full_url:
+            targets.add(full_url)
+        rid = resource.get("id")
+        if isinstance(rid, str) and rid:
+            targets.add(f"{rtype}/{rid}")
+            targets.add(f"urn:uuid:{rid}")
+    return targets
+
+
+def _section_populated(section: dict, targets: set[str]) -> bool:
+    entries = section.get("entry")
+    if not isinstance(entries, list):
+        return False
+    for ref in entries:
+        if not isinstance(ref, dict):
+            continue
+        target = ref.get("reference")
+        if isinstance(target, str) and target.split("#", 1)[0] in targets:
+            return True
+    return False
+
+
 def count_bundle_richness(bundle) -> tuple[int, int]:
     """Return (populated_sections, clinical_resources) for a Bundle JSON value.
 
     - populated_sections: distinct top-level section[] items of the (first)
-      Composition that carry an entry[] with at least one element. Sections
-      without entries (e.g. emptyReason-only) do not count.
+      Composition with at least one entry whose reference resolves to a
+      clinical resource in the bundle. Sections without entries (e.g.
+      emptyReason-only), or whose entries only point outside the bundle or at
+      nothing, do not count.
     - clinical_resources: bundle entries whose resource is neither a
       Composition nor a Patient.
     Defensive against arbitrary JSON: anything malformed counts as 0.
     """
     if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
         return 0, 0
+    targets = _clinical_targets(bundle["entry"])
     section_keys: set[str] = set()
     resources = 0
     composition_seen = False
@@ -190,10 +248,8 @@ def count_bundle_richness(bundle) -> tuple[int, int]:
                 section_list = resource.get("section")
                 if isinstance(section_list, list):
                     for section in section_list:
-                        if (
-                            isinstance(section, dict)
-                            and isinstance(section.get("entry"), list)
-                            and len(section["entry"]) >= 1
+                        if isinstance(section, dict) and _section_populated(
+                            section, targets
                         ):
                             section_keys.add(section_key(section))
             continue  # a Composition is never clinical payload
@@ -492,7 +548,10 @@ def _code_system_label(system) -> str | None:
         return known
     if system.startswith("urn:oid:"):
         return "OID " + system[len("urn:oid:") :]
-    return urllib.parse.urlparse(system).netloc or system
+    try:
+        return urllib.parse.urlparse(system).netloc or system
+    except ValueError:  # e.g. an unbalanced IPv6 bracket in the authority
+        return system
 
 
 def _concept_coding(cc) -> tuple[str | None, str | None]:
@@ -683,8 +742,8 @@ SECTION_TITLE_KINDS = (
 def _section_kind(section: dict, title: str) -> str:
     """What clinical section this is, independent of its language."""
     code = section.get("code")
-    if isinstance(code, dict):
-        for coding in code.get("coding") or []:
+    if isinstance(code, dict) and isinstance(code.get("coding"), list):
+        for coding in code["coding"]:
             if not isinstance(coding, dict):
                 continue
             kind = SECTION_LOINC_KINDS.get(str(coding.get("code") or ""))
@@ -760,7 +819,29 @@ def _render_resource(resource, by_ref) -> dict:
             if isinstance(categories, list) and categories:
                 label = _cc_display(categories[0])
         label = label or "Care plan"
-        detail = _period_str(resource.get("period"))
+        # The activity is what a reader acts on: a plan can be "active" while
+        # its one appointment is cancelled, and the cancellation is the news.
+        activity = _first_activity_detail(resource)
+        parts = []
+        if activity is not None:
+            act_status = activity.get("status")
+            if isinstance(act_status, str) and act_status.strip():
+                status = act_status.strip()
+            scheduled = _period_str(activity.get("scheduledPeriod")) or _first_str(
+                activity, "scheduledString"
+            )
+            if scheduled:
+                parts.append(f"scheduled {scheduled}")
+        period = resource.get("period")
+        span = _period_str(period)
+        if span:
+            if " to " in span:
+                parts.append(f"plan {span}")
+            elif period.get("start"):
+                parts.append(f"plan since {span}")
+            else:
+                parts.append(f"plan until {span}")
+        detail = "; ".join(parts) or None
     elif rtype == "Device":
         label = _cc_display(resource.get("type")) or "Device"
     elif rtype == "DeviceUseStatement":
@@ -776,7 +857,18 @@ def _render_resource(resource, by_ref) -> dict:
                 label = _cc_display(target.get("type")) or label
             elif isinstance(device_ref.get("display"), str):
                 label = device_ref["display"]
-        detail = _first_str(resource, "recordedOn")
+        timing = resource.get("timingPeriod")
+        span = _period_str(timing)
+        started = _first_str(resource, "timingDateTime")
+        recorded = _first_str(resource, "recordedOn")
+        if span and " to " in span:
+            detail = f"in use {span}"
+        elif span:
+            detail = f"in use since {span}" if timing.get("start") else f"in use until {span}"
+        elif started:
+            detail = f"in use since {started}"
+        elif recorded:
+            detail = f"recorded {recorded}"
     else:
         display = _cc_display(resource.get("code")) or _first_str(
             resource, "title", "description"
@@ -785,9 +877,32 @@ def _render_resource(resource, by_ref) -> dict:
             label, detail = display, _humanize_type(rtype)
         else:
             label = _humanize_type(rtype)
-    item = {"label": label, "detail": detail, "status": status}
+    item = {"label": label, "detail": detail, "status": status,
+            "note": _note_text(resource)}
     _annotate_item(item, resource, rtype, by_ref)
     return item
+
+
+def _first_activity_detail(resource) -> dict | None:
+    activities = resource.get("activity")
+    if isinstance(activities, list):
+        for activity in activities:
+            if isinstance(activity, dict) and isinstance(activity.get("detail"), dict):
+                return activity["detail"]
+    return None
+
+
+def _note_text(resource) -> str | None:
+    """The first Annotation on the resource - where authors put the part that
+    matters most and fits no coded field ("cancelled by the patient, not
+    rebooked")."""
+    notes = resource.get("note")
+    if isinstance(notes, list):
+        for note in notes:
+            text = note.get("text") if isinstance(note, dict) else None
+            if isinstance(text, str) and text.strip():
+                return " ".join(text.split())
+    return None
 
 
 def _patient_summary(patient) -> dict:
@@ -835,16 +950,22 @@ def _patient_summary(patient) -> dict:
 
 
 def _collect_references(value, out: list) -> None:
-    """Recursively collect every 'reference' string inside a JSON value."""
-    if isinstance(value, dict):
-        ref = value.get("reference")
-        if isinstance(ref, str):
-            out.append(ref)
-        for child in value.values():
-            _collect_references(child, out)
-    elif isinstance(value, list):
-        for child in value:
-            _collect_references(child, out)
+    """Collect every 'reference' string inside a JSON value.
+
+    Iterative rather than recursive: json.loads accepts nesting a good deal
+    deeper than Python's default recursion limit, and a submission is not
+    allowed to take the summary endpoint down with it.
+    """
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            ref = node.get("reference")
+            if isinstance(ref, str):
+                out.append(ref)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
 
 
 def summarize_bundle(bundle) -> dict:
@@ -1006,16 +1127,30 @@ def validate_with_matchbox(body: bytes) -> dict:
     try:
         with urllib.request.urlopen(req, timeout=MATCHBOX_TIMEOUT) as resp:
             payload = resp.read()
-    except urllib.error.HTTPError as exc:  # 4xx/5xx may still carry an outcome
+    except urllib.error.HTTPError as exc:
+        # A 4xx normally carries the OperationOutcome for a bundle Matchbox
+        # could not even parse, which is the submitter's verdict. A 5xx is
+        # the validator falling over, and must not be scored as the bundle's
+        # fault even when it comes wrapped in an OperationOutcome.
+        if exc.code >= 500:
+            raise MatchboxError(f"Matchbox returned HTTP {exc.code}") from exc
         payload = exc.read()
         try:
             outcome = json.loads(payload)
         except (ValueError, UnicodeDecodeError):
             raise MatchboxError(f"Matchbox returned HTTP {exc.code}") from exc
-        if outcome.get("resourceType") != "OperationOutcome":
+        if (
+            not isinstance(outcome, dict)
+            or outcome.get("resourceType") != "OperationOutcome"
+        ):
             raise MatchboxError(f"Matchbox returned HTTP {exc.code}") from exc
         return outcome
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,  # RemoteDisconnected, BadStatusLine, ...
+        TimeoutError,
+        OSError,
+    ) as exc:
         raise MatchboxError(f"Matchbox unreachable: {exc}") from exc
     try:
         outcome = json.loads(payload)
@@ -1031,6 +1166,59 @@ def matchbox_health_url() -> str:
     if base.endswith("/fhir"):
         base = base[: -len("/fhir")]
     return base + "/actuator/health"
+
+
+MATCHBOX_PROBE_TIMEOUT = 3  # seconds; health checks must not hang the UI
+
+
+def loaded_ig_packages() -> set[str] | None:
+    """{"packageId#version", ...} Matchbox reports loaded, or None if unknown.
+
+    Matchbox only reads application.yaml at boot, so a package added to the
+    config after the container came up is silently absent: validation still
+    runs, and every profile claim from that package comes back "not checked".
+    """
+    url = f"{MATCHBOX_URL}/ImplementationGuide?_summary=true&_count=200"
+    req = urllib.request.Request(url, headers={"Accept": "application/fhir+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=MATCHBOX_PROBE_TIMEOUT) as resp:
+            data = json.loads(resp.read())
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        OSError,
+        ValueError,
+        UnicodeDecodeError,
+    ):
+        return None
+    if not isinstance(data, dict) or data.get("resourceType") != "Bundle":
+        return None
+    # A searchset with no matches omits "entry" altogether; that is the answer
+    # "nothing is loaded", not an unreadable reply.
+    entries = data.get("entry", [])
+    if not isinstance(entries, list):
+        return None
+    loaded: set[str] = set()
+    for entry in entries:
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        package = resource.get("packageId")
+        version = resource.get("version")
+        if isinstance(package, str) and package:
+            loaded.add(f"{package}#{version}" if isinstance(version, str) and version
+                       else package)
+    return loaded
+
+
+def _ig_loaded(ig: str, loaded: set[str]) -> bool:
+    package, _, version = ig.partition("#")
+    if package in loaded:
+        return True  # listed without a version: nothing to compare, so trusted
+    if version:
+        return ig in loaded
+    return any(entry.startswith(package + "#") for entry in loaded)
 
 
 # ---------------------------------------------------------------- app
@@ -1100,7 +1288,7 @@ def team_from_token(
             "SELECT id, name, slug FROM teams WHERE token = ?", (token,)
         ).fetchone()
     if team is None:
-        raise HTTPException(401, detail="Invalid team token")
+        raise HTTPException(401, detail="Invalid company token")
     return team
 
 
@@ -1137,17 +1325,22 @@ def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
     if REGISTER_CODE:
         supplied = payload.get("code")
         if not isinstance(supplied, str) or not secrets.compare_digest(
-            supplied, REGISTER_CODE
+            supplied.encode("utf-8"), REGISTER_CODE.encode("utf-8")
         ):
             raise HTTPException(403, detail="Registration code required")
     team = payload.get("team")
     if not isinstance(team, str):
         raise HTTPException(400, detail="Body must be {\"team\": \"<name>\"}")
-    team = team.strip()
+    # Collapse runs of whitespace so "Acme  Health" is the same company as
+    # "Acme Health" rather than a way around the one-registration rule.
+    team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
         raise HTTPException(400, detail="Team name must be 2-40 characters")
     token = secrets.token_hex(8)
     with connect() as conn:
+        # The slug probe and the insert have to see the same table state, or
+        # two simultaneous registrations can both settle on "acme-2".
+        conn.execute("BEGIN IMMEDIATE")
         slug = unique_slug(conn, team)
         try:
             conn.execute(
@@ -1186,14 +1379,8 @@ def submit_eps(
         # RecursionError: json rejects deeply nested input by blowing the stack,
         # which is still the client's bad payload, not a server fault.
         raise HTTPException(400, detail="Body is not valid JSON")
-
-    # Audit log: save the raw submission before anything else.
-    now = datetime.now(timezone.utc)
-    team_dir = os.path.join(DATA_DIR, "submissions", team["slug"])
-    os.makedirs(team_dir, exist_ok=True)
-    filename = now.strftime("%Y%m%dT%H%M%S_%fZ") + ".json"
-    with open(os.path.join(team_dir, filename), "wb") as fh:
-        fh.write(body)
+    if not isinstance(bundle, dict):
+        raise HTTPException(400, detail="Body must be a FHIR Bundle JSON object")
 
     try:
         outcome = validate_with_matchbox(body)
@@ -1201,14 +1388,26 @@ def submit_eps(
         raise HTTPException(502, detail=str(exc))
 
     counts = {"fatal": 0, "error": 0, "warning": 0, "information": 0}
-    for issue in outcome.get("issue", []):
-        sev = issue.get("severity")
+    issues = outcome.get("issue")
+    for issue in issues if isinstance(issues, list) else []:
+        sev = issue.get("severity") if isinstance(issue, dict) else None
         if sev in counts:
             counts[sev] += 1
     errors = counts["fatal"] + counts["error"]
     passed = errors == 0
     sections, resources = count_bundle_richness(bundle)
     score = submission_score(passed, sections, resources)
+
+    # Audit log: the raw bytes, kept only for attempts that got a verdict, so
+    # a validator outage does not leave files with no submission row behind.
+    # The random suffix keeps two attempts in the same microsecond apart, and
+    # "xb" refuses to overwrite should the clock ever repeat itself.
+    now = datetime.now(timezone.utc)
+    team_dir = os.path.join(DATA_DIR, "submissions", team["slug"])
+    os.makedirs(team_dir, exist_ok=True)
+    filename = "%s_%s.json" % (now.strftime("%Y%m%dT%H%M%S_%fZ"), secrets.token_hex(3))
+    with open(os.path.join(team_dir, filename), "xb") as fh:
+        fh.write(body)
 
     awarded_first_pass = False
     with connect() as conn:
@@ -1331,6 +1530,26 @@ def leaderboard() -> list[dict]:
 # ---------------------------------------------------------------- submissions API
 
 
+def _loads_or_none(raw: bytes):
+    try:
+        return json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        return None
+
+
+def safe_summary(bundle) -> dict:
+    """summarize_bundle, but a bundle the summariser chokes on reads as empty.
+
+    The summariser is defensive, but it walks arbitrary client JSON and the
+    verdict beside it is the record that matters; a corner case in the
+    readable view must not take the whole detail endpoint down.
+    """
+    try:
+        return summarize_bundle(bundle)
+    except Exception:  # noqa: BLE001 - anything at all, by design
+        return summarize_bundle(None)
+
+
 def _submission_row(sub_id: int) -> sqlite3.Row | None:
     with connect() as conn:
         return conn.execute(
@@ -1393,10 +1612,7 @@ def submission_detail(sub_id: int) -> dict:
     raw = read_submission_bytes(row["team_slug"], row["filename"])
     if raw is None:
         raise HTTPException(404, detail="Submission file missing")
-    try:
-        bundle = json.loads(raw)
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        bundle = None  # summarize_bundle degrades gracefully
+    bundle = _loads_or_none(raw)  # None: the summary degrades gracefully
     return {
         "id": row["id"],
         "team": row["team_name"],
@@ -1409,7 +1625,7 @@ def submission_detail(sub_id: int) -> dict:
         # The stored verdict stands even when the file no longer parses, so say
         # so explicitly: an empty summary otherwise reads as an empty document.
         "bundle_readable": bundle is not None,
-        "summary": summarize_bundle(bundle),
+        "summary": safe_summary(bundle),
     }
 
 
@@ -1431,7 +1647,7 @@ def submission_bundle(sub_id: int) -> Response:
 # ----------------------------------------------------------------- sample API
 
 # Synthetic worked examples of the Nordic Hackathon 2026 scenarios. They are
-# hand-authored to exercise the clinician views (nil-known assertions, stale
+# generated by samples/generate.py to exercise the clinician views (nil-known assertions, stale
 # data, a non-English document) and do not come from any real system, record
 # or person.
 # scenario_url points at the organisers' brief on the event's resources page
@@ -1472,8 +1688,8 @@ SAMPLES = [
 ]
 
 SAMPLE_DISCLAIMER = (
-    "Synthetic example. Hand-authored for the hackathon scenarios - it does "
-    "not come from any real system, record or person, and only illustrates how "
+    "Synthetic example, generated for the hackathon scenarios - it does not "
+    "come from any real system, record or person, and only illustrates how "
     "such a summary could look."
 )
 
@@ -1485,8 +1701,11 @@ def _sample_meta(sample_id: str) -> dict | None:
 def read_sample_bytes(sample_id: str) -> bytes | None:
     if _sample_meta(sample_id) is None:
         return None
+    path = os.path.join(SAMPLES_DIR, sample_id + ".json")
+    if not os.path.isfile(path):
+        return None
     try:
-        with open(os.path.join(SAMPLES_DIR, sample_id + ".json"), "rb") as fh:
+        with open(path, "rb") as fh:
             return fh.read()
     except OSError:
         return None
@@ -1530,7 +1749,7 @@ def sample_detail(sample_id: str) -> dict:
         "warnings": 0,
         "score": None,
         "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
-        "summary": summarize_bundle(json.loads(raw)),
+        "summary": safe_summary(_loads_or_none(raw)),
     }
 
 
@@ -1609,19 +1828,45 @@ def exchange_fetch(team_slug: str) -> Response:
     tags=["Service"],
     summary="Service and validator health",
     description=(
-        "Reports whether Matchbox is reachable. Submissions fail while it is "
-        "down."
+        "Reports whether Matchbox is reachable (`up`), reachable but missing a "
+        "package named in VALIDATION_IGS (`degraded` - profile claims from that "
+        "package go unchecked), or unreachable (`down` - submissions fail). "
+        "Also carries the bundle size limit and whether registration needs a "
+        "code, for clients that want to warn before a doomed request."
     ),
 )
 def health() -> dict:
     matchbox = "down"
     try:
-        with urllib.request.urlopen(matchbox_health_url(), timeout=3) as resp:
+        with urllib.request.urlopen(
+            matchbox_health_url(), timeout=MATCHBOX_PROBE_TIMEOUT
+        ) as resp:
             if resp.status == 200:
                 matchbox = "up"
-    except (urllib.error.URLError, TimeoutError, OSError):
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        TimeoutError,
+        OSError,
+    ):
         pass
-    return {"status": "ok", "matchbox": matchbox}
+    missing: list[str] = []
+    if matchbox == "up" and VALIDATION_IGS:
+        loaded = loaded_ig_packages()
+        if loaded is not None:
+            missing = [ig for ig in VALIDATION_IGS if not _ig_loaded(ig, loaded)]
+            if missing:
+                # Alive, validating, and quietly not checking what we asked
+                # for. Recreate the container after editing application.yaml.
+                matchbox = "degraded"
+    return {
+        "status": "ok",
+        "matchbox": matchbox,
+        "missing_igs": missing,
+        # The UI reads these so it can warn before a doomed request.
+        "max_body_bytes": MAX_BODY_BYTES,
+        "register_code_required": bool(REGISTER_CODE),
+    }
 
 
 @app.get("/favicon.svg", include_in_schema=False)
@@ -1658,10 +1903,12 @@ INDEX_HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script>
 /* Runs before first paint so a stored choice never flashes the other theme. */
-try {
-  var t = localStorage.getItem("theme");
-  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
-} catch (e) { /* site data blocked - fall back to the system theme */ }
+(function () {
+  try {
+    var t = localStorage.getItem("theme");
+    if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+  } catch (e) { /* site data blocked - fall back to the system theme */ }
+})();
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -1709,6 +1956,11 @@ try {
   --bronze: light-dark(#8a4b1f, #d68f5f);
   --bronze-bg: light-dark(#f6e9dc, #30211a);
   --code-bg: light-dark(#f3f1e6, #131119);
+}
+/* Browsers without light-dark() (pre-2024) get the light palette rather than
+   unparsed declarations and a page with no colours at all. */
+@supports not (color: light-dark(#000, #fff)) {
+  :root { --bg: #fbfaf3; --card: #ffffff; --text: #111111; --muted: #5f5f5f; --border: #d8d5c7; --field-border: #8d8878; --accent: #503aa8; --accent-soft: #efebfa; --accent-fill: #503aa8; --accent-on: #ffffff; --pass: #16704a; --pass-bg: #e2f1e8; --fail: #b3261e; --fail-bg: #fbe7e4; --warn: #7d5300; --warn-bg: #fbf0cf; --info: #12628f; --info-bg: #e2eff7; --gold: #6f5a00; --gold-bg: #fdf6c4; --silver: #5f5f5f; --silver-bg: #eeece2; --bronze: #8a4b1f; --bronze-bg: #f6e9dc; --code-bg: #f3f1e6; }
 }
 * { box-sizing: border-box; }
 code, pre, textarea, .cv-mode, .tab-btn { font-variant-ligatures: none; }
@@ -1816,6 +2068,10 @@ tr.rank-3 td:first-child { box-shadow: inset 3px 0 0 var(--bronze); color: var(-
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important; }
+}
 .error-note { display: none; margin-top: 14px; padding: 10px 14px;
   border-radius: var(--r-card); color: var(--fail); background: var(--fail-bg);
   border: 1px solid var(--fail); font-size: 0.9rem; }
@@ -1874,11 +2130,11 @@ details.issue-fold[open] summary { margin-bottom: 6px; }
   border-color: var(--accent-fill); }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
-select, input[type=number] {
+select {
   width: 100%; padding: 9px 11px; border: 1px solid var(--field-border);
   border-radius: var(--r-ctl); background: var(--bg); color: var(--text); font: inherit;
 }
-select:focus, input[type=number]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 /* clinical view */
 .patient-card { background: var(--accent-soft); border: 1px solid var(--border);
   border-radius: var(--r-card); padding: 14px 16px; margin: 12px 0 6px; }
@@ -1889,6 +2145,11 @@ h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
 .cv-items li:last-child { border-bottom: none; }
 .cv-label { font-weight: 600; }
 .cv-detail { font-size: 0.85rem; }
+.cv-note, .tl-note { font-style: italic; }
+.cv-note { font-size: 0.85rem; }
+/* rows are links too, so a document can be opened in a new tab or bookmarked */
+a.cv-open { color: inherit; text-decoration: none; }
+tr.cv-row:hover a.cv-open { text-decoration: underline; }
 .cv-status { display: inline-block; font-size: 0.68rem; font-weight: 600;
   color: var(--muted); border: 1px solid var(--border); border-radius: 999px;
   padding: 0 6px; margin-left: 6px; vertical-align: middle; }
@@ -1897,7 +2158,7 @@ h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
   margin: 0 0 14px; font-weight: 600; }
 tr.cv-row { cursor: pointer; }
 tr.cv-row:hover td { background: var(--accent-soft); }
-footer { max-width: 1100px; margin: 26px auto 40px; padding: 0 22px;
+footer { max-width: 1060px; margin: 26px auto 40px; padding: 0 16px;
   font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
 footer a { color: var(--accent); }
 /* example documents, listed in the same table as everyone else's submissions */
@@ -2023,7 +2284,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   validated against the <a href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
   target="_blank" rel="noopener">HL7 EU EPS 1.0.0-ballot profile</a>.</p>
   <nav class="tabs">
-    <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard">Leaderboard</a>
+    <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard" aria-current="page">Leaderboard</a>
     <a class="tab-btn" data-tab="submit" href="#submit">Submit</a>
     <a class="tab-btn" data-tab="interop" href="#interop">Interop testing</a>
     <a class="tab-btn" data-tab="clinical" href="#clinical">Clinical view</a>
@@ -2038,8 +2299,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <div class="table-wrap">
   <table id="lb">
     <thead><tr>
-      <th>#</th><th>Company</th><th>Score</th><th>Status</th>
-      <th>Sections</th><th>Resources</th><th>Errors (best)</th><th>Last submission</th>
+      <th scope="col">#</th><th scope="col">Company</th><th scope="col">Score</th><th scope="col">Status</th>
+      <th scope="col">Sections</th><th scope="col">Resources</th><th scope="col">Errors (best)</th><th scope="col">Last submission</th>
     </tr></thead>
     <tbody id="lb-body"></tbody>
   </table>
@@ -2076,7 +2337,12 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
       <input type="text" id="reg-name" maxlength="40" placeholder="e.g. FHIR Starters">
       <button id="reg-btn">Register</button>
     </div>
-    <div class="error-note" id="reg-error"></div>
+    <div id="reg-code-row" hidden>
+      <label for="reg-code">Registration code</label>
+      <input type="text" id="reg-code" placeholder="from the organisers"
+        autocomplete="off" spellcheck="false">
+    </div>
+    <div class="error-note" id="reg-error" role="alert"></div>
     <div class="token-box" id="token-box">
       <div class="row" style="justify-content:space-between">
         <code id="token-value"></code>
@@ -2090,22 +2356,24 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
   <section class="card">
     <h2>Submit your EPS</h2>
-    <label for="token">Team token</label>
-    <input type="text" id="token" placeholder="paste your team token"
+    <label for="token">Company token</label>
+    <input type="text" id="token" placeholder="paste your company token"
       autocomplete="off" spellcheck="false">
     <label for="bundle">FHIR Bundle JSON (paste, or pick a file below)</label>
     <textarea id="bundle" placeholder='{"resourceType": "Bundle", "type": "document", ...}'
       spellcheck="false"></textarea>
     <div class="file-row">
-      <input type="file" id="file" accept=".json,application/json,application/fhir+json">
+      <input type="file" id="file" accept=".json,application/json,application/fhir+json"
+        aria-label="Pick a FHIR Bundle JSON file">
       <button id="submit-btn">Validate bundle</button>
     </div>
+    <p class="muted" id="validator-note" role="status" style="margin:8px 0 0"></p>
     <div class="spinner" id="spinner"><span class="ring"></span>
       <span>Validating against <a href="https://github.com/ahdis/matchbox"
       target="_blank" rel="noopener">Matchbox</a> - usually a few seconds, up
       to a minute on the first submission after it starts...</span></div>
-    <div class="error-note" id="submit-error"></div>
-    <div class="banner" id="banner"></div>
+    <div class="error-note" id="submit-error" role="alert"></div>
+    <div class="banner" id="banner" role="status"></div>
     <div id="issues-wrap">
       <div class="issue-summary" id="issue-summary"></div>
       <div id="issue-groups"></div>
@@ -2158,7 +2426,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <section class="card">
   <h2>Published documents</h2>
-  <p class="muted" id="io-hint" style="margin:0"></p>
+  <p class="muted" id="io-hint" style="margin:0" role="status"></p>
   <div id="io-partners"></div>
 </section>
 
@@ -2184,6 +2452,10 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 <script>
 "use strict";
 const $ = (s) => document.querySelector(s);
+/* Hackathon days run into each other; a bare clock time for "last submission"
+   cannot tell yesterday evening from this morning. */
+const fmtWhen = (ts) => new Date(ts).toLocaleString([],
+  { weekday: "short", hour: "2-digit", minute: "2-digit" });
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
@@ -2210,13 +2482,16 @@ async function refreshLeaderboard() {
         <td>${r.best_sections === null ? "-" : r.best_sections}</td>
         <td>${r.best_resources === null ? "-" : r.best_resources}</td>
         <td>${r.best_errors === null ? "-" : r.best_errors}</td>
-        <td class="muted">${r.last_submission
-          ? new Date(r.last_submission).toLocaleTimeString() : "-"}</td>
+        <td class="muted">${r.last_submission ? fmtWhen(r.last_submission) : "-"}</td>
       </tr>`).join("");
   } catch (e) { /* transient network error - retry on next tick */ }
 }
 refreshLeaderboard();
-setInterval(refreshLeaderboard, 5000);
+/* A tab left open in the background need not poll; catch up when it returns. */
+setInterval(() => { if (!document.hidden) refreshLeaderboard(); }, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshLeaderboard();
+});
 
 /* ---- routing ----
    The hash is this app's address bar: #<tab>[/<kind>/<id>/<view>]. Tabs are
@@ -2229,7 +2504,9 @@ const TABS = ["leaderboard", "submit", "interop", "clinical"];
 const DEFAULT_SAMPLE = "arne-complex-care";
 
 function routeParts() {
-  return decodeURIComponent(location.hash.replace(/^#/, "")).split("/");
+  let hash = location.hash.replace(/^#/, "");
+  try { hash = decodeURIComponent(hash); } catch (e) { /* a stray %: read it as typed */ }
+  return hash.split("/");
 }
 
 /* replace is for routes the user did not ask for by name - normalising a bare
@@ -2246,12 +2523,22 @@ function go(route, replace) {
 }
 
 function showTab(name) {
-  document.querySelectorAll(".tab-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.tab === name));
-  document.querySelectorAll(".tab-panel").forEach((p) =>
-    p.classList.toggle("active", p.id === "tab-" + name));
-  if (name === "clinical") initClinical();
-  if (name === "interop") initInterop();
+  document.querySelectorAll(".tab-btn").forEach((b) => {
+    const on = b.dataset.tab === name;
+    b.classList.toggle("active", on);
+    if (on) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+  });
+  let wasActive = false;
+  document.querySelectorAll(".tab-panel").forEach((p) => {
+    const on = p.id === "tab-" + name;
+    if (on && p.classList.contains("active")) wasActive = true;
+    p.classList.toggle("active", on);
+  });
+  /* Lists load when a tab is entered, not on every route change inside it:
+     reloading the company picker under a reader's hand would reset it. */
+  if (name === "clinical" && !wasActive) initClinical();
+  if (name === "interop" && !wasActive) initInterop();
+  if (name === "submit") checkValidator();
 }
 
 function applyRoute(scroll) {
@@ -2263,14 +2550,15 @@ function applyRoute(scroll) {
     go("clinical/sample/" + DEFAULT_SAMPLE + "/" + cvMode, true);
     return;
   }
-  if (CV_VIEWS[parts[3]]) cvMode = parts[3];
+  if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode = parts[3];
   /* The tab link remembers the document you were reading, so a trip to the
      leaderboard and back does not throw your place away. */
   document.querySelector('.tab-btn[data-tab="clinical"]')
     .setAttribute("href", location.hash);
-  /* initClinical, kicked off by showTab above, moves the picker onto the
-     company once the list has loaded; there is no document to show. */
-  if (parts[1] === "company") { hideDoc(); return; }
+  /* A company route shows that company's list and no document. If the tab was
+     already open the picker is moved here; otherwise initClinical, kicked off
+     by showTab above, reads the route once the list has loaded. */
+  if (parts[1] === "company") { hideDoc(); selectCompany(parts[2]); return; }
   showDoc(parts[1], parts[2], scroll);
 }
 
@@ -2279,6 +2567,7 @@ window.addEventListener("hashchange", () => applyRoute(true));
 /* ---- register ---- */
 $("#reg-btn").addEventListener("click", async () => {
   const name = $("#reg-name").value.trim();
+  const code = $("#reg-code").value.trim();
   const errBox = $("#reg-error");
   errBox.style.display = "none";
   $("#token-box").style.display = "none";
@@ -2286,34 +2575,59 @@ $("#reg-btn").addEventListener("click", async () => {
     const res = await fetch("/api/register", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ team: name }),
+      body: JSON.stringify(code ? { team: name, code } : { team: name }),
     });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      errBox.textContent = data.detail || ("Registration failed (" + res.status + ")");
+      /* The organisers may gate registration; the field appears the moment the
+         server says so, instead of cluttering an open event. */
+      if (res.status === 403) $("#reg-code-row").hidden = false;
+      errBox.textContent = detailText(data) || ("Registration failed (" + res.status + ")");
       errBox.style.display = "block";
       return;
     }
     $("#token-value").textContent = data.token;
     $("#token-box").style.display = "block";
     syncToken(data.token);
-    localStorage.setItem("eps_team", data.team);
     refreshLeaderboard();
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
     errBox.style.display = "block";
   }
 });
+["#reg-name", "#reg-code"].forEach((sel) => $(sel).addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") $("#reg-btn").click();
+}));
 
-function flashCopied(btn) {
+/* FastAPI's validation errors arrive as a list, everything else as a string. */
+function detailText(data) {
+  if (!data || data.detail === undefined) return "";
+  return typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
+}
+
+function flashCopied(btn, text) {
   const old = btn.textContent;
-  btn.textContent = "Copied!";
+  btn.textContent = text || "Copied!";
   btn.classList.add("copied");
   setTimeout(() => { btn.textContent = old; btn.classList.remove("copied"); }, 1500);
 }
-$("#token-copy").addEventListener("click", (ev) => {
-  navigator.clipboard.writeText($("#token-value").textContent)
-    .then(() => flashCopied(ev.target));
+$("#token-copy").addEventListener("click", async (ev) => {
+  const node = $("#token-value");
+  let ok = false;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(node.textContent); ok = true; }
+    catch (e) { /* permission denied - fall through to selecting the text */ }
+  }
+  if (!ok) {
+    /* Plain-http origins - which is what a LAN hackathon box is - have no
+       clipboard API; selecting the token leaves one keystroke to do. */
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  }
+  flashCopied(ev.target, ok ? "Copied!" : "Selected - press Ctrl+C");
 });
 
 /* ---- validation issue rendering ---- */
@@ -2368,7 +2682,7 @@ function issueTable(groups) {
       + "</tr>";
   }).join("");
   return '<div class="issues-scroll"><table class="issues"><thead><tr>'
-    + "<th>Severity</th><th>Location</th><th>Message</th></tr></thead><tbody>"
+    + '<th scope="col">Severity</th><th scope="col">Location</th><th scope="col">Message</th></tr></thead><tbody>'
     + rows + "</tbody></table></div>";
 }
 
@@ -2415,10 +2729,49 @@ function syncToken(value, from) {
   if (from !== "token") $("#token").value = value;
   try { localStorage.setItem("eps_token", value); } catch (e) { /* site data blocked */ }
 }
-syncToken(localStorage.getItem("eps_token") || "");
+let savedToken = "";
+try { savedToken = localStorage.getItem("eps_token") || ""; } catch (e) { /* site data blocked */ }
+syncToken(savedToken);
+
+/* The health endpoint says up front what a doomed request would only reveal
+   after a round trip: the validator is down, or up but missing a package. */
+let maxBundleBytes = 5 * 1024 * 1024;
+async function checkValidator() {
+  const note = $("#validator-note");
+  try {
+    const res = await fetch("/api/health");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const h = await res.json();
+    if (h.max_body_bytes) maxBundleBytes = h.max_body_bytes;
+    if (h.register_code_required) $("#reg-code-row").hidden = false;
+    note.textContent = h.matchbox === "up" ? ""
+      : h.matchbox === "degraded"
+        ? "The validator is up but has not loaded " + (h.missing_igs || []).join(", ")
+          + " - tell the organisers before trusting a verdict."
+        : "The validator is down right now - submissions will fail until it is back.";
+  } catch (e) {
+    note.textContent = "Could not reach the service (" + e.message + ").";
+  }
+}
+checkValidator();
+
 $("#file").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
-  if (f) $("#bundle").value = await f.text();
+  if (!f) return;
+  const errBox = $("#submit-error");
+  if (f.size > maxBundleBytes) {
+    errBox.textContent = "That file is " + (f.size / 1048576).toFixed(1) + " MB; the limit is "
+      + Math.round(maxBundleBytes / 1048576) + " MB.";
+    errBox.style.display = "block";
+    return;
+  }
+  try {
+    $("#bundle").value = await f.text();
+    errBox.style.display = "none";
+  } catch (e) {
+    errBox.textContent = "Could not read the file: " + e.message;
+    errBox.style.display = "block";
+  }
 });
 
 $("#submit-btn").addEventListener("click", async () => {
@@ -2429,7 +2782,7 @@ $("#submit-btn").addEventListener("click", async () => {
   $("#banner").className = "banner";
   $("#issues-wrap").style.display = "none";
   if (!token) {
-    errBox.textContent = "A team token is required - register a team first.";
+    errBox.textContent = "A company token is required - register your company first.";
     errBox.style.display = "block";
     return;
   }
@@ -2446,9 +2799,11 @@ $("#submit-btn").addEventListener("click", async () => {
       headers: { "Content-Type": "application/fhir+json", "X-Team-Token": token },
       body,
     });
-    if (res.status === 401 || res.status === 400 || res.status === 502) {
+    if (!res.ok || !res.headers.has("X-Pass")) {
+      /* 413, 422, 500, a proxy's error page: no verdict means failure */
       const data = await res.json().catch(() => ({}));
-      errBox.textContent = (data.detail || "Request failed") + " (HTTP " + res.status + ")";
+      errBox.textContent = (detailText(data) || res.statusText || "Request failed")
+        + " (HTTP " + res.status + ")";
       errBox.style.display = "block";
       return;
     }
@@ -2503,7 +2858,7 @@ $("#curl-leaderboard").textContent =
   "curl -s " + origin + "/api/leaderboard";
 
 /* ---- clinical view ---- */
-let cvSubs = [];
+let cvSubsByTeam = new Map();  // slug -> that company's submissions, fetched when picked
 let cvSamples = [];
 let cvCurrent = null;
 let cvMode = "document";
@@ -2530,8 +2885,13 @@ function routeTeam() {
   const parts = routeParts();
   if (parts[1] === "company" && parts[2]) return parts[2];
   if (parts[1] === "submission") {
-    const sub = cvSubs.find((s) => String(s.id) === parts[2]);
-    if (sub) return sub.team_slug;
+    if (cvCurrent && String(cvCurrent.id) === parts[2] && cvCurrent.team_slug) {
+      return cvCurrent.team_slug;
+    }
+    for (const subs of cvSubsByTeam.values()) {
+      const sub = subs.find((s) => String(s.id) === parts[2]);
+      if (sub) return sub.team_slug;
+    }
   }
   return SAMPLE_TEAM;
 }
@@ -2545,27 +2905,57 @@ function syncTeamPicker() {
   }
 }
 
+let cvInitPending = false;  // initClinical reads the route itself once it has the list
+
 async function initClinical() {
-  if (!cvSamples.length) await initSamples();
+  cvInitPending = true;
   try {
-    const res = await fetch("/api/submissions?limit=200");
-    if (!res.ok) return;
-    cvSubs = await res.json();
-  } catch (e) { return; }
-  const seen = new Map();
-  cvSubs.forEach((s) => { if (!seen.has(s.team_slug)) seen.set(s.team_slug, s.team); });
+    if (!cvSamples.length) await initSamples();
+    /* The leaderboard is the complete list of companies; a page of recent
+       submissions is not, once the event gets busy. */
+    let teams;
+    try {
+      const res = await fetch("/api/leaderboard");
+      if (!res.ok) return;
+      teams = (await res.json()).filter((t) => t.attempts > 0);
+    } catch (e) { return; }
+    const slugs = new Set(teams.map((t) => t.team_slug));
+    const sel = $("#cv-team");
+    const current = sel.value;
+    sel.innerHTML = '<option value="' + SAMPLE_TEAM + '">Example documents</option>'
+      + teams.map((t) =>
+          '<option value="' + esc(t.team_slug) + '">' + esc(t.team) + "</option>").join("");
+    cvSubsByTeam = new Map();  // a fresh visit deserves fresh lists
+    /* A #clinical/company route is an explicit request for that company, so it
+       wins over whatever the picker happened to be showing; otherwise a company
+       you had picked by hand survives a trip to another tab. */
+    const asked = routeParts()[1] === "company" ? routeParts()[2] : null;
+    if (asked && !slugs.has(asked)) { showUnknownCompany(asked); return; }
+    sel.value = asked ? asked : slugs.has(current) ? current : routeTeam();
+    renderCvList();
+  } finally {
+    cvInitPending = false;
+  }
+}
+
+function selectCompany(slug) {
+  if (cvInitPending) return;  // the route is applied when the picker is built
   const sel = $("#cv-team");
-  const current = sel.value;
-  sel.innerHTML = '<option value="' + SAMPLE_TEAM + '">Example documents</option>'
-    + [...seen.entries()].map(([slug, name]) =>
-        '<option value="' + esc(slug) + '">' + esc(name) + "</option>").join("");
-  /* A #clinical/company route is an explicit request for that company, so it
-     wins over whatever the picker happened to be showing; otherwise a company
-     you had picked by hand survives a trip to another tab. */
-  const asked = routeParts()[1] === "company" ? routeParts()[2] : null;
-  sel.value = seen.has(asked) ? asked
-            : seen.has(current) ? current : routeTeam();
-  renderCvList();
+  if (!slug || sel.value === slug) return;
+  if ([...sel.options].some((o) => o.value === slug)) {
+    sel.value = slug;
+    renderCvList();
+  } else {
+    showUnknownCompany(slug);
+  }
+}
+
+/* A link to a company that has not submitted yet (or a mistyped slug) should
+   say so, not leave a blank panel behind an unrelated picker value. */
+function showUnknownCompany(slug) {
+  $("#cv-team").selectedIndex = -1;
+  $("#cv-list").innerHTML = '<p class="muted">No company called \u201c' + esc(slug)
+    + '\u201d has submitted a document yet - pick one from the list above.</p>';
 }
 
 function renderSampleList(box) {
@@ -2574,10 +2964,11 @@ function renderSampleList(box) {
     return;
   }
   box.innerHTML = '<div class="table-wrap"><table><thead><tr>'
-    + "<th>Patient</th><th>Language</th><th>Scenario</th>"
+    + '<th scope="col">Patient</th><th scope="col">Language</th><th scope="col">Scenario</th>'
     + "</tr></thead><tbody>"
     + cvSamples.map((s) => '<tr class="cv-row" data-sample="' + esc(s.id)
-        + '" title="click to open"><td><strong>' + esc(s.name) + "</strong>"
+        + '" title="click to open"><td><strong><a class="cv-open" href="#clinical/sample/'
+        + esc(s.id) + '">' + esc(s.name) + "</a></strong>"
         + '<div class="cv-sub">' + esc(s.tagline) + "</div></td>"
         + "<td>" + esc(s.language) + "</td>"
         + '<td class="cv-scenario">' + esc(s.scenario)
@@ -2590,31 +2981,61 @@ function renderSampleList(box) {
     + '<p class="muted sample-note">' + esc(cvDisclaimer) + "</p>";
 }
 
-function renderCvList() {
+const CV_LIST_LIMIT = 1000;  // the API's ceiling for one page
+
+async function renderCvList() {
   const slug = $("#cv-team").value;
   const box = $("#cv-list");
   if (!slug) { box.innerHTML = ""; return; }
   if (slug === SAMPLE_TEAM) { renderSampleList(box); return; }
-  const subs = cvSubs.filter((s) => s.team_slug === slug);
+  let subs = cvSubsByTeam.get(slug);
+  if (!subs) {
+    box.innerHTML = '<p class="muted">Loading\u2026</p>';
+    try {
+      const res = await fetch("/api/submissions?team=" + encodeURIComponent(slug)
+        + "&limit=" + CV_LIST_LIMIT);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      subs = await res.json();
+    } catch (e) {
+      box.innerHTML = '<p class="muted">Could not load the submissions ('
+        + esc(e.message) + ").</p>";
+      return;
+    }
+    cvSubsByTeam.set(slug, subs);
+    if ($("#cv-team").value !== slug) return;  // the reader moved on meanwhile
+  }
   if (!subs.length) {
     box.innerHTML = '<p class="muted">No submissions yet.</p>';
     return;
   }
   box.innerHTML = '<div class="table-wrap"><table><thead><tr>'
-    + "<th>Time</th><th>Status</th><th>Score</th><th>Sections</th><th>Resources</th>"
+    + '<th scope="col">Time</th><th scope="col">Status</th><th scope="col">Score</th>'
+    + '<th scope="col">Sections</th><th scope="col">Resources</th>'
     + "</tr></thead><tbody>"
     + subs.map((s) => '<tr class="cv-row" data-id="' + s.id
-      + '" title="click to open"><td>' + new Date(s.ts).toLocaleString() + "</td>"
+      + '" title="click to open"><td><a class="cv-open" href="#clinical/submission/'
+      + s.id + '">' + new Date(s.ts).toLocaleString() + "</a></td>"
       + "<td>" + (s.pass ? '<span class="badge pass">VALID</span>'
                          : '<span class="badge fail">INVALID</span>') + "</td>"
       + "<td><strong>" + s.score + "</strong></td>"
       + "<td>" + s.sections + "</td><td>" + s.resources + "</td></tr>").join("")
-    + "</tbody></table></div>";
+    + "</tbody></table></div>"
+    + (subs.length >= CV_LIST_LIMIT
+        ? '<p class="muted">Showing the latest ' + CV_LIST_LIMIT + " submissions.</p>" : "");
 }
 
-$("#cv-team").addEventListener("change", renderCvList);
+$("#cv-team").addEventListener("change", () => {
+  /* On a company route the URL names the list on show; keep it truthful so a
+     reload or a shared link lands on the company just picked, not the old one. */
+  if (routeParts()[1] === "company") {
+    const slug = $("#cv-team").value;
+    history.replaceState(null, "", slug === SAMPLE_TEAM ? "#clinical"
+                                                        : "#clinical/company/" + slug);
+  }
+  renderCvList();
+});
 $("#cv-list").addEventListener("click", (ev) => {
-  if (ev.target.closest("a")) return;  // the scenario brief opens on its own
+  if (ev.target.closest("a")) return;  // links (document, scenario brief) navigate themselves
   const row = ev.target.closest("tr.cv-row");
   if (!row) return;
   go("clinical/" + (row.dataset.sample ? "sample/" + row.dataset.sample
@@ -2635,10 +3056,19 @@ async function showDoc(kind, id, scroll) {
   let data;
   try {
     const res = await fetch(path + encodeURIComponent(id));
-    if (!res.ok) { hideDoc(); return; }
+    if (!res.ok) {
+      showDocMessage(res.status === 404
+        ? "Document not found - the link may be stale, or the submission was removed."
+        : "Could not load the document (HTTP " + res.status + ").");
+      return;
+    }
     data = await res.json();
-  } catch (e) { return; }
+  } catch (e) {
+    showDocMessage("Could not load the document: " + e.message);
+    return;
+  }
   cvDocKey = key;
+  cvCurrent = data;  // routeTeam reads the document's company from here
   syncTeamPicker();
   renderClinicalDoc(data);
   if (scroll) $("#cv-doc").scrollIntoView({ behavior: "smooth" });
@@ -2648,6 +3078,14 @@ function hideDoc() {
   cvDocKey = null;
   cvCurrent = null;
   $("#cv-doc").style.display = "none";
+}
+
+/* A silent blank where a document should be reads as "still loading". */
+function showDocMessage(text) {
+  hideDoc();
+  const doc = $("#cv-doc");
+  doc.innerHTML = '<p class="muted">' + esc(text) + "</p>";
+  doc.style.display = "block";
 }
 
 function cvItemHtml(item) {
@@ -2661,6 +3099,7 @@ function cvItemHtml(item) {
     + (item.status ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
     + chips
     + (item.detail ? '<div class="cv-detail muted">' + esc(item.detail) + "</div>" : "")
+    + (item.note ? '<div class="cv-note muted">' + esc(item.note) + "</div>" : "")
     + "</li>";
 }
 
@@ -2696,7 +3135,6 @@ const countGap = (arr, g) => arr.filter((i) => hasGap(i, g)).length;
 const plural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"));
 const pctOf = (n, d) => (d ? Math.round((n / d) * 100) : 0);
 const shortDate = (dt) => String(dt || "").slice(0, 10);
-const names = (arr, n) => arr.slice(0, n).map((i) => esc(i.label || "unnamed")).join(", ");
 
 function cvChips(i) {
   let h = "";
@@ -2719,13 +3157,6 @@ function cvAge(birth, on) {
   const m = ref.getMonth() - b.getMonth();
   if (m < 0 || (m === 0 && ref.getDate() < b.getDate())) a--;
   return a >= 0 && a < 130 ? a : null;
-}
-
-function monthsSince(from, to) {
-  const a = new Date(shortDate(from));
-  const b = to ? new Date(shortDate(to)) : new Date();
-  if (isNaN(a.getTime()) || isNaN(b.getTime())) return null;
-  return Math.round((b - a) / (30.44 * 24 * 3600 * 1000));
 }
 
 function sectionFor(sections, kind) {
@@ -2769,6 +3200,7 @@ function viewTimeline(d) {
         + (i.status ? " &middot; " + esc(i.status) : "") + "</div>"
         + '<div class="tl-label">' + esc(i.label || "Unnamed item") + cvChips(i) + "</div>"
         + (i.detail ? '<div class="tl-detail">' + esc(i.detail) + "</div>" : "")
+        + (i.note ? '<div class="tl-detail tl-note">' + esc(i.note) + "</div>" : "")
         + "</div>";
     });
     h += "</div>";
@@ -3065,11 +3497,13 @@ function renderClinicalDoc(d) {
         ? ' &middot; <a href="/api/samples/' + esc(d.sample.id)
           + '/bundle" download>download the FHIR bundle</a>'
         : " &middot; submitted " + new Date(d.ts).toLocaleString()
+          + " &middot; " + (d.pass ? "valid" : "invalid") + ", score " + d.score
+          + (d.errors ? ", " + plural(d.errors, "error") : "")
           + ' &middot; <a href="/api/submissions/' + d.id
           + '/bundle" download>download the FHIR bundle</a>')
     + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
     + "</p>";
-  html += (CV_VIEWS[cvMode] || CV_VIEWS.document).fn(d);
+  html += (Object.hasOwn(CV_VIEWS, cvMode) ? CV_VIEWS[cvMode] : CV_VIEWS.document).fn(d);
   const doc = $("#cv-doc");
   doc.innerHTML = html;
   doc.style.display = "block";
@@ -3097,7 +3531,8 @@ $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"
 function partnerCard(p) {
   return '<div class="io-partner">'
     + "<strong>" + esc(p.team) + "</strong>"
-    + '<p class="muted" style="margin:6px 0 0">Document #' + p.exchange_id
+    + '<p class="muted" style="margin:6px 0 0"><code>GET /api/exchange/' + esc(p.team_slug)
+    + "</code> \u00b7 Document #" + p.exchange_id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
     + ' \u00b7 <a href="/api/submissions/' + p.exchange_id

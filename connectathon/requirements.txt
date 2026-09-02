@@ -5,7 +5,7 @@
 # venue builds the same thing. Tested on Python 3.12.
 #
 # Install:  python -m pip install -r requirements.txt
-# Dev/test extras (pytest, httpx for TestClient) live in requirements-dev.txt.
+# Dev/test extras (pytest, httpx2 for TestClient) live in requirements-dev.txt.
 
 fastapi==0.139.1
 uvicorn==0.51.0
