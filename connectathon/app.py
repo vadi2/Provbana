@@ -3876,8 +3876,26 @@ function interopCurls() {
 }
 $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
+function shotCountLabel(n) {
+  return n ? "Seen in " + n + " other system" + (n === 1 ? "" : "s")
+           : "No other system has shown this yet";
+}
+
+/* Only one number on one card changes when a screenshot lands or is withdrawn.
+   Rebuilding the whole list to show it would take the upload form, its
+   confirmation and the open gallery down with it. */
+async function refreshShotCount(slug) {
+  try {
+    const res = await fetch("/api/exchange");
+    if (!res.ok) return;
+    const p = (await res.json()).find((x) => x.team_slug === slug);
+    const btn = document.querySelector('.io-partner[data-slug="' + slug
+      + '"] [data-shots]');
+    if (p && btn) btn.textContent = shotCountLabel(p.renderings);
+  } catch (e) { /* the count is decoration; the gallery below it is the truth */ }
+}
+
 function partnerCard(p) {
-  const n = p.renderings;
   return '<div class="io-partner" data-slug="' + esc(p.team_slug) + '">'
     + "<strong>" + esc(p.team) + "</strong>"
     + '<p class="muted" style="margin:6px 0 0"><code>GET /api/exchange/' + esc(p.team_slug)
@@ -3888,8 +3906,7 @@ function partnerCard(p) {
     + '/bundle" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
     + '<button class="ghost" data-shots="' + p.exchange_id + '">'
-    + (n ? "Seen in " + n + " other system" + (n === 1 ? "" : "s")
-         : "No other system has shown this yet") + "</button>"
+    + shotCountLabel(p.renderings) + "</button>"
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */
@@ -4014,8 +4031,7 @@ async function uploadShot(slug) {
     shotStatus(form, "Published - thank you.");
     form.querySelector("input[type=file]").value = "";
     form.querySelector("textarea").value = "";
-    await whoAmI();
-    await initInterop();
+    await refreshShotCount(slug);
     const gallery = document.querySelector('[data-gallery="' + data.document + '"]');
     if (gallery) { gallery.hidden = false; loadGallery(data.document); }
   } catch (e) {
@@ -4090,6 +4106,7 @@ async function withdrawShot(id, confirmed) {
     return;
   }
   const docId = tile.closest(".shots").dataset.gallery;
+  const slug = tile.closest(".io-partner").dataset.slug;
   shotErr(tile, "");
   try {
     const res = await fetch("/api/renderings/" + id, {
@@ -4103,7 +4120,7 @@ async function withdrawShot(id, confirmed) {
   } catch (e) {
     return shotErr(tile, "Network error: " + e.message);
   }
-  await initInterop();
+  await refreshShotCount(slug);
   const gallery = document.querySelector('[data-gallery="' + docId + '"]');
   if (gallery) { gallery.hidden = false; loadGallery(docId); }
 }
