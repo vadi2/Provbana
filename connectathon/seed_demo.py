@@ -11,16 +11,21 @@ event instance.
 The team list below is chosen to cover the states the UI can be in: teams that
 pass, teams that only ever fail, teams that never submit, and a score tie that
 exercises the ranking tiebreak. Bundles come from ./examples and ./samples, so
-no patient data is invented here.
+no patient data is invented here, and the interop screenshots are drawn by this
+script rather than being real grabs of anyone's product.
 """
 
 import argparse
 import json
 import os
+import random
 import shutil
+import struct
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
+import zlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXAMPLES = os.path.join(HERE, "examples")
@@ -59,6 +64,67 @@ PLAN = [
     ("Helsinki HealthOS", []),
     ("Uppsala Vardsystem", []),
 ]
+
+# (who tested it, whose document, what they saw). Every producer here is a team
+# above whose first bundle passes, because only a published document can be
+# rendered. Karolinska's is deliberately shown by two systems, so the gallery
+# has one document with several screenshots side by side.
+RENDERINGS = [
+    ("Sahlgrenska Digital", "Karolinska Interop Lab",
+     "Imports clean. All four allergies are there, but criticality is blank on "
+     "every one of them - our list sorts by it, so they come out in file order."),
+    ("Rigshospitalet EHR", "Karolinska Interop Lab",
+     "Medication section renders, dose text does not: we only read "
+     "dosageInstruction.doseAndRate, and these carry the dose in the free text."),
+    ("Oulu Health Tech", "Sahlgrenska Digital",
+     "Full summary in one screen. The problem list dates show as 2026-01 because "
+     "we drop the day when onsetDateTime has no time zone."),
+    ("Karolinska Interop Lab", "Rigshospitalet EHR",
+     "Cross-border case opens as expected. Note the immunisation section is "
+     "empty rather than absent - worth deciding which one we all mean."),
+    ("Tromso Journal AS", "Oulu Health Tech",
+     "Nothing to report - this one came through complete."),
+    ("Reykjavik Care Systems", "Tromso Journal AS",
+     "Patient banner is blank: we key the header off name.family and this "
+     "document only has name.text."),
+]
+
+
+def mock_screenshot(seed):
+    """A PNG that reads as a screenshot of somebody's summary view at thumbnail
+    size. Drawing one beats committing binaries, and there is no font to depend
+    on - bars stand in for the text."""
+    w, h = 560, 360
+    rnd = random.Random(seed)
+    chrome = rnd.choice([(38, 78, 122), (26, 96, 84), (104, 52, 108), (140, 68, 40)])
+    canvas = bytearray(b"\xfa" * (w * h * 3))
+
+    def rect(x0, y0, x1, y1, rgb):
+        row = bytes(rgb) * (x1 - x0)
+        for y in range(y0, y1):
+            start = (y * w + x0) * 3
+            canvas[start:start + len(row)] = row
+
+    rect(0, 0, w, 34, chrome)                       # the application's own bar
+    rect(0, 34, 132, h, (238, 238, 240))            # section navigation
+    for i in range(7):
+        rect(12, 50 + i * 26, 12 + rnd.randint(60, 108), 60 + i * 26, (198, 200, 206))
+    y = 54
+    while y < h - 18:                               # the document itself
+        rect(150, y, 150 + rnd.randint(120, 380), y + 9, (206, 208, 212))
+        y += rnd.choice([18, 18, 22, 34])
+
+    scanlines = b"".join(b"\x00" + bytes(canvas[r * w * 3:(r + 1) * w * 3])
+                         for r in range(h))
+
+    def png_chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    return (b"\x89PNG\r\n\x1a\n"
+            + png_chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(scanlines, 9))
+            + png_chunk(b"IEND", b""))
 
 
 def lower(headers):
@@ -162,6 +228,23 @@ def main():
             print("  submit %-10s pass=%-5s score=%-4s sections=%-3s resources=%s"
                   % (key, headers.get("x-pass"), headers.get("x-score"),
                      headers.get("x-sections"), headers.get("x-resources")))
+
+    # Screenshots come last: a document has to be published before anyone can
+    # say what it looked like, and the slug is the service's to decide.
+    status, published, _ = call(base + "/api/exchange")
+    slugs = {p["team"]: p["team_slug"] for p in published} if status == 200 else {}
+    for consumer, producer, note in RENDERINGS:
+        token, slug = tokens.get(consumer), slugs.get(producer)
+        if not token or not slug:
+            print("screenshot %-26s SKIP (nothing published)" % producer)
+            continue
+        status, body, _ = call(
+            "%s/api/exchange/%s/renderings?note=%s"
+            % (base, slug, urllib.parse.quote(note)),
+            "POST", mock_screenshot(consumer + producer), token, "image/png")
+        detail = body.get("detail", status) if isinstance(body, dict) else status
+        print("screenshot %-26s %s"
+              % (producer, "by " + consumer if status == 201 else "FAILED (%s)" % detail))
 
     status, rows, _ = call(base + "/api/leaderboard")
     if status == 200:

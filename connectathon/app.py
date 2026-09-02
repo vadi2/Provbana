@@ -60,6 +60,11 @@ MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(5 * 1024 * 1024)))
 # ceiling than a bundle does.
 MAX_JSON_BODY_BYTES = 64 * 1024
 
+# An interop screenshot. The UI downscales before it uploads, so this is the
+# backstop for a client that does not - not the expected size.
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(2 * 1024 * 1024)))
+MAX_NOTE_CHARS = 2000
+
 VALID_BASE = 50        # points for a submission with zero error/fatal issues
 SECTION_POINTS = 10    # per populated top-level Composition section
 RESOURCE_POINTS = 2    # per clinical resource (not Composition/Patient)
@@ -102,6 +107,15 @@ def init_db() -> None:
                 token       TEXT NOT NULL UNIQUE,
                 first_pass  INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS renderings (
+                id            INTEGER PRIMARY KEY,
+                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
+                submission_id INTEGER NOT NULL REFERENCES submissions(id),
+                ts            TEXT NOT NULL,
+                note          TEXT NOT NULL DEFAULT '',
+                filename      TEXT NOT NULL,
+                mime          TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS submissions (
                 id        INTEGER PRIMARY KEY,
@@ -1324,6 +1338,13 @@ async def bundle_body(
     return await read_limited_body(request, MAX_BODY_BYTES, "Bundle")
 
 
+async def image_body(
+    request: Request, team: sqlite3.Row = Depends(current_team)
+) -> bytes:
+    """The uploaded screenshot, read only once the uploader is known."""
+    return await read_limited_body(request, MAX_IMAGE_BYTES, "Screenshot")
+
+
 @app.post("/api/register",
     tags=["Companies"],
     summary="Register a company and get its token",
@@ -1370,6 +1391,19 @@ def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
             "this token with your colleagues.",
         }
     )
+
+
+@app.get("/api/me",
+    tags=["Companies"],
+    summary="Which company this token belongs to",
+    description=(
+        "The UI needs this to know which screenshots are yours to edit or "
+        "withdraw. It returns no secrets - the token is the secret, and the "
+        "caller already has it."
+    ),
+)
+def whoami(team: sqlite3.Row = Depends(current_team)) -> dict:
+    return {"team": team["name"], "team_slug": team["slug"]}
 
 
 @app.post("/api/eps",
@@ -1807,6 +1841,10 @@ def exchange_list() -> list[dict]:
                     "ts": best["ts"],
                     "sections": best["sections"],
                     "resources": best["resources"],
+                    "renderings": conn.execute(
+                        "SELECT COUNT(*) FROM renderings WHERE submission_id = ?",
+                        (best["id"],),
+                    ).fetchone()[0],
                 }
             )
     return out
@@ -1835,6 +1873,264 @@ def exchange_fetch(team_slug: str) -> Response:
         "%s-eps.json" % producer["slug"],
         **{"X-Exchange-Id": str(best["id"]), "X-Producer": producer["slug"]},
     )
+
+
+# ------------------------------------------------------------ renderings
+
+# What another system made of a partner's document, as a picture. Interop
+# testing otherwise leaves nothing behind: the defect is described across a
+# table and by the evening nobody can point at what was actually seen. A
+# screenshot is evidence rather than a claim, which is the one thing the
+# self-reported "receipts" that used to live here could never be. Still
+# unscored, for the reason everything here is unscored - the moment a picture
+# is worth points you get fourteen pictures of the same screen.
+
+
+def sniff_image(raw: bytes) -> tuple[str, str] | None:
+    """(mime, extension) for these bytes, or None if they are not an image.
+
+    The declared Content-Type is deliberately not consulted. An upload is
+    whatever its bytes say it is, so a file that is really HTML can never be
+    stored here and then served back as a page from this origin.
+    """
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", "png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", "jpg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    return None
+
+
+# The producer is not stored on the rendering: it is whoever submitted the
+# document, so a team renaming cannot orphan the attribution.
+RENDERING_SELECT = """
+    SELECT r.id, r.consumer_id, r.submission_id, r.ts, r.note, r.filename,
+           r.mime, c.name AS consumer_name, c.slug AS consumer_slug,
+           p.name AS producer_name, p.slug AS producer_slug
+    FROM renderings r
+    JOIN teams c       ON c.id = r.consumer_id
+    JOIN submissions s ON s.id = r.submission_id
+    JOIN teams p       ON p.id = s.team_id
+"""
+
+
+def rendering_dict(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "document": row["submission_id"],
+        "producer": row["producer_name"],
+        "producer_slug": row["producer_slug"],
+        "consumer": row["consumer_name"],
+        "consumer_slug": row["consumer_slug"],
+        "ts": row["ts"],
+        "note": row["note"],
+        "image": "/api/renderings/%d/image" % row["id"],
+    }
+
+
+def fetch_rendering(conn: sqlite3.Connection, rendering_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        RENDERING_SELECT + " WHERE r.id = ?", (rendering_id,)
+    ).fetchone()
+
+
+def read_rendering_bytes(consumer_slug: str, filename: str) -> bytes | None:
+    path = os.path.join(DATA_DIR, "renderings", consumer_slug, filename)
+    try:
+        with open(path, "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def owned_rendering(
+    conn: sqlite3.Connection, rendering_id: int, team: sqlite3.Row
+) -> sqlite3.Row:
+    """The rendering, if this team is the one that uploaded it."""
+    row = fetch_rendering(conn, rendering_id)
+    if row is None:
+        raise HTTPException(404, detail="Unknown rendering")
+    if row["consumer_id"] != team["id"]:
+        raise HTTPException(403, detail="That screenshot belongs to another company")
+    return row
+
+
+@app.post("/api/exchange/{team_slug}/renderings",
+    tags=["Interop"],
+    status_code=201,
+    summary="Publish a screenshot of a partner's document in your system",
+    description=(
+        "Load a partner's exchange document into your own system, screenshot "
+        "what it looks like, and POST the image bytes here. The body is the "
+        "raw image - PNG, JPEG or WebP - not a multipart form. Use `note` to "
+        "say what the picture shows. Nothing about this is scored. 400 if the "
+        "body is not one of those three formats or the document is your own, "
+        "413 over MAX_IMAGE_BYTES."
+    ),
+)
+def add_rendering(
+    team_slug: str,
+    note: str = "",
+    image: bytes = Depends(image_body),
+    consumer: sqlite3.Row = Depends(current_team),
+) -> JSONResponse:
+    kind = sniff_image(image)
+    if kind is None:
+        raise HTTPException(400, detail="Body must be a PNG, JPEG or WebP image")
+    mime, ext = kind
+    with connect() as conn:
+        producer = conn.execute(
+            "SELECT id, name, slug FROM teams WHERE slug = ?", (team_slug,)
+        ).fetchone()
+        if producer is None:
+            raise HTTPException(404, detail="Unknown team")
+        if producer["id"] == consumer["id"]:
+            raise HTTPException(
+                400,
+                detail="That is your own document - a rendering is what "
+                "another system made of it",
+            )
+        # Pinned to the submission, not the slug: a team's exchange document
+        # changes the moment it beats its own score, and a screenshot has to
+        # stay attached to the bytes somebody actually opened.
+        best = best_valid_submission(conn, producer["id"])
+        if best is None:
+            raise HTTPException(404, detail="Team has no valid submission yet")
+
+    now = datetime.now(timezone.utc)
+    dest_dir = os.path.join(DATA_DIR, "renderings", consumer["slug"])
+    os.makedirs(dest_dir, exist_ok=True)
+    filename = "%s_%s.%s" % (
+        now.strftime("%Y%m%dT%H%M%S_%fZ"), secrets.token_hex(3), ext
+    )
+    with open(os.path.join(dest_dir, filename), "xb") as fh:
+        fh.write(image)
+
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO renderings (consumer_id, submission_id, ts, note, "
+            "filename, mime) VALUES (?, ?, ?, ?, ?, ?)",
+            (consumer["id"], best["id"], now.isoformat(),
+             note.strip()[:MAX_NOTE_CHARS], filename, mime),
+        )
+        row = fetch_rendering(conn, cur.lastrowid)
+    return JSONResponse(rendering_dict(row), status_code=201)
+
+
+@app.get("/api/renderings",
+    tags=["Interop"],
+    summary="Screenshots of documents in other systems",
+    description=(
+        "Newest first. Filter by `document` (a submission id), by `producer` "
+        "or by `consumer` (company slugs). Unfiltered it is every screenshot "
+        "the event has collected."
+    ),
+)
+def list_renderings(
+    document: int | None = None,
+    producer: str | None = None,
+    consumer: str | None = None,
+) -> list[dict]:
+    where, params = [], []
+    if document is not None:
+        where.append("r.submission_id = ?")
+        params.append(document)
+    if producer:
+        where.append("p.slug = ?")
+        params.append(producer)
+    if consumer:
+        where.append("c.slug = ?")
+        params.append(consumer)
+    sql = RENDERING_SELECT
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY r.ts DESC, r.id DESC"
+    with connect() as conn:
+        return [rendering_dict(row) for row in conn.execute(sql, params)]
+
+
+@app.get("/api/renderings/{rendering_id}/image",
+    tags=["Interop"],
+    summary="The screenshot itself",
+    description="The image bytes, served as the type its own bytes proved.",
+)
+def rendering_image(rendering_id: int) -> Response:
+    with connect() as conn:
+        row = fetch_rendering(conn, rendering_id)
+    if row is None:
+        raise HTTPException(404, detail="Unknown rendering")
+    raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
+    if raw is None:
+        raise HTTPException(404, detail="Rendering image file missing")
+    return Response(
+        content=raw,
+        media_type=row["mime"],
+        headers={
+            # This is a participant's upload served from the same origin as
+            # everyone's token. It is pinned to the type its bytes proved and
+            # given a policy that keeps it inert whatever a browser decides it
+            # is looking at.
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "Content-Disposition": "inline",
+            # Already compressed. GZipMiddleware goes by size alone, so saying
+            # the encoding out loud is what stops it spending CPU for nothing.
+            "Content-Encoding": "identity",
+            # The bytes behind an id never change, only ever disappear.
+            "Cache-Control": "public, max-age=31536000, immutable",
+        },
+    )
+
+
+@app.patch("/api/renderings/{rendering_id}",
+    tags=["Interop"],
+    summary="Rewrite the note on a screenshot you uploaded",
+    description=(
+        "The note is where the uploader says what to look at - which section "
+        "came through wrong, what the picture is meant to show. It can be "
+        "rewritten as often as you like; only the company that uploaded the "
+        "screenshot may do it."
+    ),
+)
+def update_rendering(
+    rendering_id: int,
+    payload: dict = Depends(small_json_body),
+    team: sqlite3.Row = Depends(current_team),
+) -> dict:
+    if "note" not in payload:
+        raise HTTPException(400, detail="Body must carry a \"note\"")
+    note = payload["note"]
+    if not isinstance(note, str):
+        raise HTTPException(400, detail="\"note\" must be a string")
+    with connect() as conn:
+        owned_rendering(conn, rendering_id, team)
+        conn.execute(
+            "UPDATE renderings SET note = ? WHERE id = ?",
+            (note.strip()[:MAX_NOTE_CHARS], rendering_id),
+        )
+        return rendering_dict(fetch_rendering(conn, rendering_id))
+
+
+@app.delete("/api/renderings/{rendering_id}",
+    tags=["Interop"],
+    summary="Withdraw a screenshot you uploaded",
+    description="Only the company that uploaded it can remove it; 403 otherwise.",
+)
+def delete_rendering(
+    rendering_id: int, team: sqlite3.Row = Depends(current_team)
+) -> dict:
+    with connect() as conn:
+        row = owned_rendering(conn, rendering_id, team)
+        conn.execute("DELETE FROM renderings WHERE id = ?", (rendering_id,))
+    # A withdrawn screenshot that is still on disk has not been withdrawn.
+    try:
+        os.remove(
+            os.path.join(DATA_DIR, "renderings", row["consumer_slug"], row["filename"])
+        )
+    except OSError:
+        pass
+    return {"deleted": rendering_id}
 
 
 @app.get("/api/health",
@@ -1878,6 +2174,8 @@ def health() -> dict:
         "missing_igs": missing,
         # The UI reads these so it can warn before a doomed request.
         "max_body_bytes": MAX_BODY_BYTES,
+        "max_image_bytes": MAX_IMAGE_BYTES,
+        "max_note_chars": MAX_NOTE_CHARS,
         "register_code_required": bool(REGISTER_CODE),
     }
 
@@ -2271,6 +2569,30 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   font-family: var(--font-mono); }
 .io-partner { border: 1px solid var(--border); border-radius: var(--r-card);
   padding: 14px 16px; margin-top: 12px; }
+.io-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-top: 10px; }
+/* the upload form, folded away until a company says it has tested something */
+.shot-form { margin-top: 12px; padding: 12px 14px; border: 1px dashed var(--border);
+  border-radius: var(--r-card); background: var(--accent-soft); }
+.shot-form textarea { min-height: 64px; font-family: inherit; font-size: 0.86rem; }
+.shot-form label { margin-top: 0; }
+.shot-status { font-size: 0.82rem; margin: 8px 0 0; }
+.shot-status.err { color: var(--fail); }
+/* the gallery: one document, every system that rendered it, side by side */
+.shots { display: grid; gap: 14px; margin-top: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+.shot { border: 1px solid var(--border); border-radius: var(--r-card);
+  overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
+.shot img { display: block; width: 100%; height: 168px; object-fit: cover;
+  object-position: top; background: var(--code-bg); }
+.shot-meta { padding: 9px 11px; display: flex; flex-direction: column; gap: 5px; }
+.shot-who { font-weight: 600; font-size: 0.88rem; }
+.shot-note { font-size: 0.84rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.shot-note.empty { color: var(--muted); font-style: italic; }
+.shot-own { display: flex; gap: 6px; margin-top: 2px; }
+.shot-edit textarea { width: 100%; min-height: 62px; font-family: inherit;
+  font-size: 0.84rem; }
+.shot-err { font-size: 0.82rem; color: var(--fail); }
 </style>
 </head>
 <body>
@@ -2432,9 +2754,13 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   valid patient summary; interoperability testing proves another system can
   consume it. Every company's best valid submission is published below as its
   exchange document - load one into your own system and see what breaks.</p>
-  <p class="muted" style="margin:0">Nothing here is scored or tracked. Take a
+  <p class="muted" style="margin:0 0 8px">Nothing here is scored or tracked. Take a
   partner's document, test it, and tell them what you found: the useful output
   of this track is a defect the producer can go and fix.</p>
+  <p class="muted" style="margin:0">When you have loaded one, add a screenshot of
+  how it came out in your system, with a note saying what to look at. Everyone at
+  the event can see them, and one summary shown side by side in a dozen products
+  is the one thing this room can produce that nowhere else can.</p>
 </section>
 
 <section class="card">
@@ -2749,6 +3075,7 @@ syncToken(savedToken);
 /* The health endpoint says up front what a doomed request would only reveal
    after a round trip: the validator is down, or up but missing a package. */
 let maxBundleBytes = 5 * 1024 * 1024;
+let maxNote = 2000;
 async function checkValidator() {
   const note = $("#validator-note");
   try {
@@ -2756,6 +3083,7 @@ async function checkValidator() {
     if (!res.ok) throw new Error("HTTP " + res.status);
     const h = await res.json();
     if (h.max_body_bytes) maxBundleBytes = h.max_body_bytes;
+    if (h.max_note_chars) maxNote = h.max_note_chars;
     if (h.register_code_required) $("#reg-code-row").hidden = false;
     note.textContent = h.matchbox === "up" ? ""
       : h.matchbox === "degraded"
@@ -3537,25 +3865,283 @@ function interopCurls() {
   $("#curl-exchange").textContent =
     "curl -s " + origin + "/api/exchange/PARTNER_SLUG -o partner-eps.json\n" +
     "# list every published document first:\n" +
-    "curl -s " + origin + "/api/exchange";
+    "curl -s " + origin + "/api/exchange\n\n" +
+    "# publish a screenshot of how it came out in your system:\n" +
+    "curl -X POST '" + origin + "/api/exchange/PARTNER_SLUG/renderings"
+      + "?note=Allergies+came+through+empty' \\\n" +
+    "     -H 'X-Team-Token: TOKEN' -H 'Content-Type: image/png' \\\n" +
+    "     --data-binary @screenshot.png\n" +
+    "# every screenshot of one document:\n" +
+    "curl -s '" + origin + "/api/renderings?document=ID'";
 }
 $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
 function partnerCard(p) {
-  return '<div class="io-partner">'
+  const n = p.renderings;
+  return '<div class="io-partner" data-slug="' + esc(p.team_slug) + '">'
     + "<strong>" + esc(p.team) + "</strong>"
     + '<p class="muted" style="margin:6px 0 0"><code>GET /api/exchange/' + esc(p.team_slug)
     + "</code> \u00b7 Document #" + p.exchange_id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
     + ' \u00b7 <a href="/api/submissions/' + p.exchange_id
-    + '/bundle" download>download the FHIR bundle</a></p></div>';
+    + '/bundle" download>download the FHIR bundle</a></p>'
+    + '<div class="io-actions">'
+    + '<button class="ghost" data-shots="' + p.exchange_id + '">'
+    + (n ? "Seen in " + n + " other system" + (n === 1 ? "" : "s")
+         : "No other system has shown this yet") + "</button>"
+    /* Your own document is the one card you cannot add to - a rendering is by
+       definition somebody else reading it. Saying so here beats letting
+       someone crop a screenshot first and refusing it afterwards. */
+    + (me && me.team_slug === p.team_slug
+        ? '<span class="muted">Your document - other companies add the screenshots.</span>'
+        : '<button class="ghost" data-add="' + esc(p.team_slug) + '">'
+          + "I loaded this - add a screenshot</button>")
+    + "</div>"
+    + (me && me.team_slug === p.team_slug ? "" :
+      '<div class="shot-form" hidden data-form="' + esc(p.team_slug) + '">'
+    + '<label for="shot-file-' + esc(p.team_slug) + '">Screenshot (PNG, JPEG or WebP)</label>'
+    + '<input type="file" accept="image/png,image/jpeg,image/webp" id="shot-file-'
+    + esc(p.team_slug) + '">'
+    + '<label for="shot-note-' + esc(p.team_slug) + '">What should someone look at?</label>'
+    + '<textarea id="shot-note-' + esc(p.team_slug) + '" maxlength="' + maxNote
+    + '" placeholder="'
+    + "e.g. Allergies came through, but the penicillin severity is missing and "
+    + 'the medication list dropped every dose."></textarea>'
+    + '<div class="io-actions"><button data-upload="' + esc(p.team_slug)
+    + '">Upload</button>'
+    + '<span class="muted">Needs your company token, and it is not scored.</span>'
+    + '</div><p class="shot-status" hidden></p></div>')
+    + '<div class="shots" hidden data-gallery="' + p.exchange_id + '"></div></div>';
 }
+
+/* Screenshots are full-screen grabs: 2-3 MB of PNG each, and a gallery of
+   them on venue wifi is the difference between this working and not. The
+   browser can do the resizing, so nothing has to be installed on the server
+   to make an upload a tenth of the size. */
+async function shrinkImage(file) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const cv = document.createElement("canvas");
+    cv.width = Math.round(bmp.width * scale);
+    cv.height = Math.round(bmp.height * scale);
+    cv.getContext("2d").drawImage(bmp, 0, 0, cv.width, cv.height);
+    const blob = await new Promise((r) => cv.toBlob(r, "image/webp", 0.85));
+    /* An already-small screenshot can come out bigger re-encoded; keep whichever
+       is smaller, and keep the original if the browser gave us nothing. */
+    return blob && blob.size < file.size ? blob : file;
+  } catch (e) {
+    return file;
+  }
+}
+
+/* Which company the saved token belongs to, so the gallery can offer Edit and
+   Withdraw on your own screenshots and nobody else's. Null when no token is
+   saved, which is every clinician reading the wall. */
+let me = null;
+async function whoAmI() {
+  const token = $("#token").value.trim();
+  if (!token) { me = null; return; }
+  try {
+    const res = await fetch("/api/me", { headers: { "X-Team-Token": token } });
+    me = res.ok ? await res.json() : null;
+  } catch (e) { me = null; }
+}
+
+function shotTile(s) {
+  const mine = me && me.team_slug === s.consumer_slug;
+  return '<figure class="shot" data-shot="' + s.id + '">'
+    + '<a href="' + s.image + '" target="_blank" rel="noopener">'
+    + '<img loading="lazy" src="' + s.image + '" alt="'
+    + esc(s.producer) + "'s document as shown by " + esc(s.consumer) + '"></a>'
+    + '<figcaption class="shot-meta">'
+    + '<span class="shot-who">' + esc(s.consumer) + "</span>"
+    + '<span class="muted">' + fmtWhen(s.ts) + "</span>"
+    + '<span class="shot-note' + (s.note ? '">' + esc(s.note)
+        : ' empty">No note - ask them what it shows.') + "</span>"
+    + (mine ? '<span class="shot-own">'
+        + '<button class="ghost" data-edit="' + s.id + '">Edit note</button>'
+        + '<button class="ghost" data-del="' + s.id + '">Withdraw</button></span>' : "")
+    + "</figcaption></figure>";
+}
+
+async function loadGallery(docId) {
+  const box = document.querySelector('[data-gallery="' + docId + '"]');
+  if (!box) return;
+  try {
+    const res = await fetch("/api/renderings?document=" + docId);
+    const shots = res.ok ? await res.json() : [];
+    box.innerHTML = shots.length
+      ? shots.map(shotTile).join("")
+      : '<p class="muted">Nobody has published a screenshot of this document yet.</p>';
+  } catch (e) {
+    box.innerHTML = '<p class="muted">Could not load the screenshots.</p>';
+  }
+}
+
+function shotStatus(form, text, isError) {
+  const p = form.querySelector(".shot-status");
+  p.textContent = text;
+  p.classList.toggle("err", !!isError);
+  p.hidden = !text;
+}
+
+async function uploadShot(slug) {
+  const form = document.querySelector('[data-form="' + slug + '"]');
+  const file = form.querySelector("input[type=file]").files[0];
+  const note = form.querySelector("textarea").value.trim();
+  const token = $("#token").value.trim();
+  if (!token) return shotStatus(form, "Paste your company token on the Submit tab first.", true);
+  if (!file) return shotStatus(form, "Choose a screenshot first.", true);
+  const btn = form.querySelector("[data-upload]");
+  btn.disabled = true;
+  shotStatus(form, "Uploading...");
+  try {
+    const blob = await shrinkImage(file);
+    const res = await fetch("/api/exchange/" + encodeURIComponent(slug)
+      + "/renderings?note=" + encodeURIComponent(note), {
+      method: "POST",
+      headers: { "X-Team-Token": token,
+                 "Content-Type": blob.type || "application/octet-stream" },
+      body: blob,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      shotStatus(form, detailText(data) || ("Upload failed (" + res.status + ")"), true);
+      return;
+    }
+    shotStatus(form, "Published - thank you.");
+    form.querySelector("input[type=file]").value = "";
+    form.querySelector("textarea").value = "";
+    await whoAmI();
+    await initInterop();
+    const gallery = document.querySelector('[data-gallery="' + data.document + '"]');
+    if (gallery) { gallery.hidden = false; loadGallery(data.document); }
+  } catch (e) {
+    shotStatus(form, "Network error: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function shotErr(tile, text) {
+  let p = tile.querySelector(".shot-err");
+  if (!p) {
+    p = document.createElement("span");
+    p.className = "shot-err";
+    tile.querySelector(".shot-meta").appendChild(p);
+  }
+  p.textContent = text;
+}
+
+/* The note is edited where it is shown. A browser modal would be shorter code
+   and the wrong control: a note runs to a couple of sentences about what is
+   wrong in the screenshot beside it, and nothing else here opens a dialog. */
+function editShotNote(id) {
+  const tile = document.querySelector('[data-shot="' + id + '"]');
+  if (tile.querySelector(".shot-edit")) return;
+  const note = tile.querySelector(".shot-note");
+  note.hidden = true;
+  tile.querySelector(".shot-own").hidden = true;
+  const box = document.createElement("div");
+  box.className = "shot-edit";
+  box.innerHTML = '<textarea rows="3" maxlength="' + maxNote
+    + '" placeholder="What should someone look at here?"></textarea>'
+    + '<span class="shot-own">'
+    + '<button class="ghost" data-save="' + id + '">Save note</button>'
+    + '<button class="ghost" data-cancel="' + id + '">Cancel</button></span>';
+  box.querySelector("textarea").value =
+    note.classList.contains("empty") ? "" : note.textContent;
+  tile.querySelector(".shot-meta").appendChild(box);
+  box.querySelector("textarea").focus();
+}
+
+async function saveShotNote(id) {
+  const tile = document.querySelector('[data-shot="' + id + '"]');
+  const next = tile.querySelector(".shot-edit textarea").value;
+  shotErr(tile, "");
+  try {
+    const res = await fetch("/api/renderings/" + id, {
+      method: "PATCH",
+      headers: { "X-Team-Token": $("#token").value.trim(),
+                 "Content-Type": "application/json" },
+      body: JSON.stringify({ note: next }),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return shotErr(tile, detailText(data) || ("Could not save (" + res.status + ")"));
+    }
+  } catch (e) {
+    return shotErr(tile, "Network error: " + e.message);
+  }
+  loadGallery(tile.closest(".shots").dataset.gallery);
+}
+
+/* Withdrawing is the one destructive control here, so the button asks once
+   before it does it - the same button, relabelled, rather than a modal. */
+async function withdrawShot(id, confirmed) {
+  const tile = document.querySelector('[data-shot="' + id + '"]');
+  if (!confirmed) {
+    const btn = tile.querySelector("[data-del]");
+    btn.textContent = "Withdraw - tap to confirm";
+    btn.dataset.delok = id;
+    delete btn.dataset.del;
+    return;
+  }
+  const docId = tile.closest(".shots").dataset.gallery;
+  shotErr(tile, "");
+  try {
+    const res = await fetch("/api/renderings/" + id, {
+      method: "DELETE",
+      headers: { "X-Team-Token": $("#token").value.trim() },
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return shotErr(tile, detailText(data) || ("Could not withdraw (" + res.status + ")"));
+    }
+  } catch (e) {
+    return shotErr(tile, "Network error: " + e.message);
+  }
+  await initInterop();
+  const gallery = document.querySelector('[data-gallery="' + docId + '"]');
+  if (gallery) { gallery.hidden = false; loadGallery(docId); }
+}
+
+/* One listener on the container: the partner cards are rebuilt from scratch
+   on every refresh, so per-button listeners would not survive them. */
+$("#io-partners").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  if (btn.dataset.shots) {
+    const box = document.querySelector('[data-gallery="' + btn.dataset.shots + '"]');
+    box.hidden = !box.hidden;
+    if (!box.hidden) loadGallery(btn.dataset.shots);
+  } else if (btn.dataset.add) {
+    const form = document.querySelector('[data-form="' + btn.dataset.add + '"]');
+    form.hidden = !form.hidden;
+    if (!form.hidden) form.querySelector("input[type=file]").focus();
+  } else if (btn.dataset.upload) {
+    uploadShot(btn.dataset.upload);
+  } else if (btn.dataset.edit) {
+    editShotNote(btn.dataset.edit);
+  } else if (btn.dataset.save) {
+    saveShotNote(btn.dataset.save);
+  } else if (btn.dataset.cancel) {
+    loadGallery(document.querySelector('[data-shot="' + btn.dataset.cancel + '"]')
+      .closest(".shots").dataset.gallery);
+  } else if (btn.dataset.del) {
+    withdrawShot(btn.dataset.del, false);
+  } else if (btn.dataset.delok) {
+    withdrawShot(btn.dataset.delok, true);
+  }
+});
 
 async function initInterop() {
   interopCurls();
   const hint = $("#io-hint");
   const box = $("#io-partners");
+  await whoAmI();
   try {
     const res = await fetch("/api/exchange");
     if (!res.ok) return;
@@ -3651,6 +4237,28 @@ OPENAPI_BODIES = {
             "application/json": {"schema": {"type": "object"}},
         },
     },
+    ("/api/exchange/{team_slug}/renderings", "post"): {
+        "required": True,
+        "description": "The raw image bytes - not a multipart form.",
+        "content": {
+            fmt: {"schema": {"type": "string", "format": "binary"}}
+            for fmt in ("image/png", "image/jpeg", "image/webp")
+        },
+    },
+    ("/api/renderings/{rendering_id}", "patch"): {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["note"],
+                    "properties": {"note": {"type": "string",
+                                            "maxLength": MAX_NOTE_CHARS}},
+                },
+                "example": {"note": "Allergies section came through empty."},
+            }
+        },
+    },
 }
 
 # Score and verdict ride on headers so a client can act on them without parsing
@@ -3664,7 +4272,13 @@ SUBMIT_RESPONSE_HEADERS = {
 }
 
 # Endpoints that read X-Team-Token. Anything else is open.
-TOKEN_REQUIRED = {("/api/eps", "post")}
+TOKEN_REQUIRED = {
+    ("/api/me", "get"),
+    ("/api/eps", "post"),
+    ("/api/exchange/{team_slug}/renderings", "post"),
+    ("/api/renderings/{rendering_id}", "patch"),
+    ("/api/renderings/{rendering_id}", "delete"),
+}
 
 
 def custom_openapi() -> dict:

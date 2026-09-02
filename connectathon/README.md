@@ -40,11 +40,14 @@ Do not use `uvicorn app:app` - it defaults to localhost only and ignores `PORT`.
 Environment: `PORT` (8095), `DATA_DIR` (`/data`), `MATCHBOX_URL`
 (`http://matchbox:8080/matchboxv3/fhir`), `PROFILE`
 (`http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps`), `SAMPLES_DIR`
-(`samples/` next to `app.py`), `MAX_BODY_BYTES` (5 MB), `MATCHBOX_TIMEOUT` (60 s -
-how long a submitting client waits on a wedged validator), `REGISTER_CODE` (unset =
-registration is open; set it to require `{"code": "..."}` on `/api/register`).
+(`samples/` next to `app.py`), `MAX_BODY_BYTES` (5 MB), `MAX_IMAGE_BYTES` (2 MB - the
+backstop for an interop screenshot; the UI downscales before it uploads, so this is
+not the expected size), `MATCHBOX_TIMEOUT` (60 s - how long a submitting client waits
+on a wedged validator), `REGISTER_CODE` (unset = registration is open; set it to
+require `{"code": "..."}` on `/api/register`).
 `DATA_DIR` must be writable by the user running the service; it holds
-`connectathon.db` and the raw submission audit log.
+`connectathon.db`, the raw submission audit log and `renderings/` (the uploaded
+screenshots, one directory per uploading company).
 
 `VALIDATION_IGS` (default `hl7se.fhir.base#1.1.0`, comma-separated) names extra
 packages to load into the validation engine. Matchbox scopes an engine to the IG
@@ -56,8 +59,10 @@ nothing to load.
 Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest -q test_app.py`
 
 Demo data for a local preview: `.venv/bin/python seed_demo.py` (with the service and
-Matchbox running) registers a handful of fake companies and submits the bundles in
-`examples/` and `samples/`, so every UI state has something to show. `--reset` deletes
+Matchbox running) registers a handful of fake companies, submits the bundles in
+`examples/` and `samples/`, and publishes a few interop screenshots against them, so
+every UI state has something to show. The screenshots are drawn by the script - no real
+product is pictured. `--reset` deletes
 the data directory first - stop the service before, restart it after. Never point it at
 the event instance.
 
@@ -141,15 +146,47 @@ curl localhost:8095/api/submissions/12/bundle -o submitted.json
 ### Exchange / interop
 
 Every team's best passing submission is published as the shared test corpus. Load a
-partner's document into your own system and see what breaks. Nothing here needs a token
-and nothing is scored or recorded - the output of the track is a defect the producer can
-go and fix, reported to them directly.
+partner's document into your own system and see what breaks. Downloading needs no token
+and nothing here is scored - the output of the track is a defect the producer can go and
+fix, reported to them directly.
 
 ```
 # who has published something
 curl localhost:8095/api/exchange
 # download a partner's document (X-Exchange-Id = submission id, X-Producer = slug)
 curl localhost:8095/api/exchange/TEAM_SLUG -o partner-eps.json
+```
+
+Then show what it looked like. A **rendering** is a screenshot of a partner's document
+as it came out in your system, and it is the only evidence anyone else - another
+implementer, a clinician walking the room - can read without installing your product.
+
+```
+# publish a screenshot of a partner's document (raw image body, not multipart)
+curl -X POST 'localhost:8095/api/exchange/TEAM_SLUG/renderings?note=Allergies+came+through+empty' \
+     -H 'X-Team-Token: TOKEN' -H 'Content-Type: image/png' --data-binary @shot.png
+# every screenshot, or just one document's / one company's
+curl 'localhost:8095/api/renderings?document=12'
+curl 'localhost:8095/api/renderings?producer=TEAM_SLUG&consumer=MY_SLUG'
+curl localhost:8095/api/renderings/3/image -o shot.png
+# your own uploads only: correct the note, or withdraw the screenshot entirely
+curl -X PATCH localhost:8095/api/renderings/3 -H 'X-Team-Token: TOKEN' \
+     -H 'Content-Type: application/json' -d '{"note":"Allergies empty, dosage fine"}'
+curl -X DELETE localhost:8095/api/renderings/3 -H 'X-Team-Token: TOKEN'
+```
+
+PNG, JPEG and WebP only, decided by the bytes and not by `Content-Type` - so a file that
+is really HTML can never be stored and then served back as a page from this origin.
+**400** for anything else and for a screenshot of your own document, **404** if the
+company is unknown or has published nothing yet, **413** over `MAX_IMAGE_BYTES`, **403**
+on editing or deleting somebody else's upload. The optional `note` (query parameter on
+upload, JSON body on `PATCH`) is trimmed to 2000 characters. A rendering pins to the
+submission id, not the company: when a producer beats its own score the exchange
+document moves on and the old screenshots stay with the bytes they were taken from.
+
+```
+# which company a token belongs to
+curl localhost:8095/api/me -H 'X-Team-Token: TOKEN'
 ```
 
 ### Leaderboard
@@ -176,7 +213,8 @@ curl localhost:8095/api/samples/andrea-cross-border/bundle -o example-eps.json
 
 ```
 curl localhost:8095/api/health
-# {"status":"ok","matchbox":"up","missing_igs":[],"max_body_bytes":5242880,"register_code_required":false}
+# {"status":"ok","matchbox":"up","missing_igs":[],"max_body_bytes":5242880,
+#  "max_image_bytes":2097152,"max_note_chars":2000,"register_code_required":false}
 ```
 
 `matchbox` is `up`, `degraded` (reachable, but a package named in `VALIDATION_IGS` is

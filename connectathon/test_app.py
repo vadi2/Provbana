@@ -13,8 +13,11 @@ import io
 import http.client
 import json
 import os
+import struct
 import urllib.error
+import urllib.parse
 import urllib.request
+import zlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1390,6 +1393,8 @@ def test_health_reports_matchbox_up_and_down(client, monkeypatch):
     assert body["missing_igs"] == []
     # the UI reads these to warn before a doomed request
     assert body["max_body_bytes"] == 5 * 1024 * 1024
+    assert body["max_image_bytes"] == 2 * 1024 * 1024
+    assert body["max_note_chars"] == app_module.MAX_NOTE_CHARS
     assert body["register_code_required"] is False
     fake_urlopen(monkeypatch, FakeResponse(b"{}", status=503))
     assert client.get("/api/health").json()["matchbox"] == "down"
@@ -1910,3 +1915,247 @@ def test_index_reads_health_and_links_rows(client):
     assert 'if (routeParts()[1] === "company") {' in text  # the picker keeps the URL honest
     assert "Company token" in text
     assert "team token" not in text.lower()
+
+
+# ---------------------------------------------------------------- renderings
+
+def png_bytes(w=8, h=8, rgb=(200, 60, 60)):
+    """A real PNG, so the sniffer is tested against the format and not a stub."""
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+
+    def chunk(tag, data):
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    return (b"\x89PNG\r\n\x1a\x0a"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw))
+            + chunk(b"IEND", b""))
+
+
+JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+WEBP = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 64
+
+
+def add_shot(client, token, slug, image=None, note=None):
+    url = "/api/exchange/%s/renderings" % slug
+    if note is not None:
+        url += "?note=" + urllib.parse.quote(note)
+    return client.post(url, content=png_bytes() if image is None else image,
+                       headers={"X-Team-Token": token, "Content-Type": "image/png"})
+
+
+def test_a_rendering_records_who_saw_whose_document(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = add_shot(client, tok_c, "producer", note="  Allergies came through empty.  ")
+    assert res.status_code == 201
+    shot = res.json()
+    assert shot["producer"] == "Producer" and shot["producer_slug"] == "producer"
+    assert shot["consumer"] == "Consumer" and shot["consumer_slug"] == "consumer"
+    assert shot["note"] == "Allergies came through empty."   # stripped
+    assert shot["image"] == "/api/renderings/%d/image" % shot["id"]
+    # the document is the producer's published submission, not just its slug
+    assert shot["document"] == client.get("/api/exchange").json()[0]["exchange_id"]
+    # and the bytes are on disk under the uploader
+    saved = os.listdir(os.path.join(client.data_dir, "renderings", "consumer"))
+    assert len(saved) == 1 and saved[0].endswith(".png")
+
+
+def test_every_accepted_format_is_sniffed_not_declared(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    for image, ext in ((png_bytes(), ".png"), (JPEG, ".jpg"), (WEBP, ".webp")):
+        res = add_shot(client, tok_c, "producer", image=image)
+        assert res.status_code == 201, res.text
+    saved = os.listdir(os.path.join(client.data_dir, "renderings", "consumer"))
+    assert sorted(os.path.splitext(f)[1] for f in saved) == [".jpg", ".png", ".webp"]
+
+
+def test_a_file_that_is_not_an_image_is_refused(client, monkeypatch):
+    """The declared Content-Type is not evidence: HTML must never land here and
+    be served back as a page from the same origin as everyone's token."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = client.post("/api/exchange/producer/renderings",
+                      content=b"<html><script>alert(1)</script></html>",
+                      headers={"X-Team-Token": tok_c, "Content-Type": "image/png"})
+    assert res.status_code == 400
+    assert "PNG, JPEG or WebP" in res.json()["detail"]
+    assert not os.path.exists(os.path.join(client.data_dir, "renderings"))
+
+
+def test_you_cannot_render_your_own_document(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = add_shot(client, tok_p, "producer")
+    assert res.status_code == 400
+    assert "your own document" in res.json()["detail"]
+
+
+def test_rendering_a_document_that_does_not_exist(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    assert add_shot(client, tok_c, "ghost").status_code == 404
+    # registered, but has published nothing to render
+    tok_x = register(client, "Silent")
+    assert add_shot(client, tok_x, "consumer").status_code == 404
+
+
+def test_uploading_a_rendering_needs_a_token(client, monkeypatch):
+    interop_setup(client, monkeypatch)
+    res = client.post("/api/exchange/producer/renderings", content=png_bytes(),
+                      headers={"Content-Type": "image/png"})
+    assert res.status_code == 401
+
+
+def test_an_oversized_screenshot_is_refused_before_it_is_resident(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    monkeypatch.setattr(app_module, "MAX_IMAGE_BYTES", 1024)
+    res = add_shot(client, tok_c, "producer", image=png_bytes() + b"\x00" * 4096)
+    assert res.status_code == 413
+    assert "limit is 1024 bytes" in res.json()["detail"]
+
+
+def test_a_runaway_note_is_truncated_not_refused(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = add_shot(client, tok_c, "producer", note="x" * (app_module.MAX_NOTE_CHARS + 500))
+    assert res.status_code == 201
+    assert len(res.json()["note"]) == app_module.MAX_NOTE_CHARS
+
+
+def test_renderings_list_filters_by_document_producer_and_consumer(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    add_shot(client, tok_c, "producer", note="from consumer")
+    add_shot(client, tok_d, "producer", note="from third")
+    doc = client.get("/api/exchange").json()[0]["exchange_id"]
+
+    everything = client.get("/api/renderings").json()
+    assert len(everything) == 2
+    assert everything[0]["ts"] >= everything[1]["ts"]          # newest first
+    assert len(client.get("/api/renderings?document=%d" % doc).json()) == 2
+    assert len(client.get("/api/renderings?producer=producer").json()) == 2
+    assert [s["note"] for s in client.get("/api/renderings?consumer=third").json()] \
+        == ["from third"]
+    assert client.get("/api/renderings?producer=nobody").json() == []
+    assert client.get("/api/renderings?document=99999").json() == []
+
+
+def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    assert client.get("/api/exchange").json()[0]["renderings"] == 0
+    add_shot(client, tok_c, "producer")
+    assert client.get("/api/exchange").json()[0]["renderings"] == 1
+
+
+def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    sid = add_shot(client, tok_c, "producer", image=JPEG).json()["id"]
+    res = client.get("/api/renderings/%d/image" % sid)
+    assert res.status_code == 200
+    assert res.content == JPEG
+    assert res.headers["content-type"] == "image/jpeg"       # not the declared image/png
+    assert res.headers["x-content-type-options"] == "nosniff"
+    assert "default-src 'none'" in res.headers["content-security-policy"]
+    # already compressed: gzipping it again would be CPU for nothing
+    assert res.headers["content-encoding"] == "identity"
+    assert client.get("/api/renderings/99999/image").status_code == 404
+
+
+def test_a_rendering_stays_pinned_to_the_document_it_was_taken_from(client, monkeypatch):
+    """A team's exchange document moves the moment it beats its own score. A
+    screenshot has to keep pointing at the bytes somebody actually opened."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    first_doc = client.get("/api/exchange").json()[0]["exchange_id"]
+    sid = add_shot(client, tok_c, "producer").json()["id"]
+    # the producer publishes something better; the exchange document changes
+    submit(client, tok_p, outcome(), monkeypatch,
+           body=bundle(sections=4, resources=10))
+    second_doc = client.get("/api/exchange").json()[0]["exchange_id"]
+    assert second_doc != first_doc
+    shot = [s for s in client.get("/api/renderings").json() if s["id"] == sid][0]
+    assert shot["document"] == first_doc
+    assert client.get("/api/exchange").json()[0]["renderings"] == 0   # of the new one
+
+
+def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    sid = add_shot(client, tok_c, "producer", note="first take").json()["id"]
+
+    def patch(token, payload):
+        return client.patch("/api/renderings/%d" % sid, json=payload,
+                            headers={"X-Team-Token": token})
+
+    assert patch(tok_c, {"note": "  clearer take  "}).json()["note"] == "clearer take"
+    assert patch(tok_d, {"note": "hijack"}).status_code == 403
+    assert patch(tok_c, {}).status_code == 400
+    assert patch(tok_c, {"note": 7}).status_code == 400
+    assert client.patch("/api/renderings/%d" % sid, json={"note": "x"}).status_code == 401
+    assert client.patch("/api/renderings/99999", json={"note": "x"},
+                        headers={"X-Team-Token": tok_c}).status_code == 404
+    # the last accepted write is what everyone reads
+    assert client.get("/api/renderings").json()[0]["note"] == "clearer take"
+
+
+def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    sid = add_shot(client, tok_c, "producer").json()["id"]
+    shot_dir = os.path.join(client.data_dir, "renderings", "consumer")
+    assert len(os.listdir(shot_dir)) == 1
+
+    assert client.delete("/api/renderings/%d" % sid,
+                         headers={"X-Team-Token": tok_d}).status_code == 403
+    assert client.delete("/api/renderings/%d" % sid).status_code == 401
+    assert len(os.listdir(shot_dir)) == 1          # nothing removed by a refused call
+
+    res = client.delete("/api/renderings/%d" % sid, headers={"X-Team-Token": tok_c})
+    assert res.status_code == 200 and res.json() == {"deleted": sid}
+    assert os.listdir(shot_dir) == []              # a withdrawn screenshot is gone
+    assert client.get("/api/renderings").json() == []
+    assert client.get("/api/renderings/%d/image" % sid).status_code == 404
+    assert client.delete("/api/renderings/%d" % sid,
+                         headers={"X-Team-Token": tok_c}).status_code == 404
+
+
+def test_renderings_are_readable_without_a_token(client, monkeypatch):
+    """The wall is for everyone in the room to read, participant or not."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    sid = add_shot(client, tok_c, "producer").json()["id"]
+    for headers in ({}, {"X-Team-Token": "not-a-real-token"}):
+        assert client.get("/api/renderings", headers=headers).status_code == 200
+        assert client.get("/api/renderings/%d/image" % sid,
+                          headers=headers).status_code == 200
+
+
+def test_screenshots_earn_nothing(client, monkeypatch):
+    """Interop stays unscored, so a wall of screenshots cannot be farmed."""
+    consume_first_pass(client, monkeypatch)
+    tok_p = register(client, "Producer2")
+    tok_c = register(client, "Consumer2")
+    submit(client, tok_p, outcome(), monkeypatch, body=CLINICAL_BODY)
+    before = {r["team"]: r["score"] for r in client.get("/api/leaderboard").json()}
+    for _ in range(5):
+        assert add_shot(client, tok_c, "producer2").status_code == 201
+    after = {r["team"]: r["score"] for r in client.get("/api/leaderboard").json()}
+    assert after == before
+    assert after["Consumer2"] == 0
+
+
+def test_whoami_names_the_company_behind_a_token(client):
+    tok = register(client, "  Alpha Team  ")
+    res = client.get("/api/me", headers={"X-Team-Token": tok})
+    assert res.status_code == 200
+    assert res.json() == {"team": "Alpha Team", "team_slug": "alpha-team"}
+    assert client.get("/api/me").status_code == 401
+    assert client.get("/api/me", headers={"X-Team-Token": "nope"}).status_code == 401
+
+
+def test_the_interop_tab_offers_screenshots(client):
+    text = client.get("/").text
+    assert "I loaded this - add a screenshot</button>" in text
+    assert "async function shrinkImage(file)" in text          # browser-side downscale
+    assert 'loading="lazy"' in text                            # a gallery on venue wifi
+    assert "Your document - other companies add the screenshots." in text
+    assert "/api/renderings?document=" in text
+    # the note is edited in place, and a withdraw asks once first
+    assert 'box.className = "shot-edit"' in text
+    assert "prompt(" not in text
+    assert "Withdraw - tap to confirm" in text
