@@ -2755,7 +2755,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
       <div class="issue-summary" id="issue-summary"></div>
       <div id="issue-groups"></div>
       <details id="doc-wrap" class="issue-fold" hidden>
-        <summary id="doc-summary">Your document, with the findings in place</summary>
+        <summary id="doc-summary">Embedded view</summary>
         <div class="doc-head">
           <span class="muted" id="doc-note"></span>
           <label class="doc-toggle"><input type="checkbox" id="doc-flagged">
