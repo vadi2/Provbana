@@ -2223,15 +2223,17 @@ INDEX_HTML = r"""<!doctype html>
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700;800&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700&display=swap">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
 <title>Nordic Hackathon 2026</title>
 <style>
-/* Nordic Hackathon 2026 - palette taken from the event site
-   (nordichackathon2026.blogs.dsv.su.se): base #FFFFFF, contrast #111111,
-   accent-3 #503AA8, accent-4 #686868, accent-5 #FBFAF3, accent-1 #FFEE58,
-   set in Manrope with Fira Code for code. Semantic colours (pass/fail/warn)
-   are deepened beyond the event palette so abnormal results stay obvious.
+/* Nordic Hackathon 2026 - palette, type scale and controls taken from the
+   event site (nordichackathon2026.blogs.dsv.su.se), which runs WordPress's
+   Twenty Twenty-Five: base #FFFFFF, contrast #111111, accent-3 #503AA8,
+   accent-4 #686868, accent-5 #FBFAF3, accent-1 #FFEE58, set in Manrope with
+   Fira Code for code, headings at 400 rather than bold, and nothing rounded.
+   Semantic colours (pass/fail/warn) are deepened beyond the event palette so
+   abnormal results stay obvious.
    Each token carries its light and dark value as a pair, so the two themes
    cannot drift apart; the theme picker only has to set color-scheme. */
 :root { color-scheme: light dark; }
@@ -2241,7 +2243,15 @@ INDEX_HTML = r"""<!doctype html>
   --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
                Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
   --font-mono: "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --r-card: 4px; --r-ctl: 3px;
+  /* The site's type scale, clamps and all, straight out of its theme.json. */
+  --fs-medium: clamp(1rem, 1rem + ((1vw - 0.2rem) * 0.196), 1.125rem);
+  --fs-large: clamp(1.125rem, 1.125rem + ((1vw - 0.2rem) * 0.392), 1.375rem);
+  --fs-x-large: clamp(1.75rem, 1.75rem + ((1vw - 0.2rem) * 0.392), 2rem);
+  --fs-xx-large: clamp(2.15rem, 2.15rem + ((1vw - 0.2rem) * 1.333), 3rem);
+  --measure: 645px;              /* the site's reading column */
+  --pad-x: clamp(20px, 5vw, 50px);  /* and its page gutter */
+  /* Nothing on the site is rounded - not a button, not an image. */
+  --r-card: 0px; --r-ctl: 0px;
   --bg: light-dark(#fbfaf3, #15141a);
   --card: light-dark(#ffffff, #1e1c26);
   --text: light-dark(#111111, #f3f1e7);
@@ -2252,6 +2262,10 @@ INDEX_HTML = r"""<!doctype html>
   --accent-soft: light-dark(#efebfa, #292340);
   --accent-fill: light-dark(#503aa8, #b9a8f7);
   --accent-on: light-dark(#ffffff, #15141a);
+  /* Buttons there are contrast-on-base, not accent-coloured; in the dark
+     theme the pair swaps over the way the site's dark style variation does. */
+  --btn: light-dark(#111111, #f3f1e7);
+  --btn-on: light-dark(#ffffff, #15141a);
   --pass: light-dark(#16704a, #58cf94);
   --pass-bg: light-dark(#e2f1e8, #123522);
   --fail: light-dark(#b3261e, #ff8a80);
@@ -2271,21 +2285,30 @@ INDEX_HTML = r"""<!doctype html>
 /* Browsers without light-dark() (pre-2024) get the light palette rather than
    unparsed declarations and a page with no colours at all. */
 @supports not (color: light-dark(#000, #fff)) {
-  :root { --bg: #fbfaf3; --card: #ffffff; --text: #111111; --muted: #5f5f5f; --border: #d8d5c7; --field-border: #8d8878; --accent: #503aa8; --accent-soft: #efebfa; --accent-fill: #503aa8; --accent-on: #ffffff; --pass: #16704a; --pass-bg: #e2f1e8; --fail: #b3261e; --fail-bg: #fbe7e4; --warn: #7d5300; --warn-bg: #fbf0cf; --info: #12628f; --info-bg: #e2eff7; --gold: #6f5a00; --gold-bg: #fdf6c4; --silver: #5f5f5f; --silver-bg: #eeece2; --bronze: #8a4b1f; --bronze-bg: #f6e9dc; --code-bg: #f3f1e6; }
+  :root { --bg: #fbfaf3; --card: #ffffff; --text: #111111; --muted: #5f5f5f; --border: #d8d5c7; --field-border: #8d8878; --accent: #503aa8; --accent-soft: #efebfa; --accent-fill: #503aa8; --accent-on: #ffffff; --btn: #111111; --btn-on: #ffffff; --pass: #16704a; --pass-bg: #e2f1e8; --fail: #b3261e; --fail-bg: #fbe7e4; --warn: #7d5300; --warn-bg: #fbf0cf; --info: #12628f; --info-bg: #e2eff7; --gold: #6f5a00; --gold-bg: #fdf6c4; --silver: #5f5f5f; --silver-bg: #eeece2; --bronze: #8a4b1f; --bronze-bg: #f6e9dc; --code-bg: #f3f1e6; }
 }
 * { box-sizing: border-box; }
 code, pre, textarea, .cv-mode, .tab-btn { font-variant-ligatures: none; }
 a { color: var(--accent); text-underline-offset: 2px; }
+a:hover { text-decoration: none; }   /* as on the site */
 body {
   margin: 0; background: var(--bg); color: var(--text);
-  font: 400 15px/1.6 var(--font-sans);
-  letter-spacing: -0.01em;
+  font: 300 16px/1.5 var(--font-sans);
+  letter-spacing: -0.1px;
 }
-main { max-width: 1060px; margin: 0 auto; padding: 26px 16px 72px; }
-header { max-width: 1060px; margin: 0 auto; padding: 48px 16px 6px; }
-.head-row { display: flex; align-items: flex-start; justify-content: space-between;
+/* Manrope 300 is the site's body weight, but it was chosen for 20px prose:
+   small print and dense table rows need the extra stem to stay readable. */
+table, input, textarea, select, .muted, label { font-weight: 400; }
+main { max-width: 1060px; margin: 0 auto; padding: 26px var(--pad-x) 72px; }
+header { max-width: 1060px; margin: 0 auto; padding: 20px var(--pad-x) 6px; }
+/* The site's header is a single bar - bold site title left, navigation right -
+   with the big, light hero heading underneath it. */
+.head-row { display: flex; align-items: center; justify-content: space-between;
   gap: 14px 24px; flex-wrap: wrap; }
-.theme-toggle { display: flex; flex: none; margin-top: 5px;
+.site-title { margin: 0; font-size: var(--fs-medium); font-weight: 700; }
+.site-title a { color: var(--text); text-decoration: none; }
+.head-nav { display: flex; align-items: center; gap: 10px 22px; flex-wrap: wrap; }
+.theme-toggle { display: flex; flex: none;
   border: 1px solid var(--field-border); border-radius: var(--r-ctl);
   overflow: hidden; }
 .th-btn { font: inherit; display: grid; place-items: center;
@@ -2298,45 +2321,54 @@ header { max-width: 1060px; margin: 0 auto; padding: 48px 16px 6px; }
   stroke: currentColor; stroke-width: 1.6; stroke-linecap: round;
   stroke-linejoin: round; }
 .th-btn:first-child { border-left: none; }
-.th-btn:hover { color: var(--accent); filter: none; }
-.th-btn[aria-pressed="true"] { background: var(--accent-fill); color: var(--accent-on); }
-h1 { margin: 0; font-size: 1.95rem; font-weight: 700; letter-spacing: -0.035em;
-  line-height: 1.15; }
-.sub { margin: 8px 0 0; color: var(--muted); font-size: 1.02rem;
-  letter-spacing: -0.015em; max-width: 62ch; }
-h2 { margin: 0 0 14px; font-size: 1.14rem; font-weight: 700;
-  letter-spacing: -0.025em; }
-h3, h4, .patient-name, .db-big { letter-spacing: -0.02em; }
+.th-btn:hover { color: var(--accent); background: transparent; }
+.th-btn[aria-pressed="true"] { background: var(--btn); color: var(--btn-on); }
+/* Hierarchy comes from size, not weight: the site sets every heading level at
+   400 and gives them all the body's -0.1px tracking. */
+h1, h2, h3, h4, h5, h6 { font-weight: 400; letter-spacing: -0.1px;
+  line-height: 1.125; }
+h1 { margin: clamp(28px, 5vw, 56px) 0 0; font-size: var(--fs-xx-large); }
+.sub { margin: 14px 0 0; color: var(--muted); font-size: var(--fs-large);
+  max-width: var(--measure); }
+h2 { margin: 0 0 14px; font-size: var(--fs-large); }
+/* Explanatory prose gets the site's reading column; the tables and forms
+   beside it keep the full width of the card. */
+.card > p.muted { max-width: var(--measure); }
 .card {
   background: var(--card); border: 1px solid var(--border);
-  border-radius: var(--r-card); padding: 22px 24px; margin-top: 20px;
+  border-radius: var(--r-card); padding: 26px 28px; margin-top: 22px;
 }
 .grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 20px; }
 @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
 label { display: block; font-size: 0.83rem; color: var(--muted); margin: 12px 0 4px; }
 input[type=text], textarea {
-  width: 100%; padding: 9px 11px; border: 1px solid var(--field-border);
+  width: 100%; padding: 12px; border: 1px solid var(--field-border);
   border-radius: var(--r-ctl); background: var(--bg); color: var(--text);
   font: inherit;
 }
 textarea { font-family: var(--font-mono);
   font-size: 0.82rem; min-height: 170px; resize: vertical; }
 input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+/* Square, near-black, roomy, and a hover that thins the fill instead of
+   brightening it - the site's button, scaled down for a form. */
 button {
-  font: inherit; font-weight: 600; border: none; border-radius: var(--r-ctl);
-  padding: 9px 18px; cursor: pointer; background: var(--accent-fill);
-  color: var(--accent-on); letter-spacing: -0.01em;
+  font: inherit; font-weight: 500; border: none; border-radius: var(--r-ctl);
+  padding: 12px 28px; cursor: pointer; background: var(--btn);
+  color: var(--btn-on); letter-spacing: -0.1px;
 }
-button:hover { filter: brightness(1.08); }
+button:hover { background: color-mix(in srgb, var(--btn) 85%, transparent); }
+button:focus-visible { outline: 2px solid var(--muted); outline-offset: 2px; }
 button:disabled { opacity: 0.55; cursor: wait; }
 button.ghost {
   background: transparent; color: var(--accent);
-  border: 1px solid var(--field-border); font-weight: 500; padding: 4px 10px;
+  border: 1px solid var(--field-border); font-weight: 400; padding: 5px 12px;
   font-size: 0.8rem;
 }
+button.ghost:hover { background: var(--accent-soft); }
 table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+/* The site's smallest heading level: uppercase, bold, widely tracked. */
 th { text-align: left; color: var(--muted); font-size: 0.76rem;
-  text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.1em; font-weight: 700;
   padding: 6px 10px; border-bottom: 1px solid var(--border); }
 td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
@@ -2347,12 +2379,13 @@ tr.rank-3 td { background: var(--bronze-bg); }
 tr.rank-1 td:first-child { box-shadow: inset 3px 0 0 var(--gold); color: var(--gold); font-weight: 700; }
 tr.rank-2 td:first-child { box-shadow: inset 3px 0 0 var(--silver); color: var(--silver); font-weight: 700; }
 tr.rank-3 td:first-child { box-shadow: inset 3px 0 0 var(--bronze); color: var(--bronze); font-weight: 700; }
-.badge { display: inline-block; padding: 2px 9px; border-radius: 999px;
+.badge { display: inline-block; padding: 3px 9px; border-radius: var(--r-ctl);
   font-size: 0.74rem; font-weight: 600; }
 .badge.pass { color: var(--pass); background: var(--pass-bg); }
 .badge.fail { color: var(--fail); background: var(--fail-bg); }
-.chip { display: inline-block; padding: 1px 8px; border-radius: 999px;
-  font-size: 0.72rem; font-weight: 600; text-transform: uppercase; }
+.chip { display: inline-block; padding: 2px 8px; border-radius: var(--r-ctl);
+  font-size: 0.72rem; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 0.06em; }
 .chip.error, .chip.fatal { color: var(--fail); background: var(--fail-bg); }
 .chip.warning { color: var(--warn); background: var(--warn-bg); }
 .chip.information { color: var(--info); background: var(--info-bg); }
@@ -2364,7 +2397,7 @@ tr.rank-3 td:first-child { box-shadow: inset 3px 0 0 var(--bronze); color: var(-
 .token-box code { font-size: 1.05rem; font-weight: 700; letter-spacing: 0.04em;
   font-family: var(--font-mono); }
 .banner { display: none; margin-top: 16px; padding: 14px 18px; border-radius: var(--r-card);
-  font-size: 1.15rem; font-weight: 700; }
+  font-size: var(--fs-large); font-weight: 500; }
 .banner.pass { display: block; color: var(--pass); background: var(--pass-bg);
   border: 1px solid var(--pass); }
 .banner.fail { display: block; color: var(--fail); background: var(--fail-bg);
@@ -2392,8 +2425,8 @@ pre.curl {
   font-size: 0.8rem; line-height: 1.5;
   font-family: var(--font-mono);
 }
-details summary { cursor: pointer; font-weight: 700; font-size: 1.14rem;
-  letter-spacing: -0.025em; }
+details summary { cursor: pointer; font-size: var(--fs-large);
+  letter-spacing: -0.1px; }
 details[open] summary { margin-bottom: 8px; }
 .row { display: flex; gap: 10px; align-items: center; }
 .row input { flex: 1; }
@@ -2422,11 +2455,11 @@ table.issues td.loc {
 table.issues td.loc, table.issues th.loc-h { min-width: 190px; }
 .loc-where { display: block; margin-top: 2px; overflow-wrap: anywhere; }
 .count-badge { display: inline-block; font-size: 0.68rem; font-weight: 600;
-  color: var(--muted); border: 1px solid var(--border); border-radius: 999px;
+  color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 0 6px; margin-left: 4px; white-space: nowrap; }
 .profile-chip { display: inline-block; font-size: 0.66rem; color: var(--muted);
   background: var(--code-bg); border: 1px solid var(--border);
-  border-radius: 999px; padding: 0 6px; margin-left: 6px; white-space: nowrap;
+  border-radius: var(--r-ctl); padding: 0 6px; margin-left: 6px; white-space: nowrap;
   vertical-align: middle; }
 details.issue-fold { margin-top: 10px; }
 details.issue-fold summary { font-size: 0.86rem; font-weight: 600;
@@ -2470,29 +2503,30 @@ button.loc-jump { background: transparent; border: 0; padding: 0; margin: 0;
   font: inherit; font-weight: 600; white-space: nowrap; color: var(--accent);
   text-align: left; cursor: pointer; text-decoration: underline;
   text-underline-offset: 2px; }
-button.loc-jump:hover { filter: none; text-decoration-thickness: 2px; }
+button.loc-jump:hover { background: transparent; text-decoration-thickness: 2px; }
 .copied { color: var(--pass) !important; border-color: var(--pass) !important; }
-/* tabs */
-.tabs { display: flex; gap: 8px; margin-top: 18px; flex-wrap: wrap; }
+/* tabs - the site's header navigation: plain text, no boxes, the current
+   page marked by weight and a rule rather than a filled pill */
+.tabs { display: flex; gap: 4px 22px; flex-wrap: wrap; align-items: center; }
 .tab-btn { display: inline-block; background: transparent; color: var(--muted);
-  border: 1px solid var(--field-border); text-decoration: none; cursor: pointer;
-  border-radius: var(--r-ctl); padding: 7px 16px; font-weight: 600; font-size: 0.88rem;
-  letter-spacing: -0.01em; }
-.tab-btn:hover { color: var(--accent); filter: none; }
-.tab-btn.active { background: var(--accent-fill); color: var(--accent-on);
-  border-color: var(--accent-fill); }
+  border: none; border-bottom: 2px solid transparent; text-decoration: none;
+  cursor: pointer; padding: 2px 0; font-weight: 400;
+  font-size: var(--fs-medium); letter-spacing: -0.1px; }
+.tab-btn:hover { color: var(--text); }
+.tab-btn.active { color: var(--text); font-weight: 700;
+  border-bottom-color: var(--accent); }
 .tab-panel { display: none; }
 .tab-panel.active { display: block; }
 select {
-  width: 100%; padding: 9px 11px; border: 1px solid var(--field-border);
+  width: 100%; padding: 12px; border: 1px solid var(--field-border);
   border-radius: var(--r-ctl); background: var(--bg); color: var(--text); font: inherit;
 }
 select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 /* clinical view */
 .patient-card { background: var(--accent-soft); border: 1px solid var(--border);
   border-radius: var(--r-card); padding: 14px 16px; margin: 12px 0 6px; }
-.patient-name { font-size: 1.25rem; font-weight: 700; }
-h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
+.patient-name { font-size: var(--fs-large); }
+h3.cv-sec { margin: 22px 0 4px; font-size: var(--fs-large); }
 .cv-items { list-style: none; padding: 0; margin: 4px 0 10px; }
 .cv-items li { padding: 8px 2px; border-bottom: 1px solid var(--border); }
 .cv-items li:last-child { border-bottom: none; }
@@ -2504,14 +2538,14 @@ h3.cv-sec { margin: 20px 0 4px; font-size: 1rem; }
 a.cv-open { color: inherit; text-decoration: none; }
 tr.cv-row:hover a.cv-open { text-decoration: underline; }
 .cv-status { display: inline-block; font-size: 0.68rem; font-weight: 600;
-  color: var(--muted); border: 1px solid var(--border); border-radius: 999px;
+  color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 0 6px; margin-left: 6px; vertical-align: middle; }
 .warn-banner { padding: 10px 14px; border-radius: var(--r-card); color: var(--fail);
   background: var(--fail-bg); border: 1px solid var(--fail);
   margin: 0 0 14px; font-weight: 600; }
 tr.cv-row { cursor: pointer; }
 tr.cv-row:hover td { background: var(--accent-soft); }
-footer { max-width: 1060px; margin: 26px auto 40px; padding: 0 16px;
+footer { max-width: 1060px; margin: 26px auto 40px; padding: 0 var(--pad-x);
   font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
 footer a { color: var(--accent); }
 /* example documents, listed in the same table as everyone else's submissions */
@@ -2529,10 +2563,10 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .cv-mode { background: transparent; color: var(--muted); border: none;
   border-left: 1px solid var(--field-border); border-radius: 0;
   padding: 6px 13px; font-size: 0.82rem; font-weight: 600;
-  letter-spacing: -0.01em; cursor: pointer; white-space: nowrap; }
+  letter-spacing: -0.1px; cursor: pointer; white-space: nowrap; }
 .cv-mode:first-child { border-left: none; }
-.cv-mode:hover { color: var(--accent); filter: none; }
-.cv-mode.active { background: var(--accent-fill); color: var(--accent-on); }
+.cv-mode:hover { color: var(--accent); background: transparent; }
+.cv-mode.active { background: var(--btn); color: var(--btn-on); }
 /* Floating it here would leave the title a useless sliver, so it goes back to
    being a full-width row above the document. */
 @media (max-width: 640px) {
@@ -2590,8 +2624,8 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .db-card.alert { border-color: var(--fail); background: var(--fail-bg); }
 .db-card.good { border-color: var(--pass); }
 .db-card h4 { margin: 0 0 8px; font-size: 0.72rem; text-transform: uppercase;
-  letter-spacing: 0.07em; color: var(--muted); }
-.db-big { font-size: 1.55rem; font-weight: 700; line-height: 1.15; }
+  letter-spacing: 0.1em; font-weight: 700; color: var(--muted); }
+.db-big { font-size: var(--fs-x-large); line-height: 1.15; }
 .db-sub { font-size: 0.8rem; color: var(--muted); }
 .db-list { list-style: none; margin: 6px 0 0; padding: 0; font-size: 0.87rem; }
 .db-list li { padding: 4px 0; border-bottom: 1px solid var(--border); }
@@ -2600,7 +2634,7 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .mt { margin-top: 9px; }
 .mt-top { display: flex; justify-content: space-between; font-size: 0.78rem;
   font-weight: 600; }
-.meter { height: 7px; border-radius: 999px; background: var(--border);
+.meter { height: 7px; border-radius: var(--r-ctl); background: var(--border);
   overflow: hidden; margin: 4px 0 0; }
 .meter > span { display: block; height: 100%; background: var(--pass); }
 .meter.mid > span { background: var(--warn); }
@@ -2640,32 +2674,35 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 <body>
 <header>
   <div class="head-row">
-    <h1>Nordic Hackathon 2026 - Patient Summary Challenge</h1>
-    <div class="theme-toggle" role="group" aria-label="Colour theme">
-      <button class="th-btn" data-theme-set="system" title="System theme"
-              aria-label="System theme"><svg viewBox="0 0 16 16" aria-hidden="true">
-        <rect x="1.8" y="2.8" width="12.4" height="8.4" rx="1.2"/>
-        <path d="M5.5 14h5M8 11.2V14"/></svg></button>
-      <button class="th-btn" data-theme-set="light" title="Light theme"
-              aria-label="Light theme"><svg viewBox="0 0 16 16" aria-hidden="true">
-        <circle cx="8" cy="8" r="3.1"/>
-        <path d="M8 1.2v1.5M8 13.3v1.5M1.2 8h1.5M13.3 8h1.5M3.3 3.3l1.1 1.1M11.6
-        11.6l1.1 1.1M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1"/></svg></button>
-      <button class="th-btn" data-theme-set="dark" title="Dark theme"
-              aria-label="Dark theme"><svg viewBox="0 0 16 16" aria-hidden="true">
-        <path d="M13.4 9.9A5.7 5.7 0 0 1 6.1 2.6a5.7 5.7 0 1 0 7.3 7.3z"/>
-        </svg></button>
+    <p class="site-title"><a href="/">Nordic Hackathon 2026</a></p>
+    <div class="head-nav">
+      <nav class="tabs">
+        <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard" aria-current="page">Leaderboard</a>
+        <a class="tab-btn" data-tab="submit" href="#submit">Submit</a>
+        <a class="tab-btn" data-tab="interop" href="#interop">Interop testing</a>
+        <a class="tab-btn" data-tab="clinical" href="#clinical">Clinical view</a>
+      </nav>
+      <div class="theme-toggle" role="group" aria-label="Colour theme">
+        <button class="th-btn" data-theme-set="system" title="System theme"
+                aria-label="System theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="1.8" y="2.8" width="12.4" height="8.4" rx="1.2"/>
+          <path d="M5.5 14h5M8 11.2V14"/></svg></button>
+        <button class="th-btn" data-theme-set="light" title="Light theme"
+                aria-label="Light theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="3.1"/>
+          <path d="M8 1.2v1.5M8 13.3v1.5M1.2 8h1.5M13.3 8h1.5M3.3 3.3l1.1 1.1M11.6
+          11.6l1.1 1.1M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1"/></svg></button>
+        <button class="th-btn" data-theme-set="dark" title="Dark theme"
+                aria-label="Dark theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M13.4 9.9A5.7 5.7 0 0 1 6.1 2.6a5.7 5.7 0 1 0 7.3 7.3z"/>
+          </svg></button>
+      </div>
     </div>
   </div>
+  <h1>Nordic Hackathon 2026 - Patient Summary Challenge</h1>
   <p class="sub">Submit your European Patient Summary (FHIR R4 Bundle) and get it
   validated against the <a href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
   target="_blank" rel="noopener">HL7 EU EPS 1.0.0-ballot profile</a>.</p>
-  <nav class="tabs">
-    <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard" aria-current="page">Leaderboard</a>
-    <a class="tab-btn" data-tab="submit" href="#submit">Submit</a>
-    <a class="tab-btn" data-tab="interop" href="#interop">Interop testing</a>
-    <a class="tab-btn" data-tab="clinical" href="#clinical">Clinical view</a>
-  </nav>
 </header>
 <main>
 
