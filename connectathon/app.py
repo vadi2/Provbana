@@ -17,7 +17,9 @@ import urllib.request
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
+import anyio.to_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
@@ -1226,6 +1228,13 @@ def _ig_loaded(ig: str, loaded: set[str]) -> bool:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    # Every endpoint here is a sync def, so they all share one threadpool -
+    # 40 threads by default. A wedged validator parks one of them per
+    # in-flight submission for MATCHBOX_TIMEOUT seconds, and the 41st request
+    # waits: the leaderboard, which touches nothing but SQLite, goes dark for
+    # a minute because some team left a submit loop running. A thread blocked
+    # on a socket costs a stack and nothing else, so give the pool room.
+    anyio.to_thread.current_default_thread_limiter().total_tokens = 256
     yield
 
 
@@ -1235,6 +1244,10 @@ app = FastAPI(
     version=APP_VERSION,
     lifespan=lifespan,
 )
+# Everything served here is JSON or HTML, and the validator's OperationOutcome
+# for a real bundle is a few hundred KB that gzips to a twentieth of that.
+# Venue wifi shared by every participant is the constraint, not the CPU.
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
