@@ -2,4 +2,6 @@
 __pycache__/
 .pytest_cache/
 connectathon/data/
+connectathon/backups/
+connectathon/data.replaced-*/
 .claude/

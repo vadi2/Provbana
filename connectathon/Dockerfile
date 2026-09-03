@@ -10,6 +10,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+# The backup daemon runs from this same image as its own compose service - it
+# opens the SQLite database directly, so it has to be beside it. Stdlib only,
+# so it adds nothing to requirements.txt.
+COPY backup.py .
 # Only the bundles: generate.py is the authoring tool, not part of the service.
 COPY samples/*.json ./samples/
 

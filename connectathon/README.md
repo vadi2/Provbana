@@ -66,6 +66,157 @@ product is pictured. `--reset` deletes
 the data directory first - stop the service before, restart it after. Never point it at
 the event instance.
 
+## Backups
+
+`backup.py` snapshots everything a result is made of - the SQLite database, the
+exact bytes of every submitted bundle, every uploaded interop screenshot - and
+puts them back if something goes wrong. Scores are not recomputed from anything:
+the database *is* the leaderboard, so losing it loses the event.
+
+### Taking backups
+
+Start it beside the service and leave it running for the whole event:
+
+```
+.venv/bin/python backup.py --loop
+```
+
+```
+18:32:22  snapshotting ./data into /home/.../connectathon/backups every 900s, keeping 96
+18:32:22  snapshot 20260902T183222Z - 21 files, 641.0 KB
+```
+
+That is a snapshot every 15 minutes, keeping the last 96 - a day's worth, so the
+pruner never reaches back past the start of the day it is protecting. A bad run
+is logged as `SNAPSHOT FAILED` and the loop carries on; a backup loop that dies
+on one error stops silently and nobody notices until the restore is needed.
+
+Snapshots land in `backups/` next to `app.py`. That is deliberately *beside* the
+data directory rather than inside it, because `seed_demo.py --reset` and a
+restore both move the data directory wholesale.
+
+One snapshot right now, without the loop:
+
+```
+.venv/bin/python backup.py
+```
+
+Take one by hand before anything you would not want to do twice - reseeding,
+editing the database, moving the service to another machine.
+
+Two details worth knowing. The database is copied through SQLite's own online
+backup API, not `cp`: copying a file that is being written to yields a database
+that opens fine and is quietly missing the last transaction, and at an event
+something is always being written. And `submissions/` and `renderings/` are
+hard-linked rather than copied, since a submitted bundle and an uploaded
+screenshot are written once and never edited - so a snapshot is the same bytes
+for none of the disk, and a day of them costs kilobytes rather than gigabytes.
+Deleting a screenshot through the API unlinks the live copy and leaves the
+snapshot's link intact, which is the point.
+
+### Seeing what you have
+
+```
+.venv/bin/python backup.py --list
+```
+
+```
+snapshot                files       size  contents
+20260902T181956Z           21   641.0 KB  11 companies, 14 submissions
+20260902T183222Z           21   641.0 KB  11 companies, 14 submissions
+20260902T184722Z           21   641.0 KB  11 companies, 14 submissions
+
+3 snapshot(s) in /home/.../connectathon/backups
+```
+
+Names are UTC timestamps, and the company and submission counts come from
+opening each snapshot's database - so a snapshot that cannot be read says
+`UNREADABLE` here rather than at the moment you need it. Check this once during
+the event, not for the first time during a disaster.
+
+### Restoring
+
+Three steps. Look first, stop the service, then restore.
+
+**1. Pick a snapshot.** `--list` as above, or `LATEST` for the newest.
+
+**2. Look before you leap.** Without `--yes` nothing is touched - it prints what
+the snapshot holds and what would move where, then exits 1:
+
+```
+.venv/bin/python backup.py --restore LATEST
+```
+
+```
+Restore /home/.../connectathon/backups/20260902T184722Z
+  contains   11 companies, 14 submissions, 21 files (641.0 KB)
+  into       /home/.../connectathon/data
+  current    /home/.../connectathon/data -> moved aside to /home/.../connectathon/data.replaced-20260902T185727Z (nothing is deleted)
+
+Stop the service, then re-run with --yes to go ahead.
+```
+
+Read the company and submission counts. If they are lower than you expect, you
+picked a snapshot from before the submissions you are trying to save.
+
+**3. Stop the service, then restore.** Stopping it first is not optional: the
+rename below is atomic, but a running service keeps writing into the directory
+it already has open, and those writes would land in the set-aside copy instead
+of the restored one.
+
+```
+# Ctrl-C the service (and the --loop backup, if it is in the same terminal)
+.venv/bin/python backup.py --restore LATEST --yes
+```
+
+```
+18:57:27  restored 20260902T184722Z -> /home/.../connectathon/data
+18:57:27  previous data is at /home/.../connectathon/data.replaced-20260902T185727Z - delete it once you are happy
+18:57:27  start the service again now
+```
+
+Start the service again and check the leaderboard. Delete the
+`data.replaced-*` directory once you are happy - it is not pruned for you.
+
+**Undoing a restore.** Nothing was deleted, so swap the two directories back:
+
+```
+mv data data.wrong && mv data.replaced-20260902T185727Z data
+```
+
+The snapshot is untouched by all of this - restore copies out of it rather than
+moving it - so the same snapshot can be restored again if the first attempt went
+somewhere unhelpful.
+
+### Only you can restore
+
+There is no HTTP endpoint for restore, and no token that grants it. It is this
+script, run from a shell on this machine, by the account that owns `backups/`:
+the directory is created 0700 and its databases 0600, so another account on the
+same laptop can neither read the submissions nor swap a snapshot for a doctored
+one, and the script refuses outright if the backup directory belongs to a
+different uid. Nothing a participant on the venue network can send will trigger
+any of it.
+
+The one thing to get right yourself: `backups/` is on the same disk as `data/`,
+which protects you from a bad reset, a bad edit or a corrupted database, but not
+from losing the laptop. Copy the newest snapshot to a USB stick or another
+machine at the end of each day - it is a plain directory, so `cp -a` or `rsync`
+is the whole procedure.
+
+### Options
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--loop` | off | Keep running, snapshotting every `--every` seconds |
+| `--every N` | `900` | Seconds between snapshots in `--loop` |
+| `--keep N` | `96` | Snapshots to retain (96 = 24h at 15 min) |
+| `--list` | | Show what has been kept, with counts |
+| `--restore NAME` | | Put a snapshot back; `NAME` or `LATEST` |
+| `--yes` | off | Required by `--restore`; without it, nothing is touched |
+| `--data-dir` | `$DATA_DIR`, else `data/` beside `app.py` | Which data directory to snapshot or restore into |
+| `--backup-dir` | `$BACKUP_DIR`, else `backups/` beside `app.py` | Where snapshots live |
+
 ## Scoring
 
 Any error or fatal validation issue scores the submission **0**. A valid bundle earns

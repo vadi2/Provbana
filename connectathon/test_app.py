@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import struct
 import subprocess
 import urllib.error
@@ -26,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app as app_module
+import backup
 
 
 def bundle(sections=0, resources=0, empty_sections=0):
@@ -2284,4 +2286,218 @@ def test_the_submit_tab_shows_findings_inside_the_document(client):
     assert "renderIssues(outcome.issue || [], body)" in text     # the submitted bytes
     assert 'class="loc-jump"' in text                            # location jumps to the line
     assert "DOC_MAX_LINES" in text                               # a huge bundle stays usable
+
+
+
+# ---------------------------------------------------------------- backups
+
+def fake_data_dir(path, teams=2, subs=3, files=("submissions/acme/1.json",
+                                                "renderings/acme/shot.png")):
+    """The shape backup.py cares about: a database with the two tables it
+    reports on, plus the write-once trees beside it."""
+    os.makedirs(path, exist_ok=True)
+    conn = sqlite3.connect(os.path.join(path, backup.DB_NAME))
+    conn.execute("CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute("CREATE TABLE submissions (id INTEGER PRIMARY KEY, team INTEGER)")
+    conn.executemany("INSERT INTO teams (name) VALUES (?)",
+                     [("team%d" % i,) for i in range(teams)])
+    conn.executemany("INSERT INTO submissions (team) VALUES (?)",
+                     [(1,) for _ in range(subs)])
+    conn.commit()
+    conn.close()
+    for rel in files:
+        full = os.path.join(path, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(rel.encode() * 20)
+    return path
+
+
+def test_snapshot_captures_database_and_both_trees(tmp_path):
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    path, files, total, pruned = backup.take_snapshot(data, backups, keep=10)
+
+    assert os.path.isfile(os.path.join(path, backup.DB_NAME))
+    assert os.path.isfile(os.path.join(path, "submissions/acme/1.json"))
+    assert os.path.isfile(os.path.join(path, "renderings/acme/shot.png"))
+    assert (files, pruned) == (3, 0) and total > 0
+
+    # the copy is a database, not bytes that happen to be there
+    conn = sqlite3.connect(os.path.join(path, backup.DB_NAME))
+    assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 2
+    conn.close()
+
+
+def test_snapshot_hardlinks_the_write_once_trees(tmp_path):
+    """A submission's bytes never change, so a snapshot of them must not cost
+    a second copy - an event's worth of 15-minute snapshots otherwise fills
+    the disk with the same gigabytes over and over."""
+    data = fake_data_dir(str(tmp_path / "data"))
+    path, _, _, _ = backup.take_snapshot(data, str(tmp_path / "backups"), keep=10)
+
+    live = os.stat(os.path.join(data, "submissions/acme/1.json"))
+    snap = os.stat(os.path.join(path, "submissions/acme/1.json"))
+    assert (live.st_dev, live.st_ino) == (snap.st_dev, snap.st_ino)
+
+    # the database is the one thing that does change, so it is a real copy
+    live_db = os.stat(os.path.join(data, backup.DB_NAME))
+    snap_db = os.stat(os.path.join(path, backup.DB_NAME))
+    assert live_db.st_ino != snap_db.st_ino
+
+
+def test_deleting_a_rendering_leaves_the_snapshot_intact(tmp_path):
+    data = fake_data_dir(str(tmp_path / "data"))
+    path, _, _, _ = backup.take_snapshot(data, str(tmp_path / "backups"), keep=10)
+    os.unlink(os.path.join(data, "renderings/acme/shot.png"))
+    assert os.path.isfile(os.path.join(path, "renderings/acme/shot.png"))
+
+
+def test_snapshot_database_is_readable_while_the_service_writes(tmp_path):
+    """`cp` on a live SQLite file can yield a torn database; the backup API
+    cannot. Hold an open write transaction and snapshot underneath it."""
+    data = fake_data_dir(str(tmp_path / "data"))
+    live = sqlite3.connect(os.path.join(data, backup.DB_NAME))
+    live.execute("BEGIN")
+    live.execute("INSERT INTO teams (name) VALUES ('mid-flight')")
+    try:
+        path, _, _, _ = backup.take_snapshot(data, str(tmp_path / "backups"), keep=10)
+    finally:
+        live.rollback()
+        live.close()
+
+    conn = sqlite3.connect(os.path.join(path, backup.DB_NAME))
+    assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    # the uncommitted row is not in the snapshot, which is the point of a
+    # consistent copy rather than a byte-for-byte one
+    assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 2
+    conn.close()
+
+
+def test_prune_keeps_the_newest_and_nothing_else(tmp_path):
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    for stamp in ("20260101T000000Z", "20260101T001500Z", "20260101T003000Z"):
+        (backups / stamp).mkdir()
+    (backups / "not-a-snapshot").mkdir()          # never swept up by name
+
+    assert backup.prune(str(backups), keep=2) == 1
+    assert backup.list_snapshots(str(backups)) == [
+        "20260101T001500Z", "20260101T003000Z"]
+    assert (backups / "not-a-snapshot").is_dir()
+
+
+def test_a_failed_snapshot_leaves_nothing_that_looks_usable(tmp_path, monkeypatch):
+    """A half-written snapshot that is named like a finished one is worse than
+    no snapshot: --restore LATEST would pick it."""
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+
+    def boom(src, dest):
+        raise OSError("disk full")
+    monkeypatch.setattr(backup, "link_tree", boom)
+
+    with pytest.raises(OSError):
+        backup.take_snapshot(data, backups, keep=10)
+    assert backup.list_snapshots(backups) == []
+    assert not [n for n in os.listdir(backups) if n.endswith(".partial")]
+
+
+def test_restore_without_yes_changes_nothing(tmp_path, capsys):
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    backup.take_snapshot(data, backups, keep=10)
+    os.unlink(os.path.join(data, "submissions/acme/1.json"))
+
+    with pytest.raises(SystemExit):
+        backup.restore(data, backups, "LATEST", confirmed=False)
+
+    # it says what it would do, and the damaged directory is still damaged
+    assert "2 companies, 3 submissions" in capsys.readouterr().out
+    assert not os.path.exists(os.path.join(data, "submissions/acme/1.json"))
+
+
+def test_restore_puts_the_results_back_and_keeps_the_old_copy(tmp_path):
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    backup.take_snapshot(data, backups, keep=10)
+
+    # the disaster: leaderboard emptied, a submitted bundle gone
+    conn = sqlite3.connect(os.path.join(data, backup.DB_NAME))
+    conn.execute("DELETE FROM teams")
+    conn.commit()
+    conn.close()
+    os.unlink(os.path.join(data, "submissions/acme/1.json"))
+
+    backup.restore(data, backups, "LATEST", confirmed=True)
+
+    conn = sqlite3.connect(os.path.join(data, backup.DB_NAME))
+    assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 2
+    conn.close()
+    assert os.path.isfile(os.path.join(data, "submissions/acme/1.json"))
+
+    # nothing was deleted: the emptied directory is still there to go back to
+    aside = [n for n in os.listdir(tmp_path) if n.startswith("data.replaced-")]
+    assert len(aside) == 1
+    conn = sqlite3.connect(os.path.join(tmp_path, aside[0], backup.DB_NAME))
+    assert conn.execute("SELECT COUNT(*) FROM teams").fetchone()[0] == 0
+    conn.close()
+
+
+def test_the_same_snapshot_can_be_restored_twice(tmp_path):
+    """Restore copies out of the snapshot rather than moving it, so a restore
+    that itself went wrong can be repeated."""
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    name = os.path.basename(backup.take_snapshot(data, backups, keep=10)[0])
+
+    backup.restore(data, backups, name, confirmed=True)
+    backup.restore(data, backups, name, confirmed=True)
+    assert backup.list_snapshots(backups) == [name]
+    assert os.path.isfile(os.path.join(data, "submissions/acme/1.json"))
+    # both set-aside copies survive, rather than the second restore colliding
+    # with the first on a name stamped to the same second
+    assert len([n for n in os.listdir(tmp_path)
+                if n.startswith("data.replaced-")]) == 2
+    assert not [n for n in os.listdir(tmp_path) if ".incoming-" in n]
+
+
+def test_restore_refuses_someone_elses_backups(tmp_path, monkeypatch):
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    backup.take_snapshot(data, backups, keep=10)
+    # read the real uid before patching: backup.os *is* os
+    someone_else = os.getuid() + 1
+    monkeypatch.setattr(os, "getuid", lambda: someone_else)
+
+    with pytest.raises(SystemExit) as exc:
+        backup.restore(data, backups, "LATEST", confirmed=True)
+    assert "owns the backups" in str(exc.value)
+
+
+def test_backups_are_not_world_readable(tmp_path):
+    """Results sit on a laptop at a venue; another account on it should not be
+    able to read the submissions, nor swap a snapshot for a doctored one."""
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    path, _, _, _ = backup.take_snapshot(data, backups, keep=10)
+    assert oct(os.stat(backups).st_mode & 0o777) == "0o700"
+    assert oct(os.stat(os.path.join(path, backup.DB_NAME)).st_mode & 0o777) == "0o600"
+
+
+def test_restore_names_a_missing_snapshot_instead_of_guessing(tmp_path):
+    data = fake_data_dir(str(tmp_path / "data"))
+    backups = str(tmp_path / "backups")
+    backup.take_snapshot(data, backups, keep=10)
+    with pytest.raises(SystemExit) as exc:
+        backup.restore(data, backups, "20200101T000000Z", confirmed=True)
+    assert "--list" in str(exc.value)
+
+
+def test_no_http_route_can_trigger_a_restore(client):
+    """Restore is the operator's, from a shell on the organiser's machine. A
+    participant on the venue network must not have any way to reach it."""
+    paths = [r.path for r in app_module.app.routes]
+    assert not [p for p in paths if "backup" in p or "restore" in p]
+
 
