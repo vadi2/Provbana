@@ -5,3 +5,10 @@ __pycache__/
 test_app.py
 seed_demo.py
 examples/
+# backup.py's snapshots, and the directory its --restore moves data/ aside to.
+# Listed for the same reason as data/ above rather than for build speed: with
+# BuildKit and a Dockerfile that COPYs named files, 200 MB parked in backups/
+# measurably costs nothing. These lines are what keeps a stray `COPY . .` from
+# baking a copy of the event's uploads into a published image.
+backups/
+data.replaced-*/

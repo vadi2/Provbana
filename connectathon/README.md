@@ -250,16 +250,21 @@ python reset.py --loop       # daily until PRACTICE_ENDS, then idle (how it runs
 python reset.py --yes        # wipe once, now
 ```
 
-A wipe clears the `teams`, `submissions` and `renderings` tables and the per-team
-directories beside them, in that order, inside one transaction. It leaves the database,
-the schema and the trees in place, so it runs against a live service - unlike
-`seed_demo.py --reset`, which deletes the data directory wholesale and needs the service
-stopped. Backups are not touched; `backup.py`'s own pruning ages them out.
+A wipe clears the `renderings`, `submissions` and `teams` tables in that order - child
+rows first, so no row is ever left pointing at one that has gone - inside a single
+transaction, and then removes the per-team directories beside them once that transaction
+has committed. A bundle whose row has gone is merely unreachable; a row whose bundle has
+gone is a 500 on the way out. It leaves the database, the schema and the trees in place,
+so it runs against a live service - unlike `seed_demo.py --reset`, which deletes the data
+directory wholesale and needs the service stopped. If there is no database in the data
+directory it touches nothing at all and says so, rather than emptying the trees of a
+directory that turned out to be the wrong one. Backups are not touched; `backup.py`'s own
+pruning ages them out.
 
 | Flag | Default | What it does |
 |---|---|---|
 | `--loop` | off | Wipe daily until `PRACTICE_ENDS`, then idle |
-| `--status` | | Print the schedule and the next wipe |
+| `--status` | | Print the schedule, the data directory, and what a wipe would take |
 | `--yes` | off | Required to wipe once, now; without it nothing is touched |
 | `--data-dir` | `$DATA_DIR`, else `data/` beside `app.py` | Which data directory to clear |
 

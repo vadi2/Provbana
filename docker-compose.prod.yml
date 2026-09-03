@@ -2,7 +2,7 @@
 #
 #   docker compose -f docker-compose.prod.yml up -d --build
 #
-# Differs from itb/docker-compose.yml in three ways that matter:
+# Differs from itb/docker-compose.yml in four ways that matter:
 #
 #   * Nothing but Caddy publishes a port. Matchbox (8080) and the service
 #     (8095) are reachable only on the compose network, so the Hetzner Cloud
@@ -10,13 +10,24 @@
 #   * The JVM heap is capped. The matchbox image hardcodes -Xmx12g in its CMD;
 #     _JAVA_OPTIONS overrides that without having to restate the whole java
 #     command, and mem_limit stops a runaway JVM taking the box down with it.
-#   * State lives in one named volume, not the checkout.
+#   * State lives in named volumes, not the checkout.
+#   * Every service caps its log file. Docker's default json-file driver has no
+#     size limit, and this box runs for months before the event.
 #
 # itb/docker-compose.yml stays as it is - it is the local development
 # validator, and its project name pins the itb_default network that
 # connectathon/README.md's `docker run` line joins.
 
 name: hackathon2026
+
+# Docker's json-file driver keeps every line ever logged unless told not to.
+# This box is up from September to November; matchbox alone is chatty enough to
+# matter, and a full disk during the event is unrecoverable in the time
+# available. Anchored here rather than on a service so that removing a service
+# cannot take the other four services' caps with it.
+x-logging: &logging
+  driver: json-file
+  options: {max-size: "10m", max-file: "3"}
 
 services:
   matchbox:
@@ -28,6 +39,19 @@ services:
       # Read-only here: on the event box the package list is changed by editing
       # the file and recreating the container, never by the container itself.
       - ./matchbox/config:/config:ro
+      # The FHIR package cache lives in ~/.fhir and is 95 MB of downloaded IGs.
+      # Without this it sits in the container's writable layer and is thrown
+      # away by every recreate, so a validator restarted at the venue would
+      # need the internet to come back up at all. Mounted at /home/matchbox,
+      # not at /home/matchbox/.fhir: .fhir is created at runtime, and a volume
+      # over a path the image does not contain is created root-owned, which the
+      # matchbox user (uid 1000) then cannot write to. /home/matchbox does
+      # exist in the image, so the volume inherits its ownership.
+      #
+      # /database is deliberately not persisted: matchbox rebuilds it from the
+      # packages at boot, and a stale copy is exactly how an edit to the IG
+      # list in matchbox/config/application.yaml would fail to take effect.
+      - matchbox_home:/home/matchbox
     environment:
       # Read once at boot, like application.yaml. Bump both numbers together -
       # the limit needs headroom over the heap for JVM metaspace, code cache
@@ -40,6 +64,7 @@ services:
       OTEL_METRICS_EXPORTER: none
       OTEL_LOGS_EXPORTER: none
     mem_limit: ${MATCHBOX_MEM_LIMIT:-10g}
+    logging: *logging
     # No ports: reached as http://matchbox:8080/matchboxv3/fhir from the app.
 
   app:
@@ -48,9 +73,11 @@ services:
     environment:
       DATA_DIR: /srv/data
       MATCHBOX_URL: http://matchbox:8080/matchboxv3/fhir
-      # Loading the IGs takes a minute or two from cold, and every submission
-      # in that window would otherwise score 0 against a validator that is
-      # merely still booting. Raise if a validation on this box measures close.
+      # Loading the IGs takes a minute or two from cold. A submission that runs
+      # out of this budget is a 502 and is not stored at all - no score, no
+      # findings, just a team told to try again. Raise it if a validation on
+      # this box ever measures close; deploy/deploy.sh warms the validator so
+      # the first submission of the event does not pay the cold cost.
       MATCHBOX_TIMEOUT: ${MATCHBOX_TIMEOUT:-60}
       # Unset leaves registration open to anyone who can reach the URL. The box
       # is public from the day it goes up, so set this in .env before the event
@@ -63,6 +90,11 @@ services:
       - state:/srv
     depends_on:
       - matchbox
+    # Small next to the validator's 10g, and that is the point: whatever a
+    # submission does to this process must not be able to take the box, and the
+    # validator with it, down. Baseline is around 100 MB.
+    mem_limit: 2g
+    logging: *logging
     # No ports: Caddy is the only front door.
 
   backup:
@@ -82,6 +114,8 @@ services:
       - state:/srv
     depends_on:
       - app
+    mem_limit: 512m
+    logging: *logging
 
   reset:
     # Same image again, for the same reason as backup: it opens the database
@@ -99,6 +133,8 @@ services:
       - state:/srv
     depends_on:
       - app
+    mem_limit: 512m
+    logging: *logging
 
   caddy:
     image: caddy:2.10-alpine
@@ -116,10 +152,13 @@ services:
       SITE_ADDRESS: ${SITE_ADDRESS:-hackathon2026.vadimperetok.in}
     depends_on:
       - app
+    logging: *logging
 
 volumes:
   # One volume, holding data/ and backups/ side by side. Both the hard-linking
   # and the restore rename depend on them sharing a filesystem.
   state:
+  # The validator's downloaded IG packages - see the matchbox service above.
+  matchbox_home:
   caddy_data:
   caddy_config:

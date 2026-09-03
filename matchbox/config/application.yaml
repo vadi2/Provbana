@@ -14,7 +14,12 @@ hapi:
 # Terminology is deliberately left off (Matchbox's packaged default is
 # `txServer: n/a`). With it off, a code from a code system the IGs do not carry
 # - ATC, SNOMED CT, LOINC - produces "the code cannot be validated" as a
-# *warning*, and a bundle is never failed for something we could not check.
+# *warning* rather than an error: 51 of the 64 findings on
+# samples/andrea-cross-border.json are of that kind, all of them warnings or
+# information. app.py's drop_uncheckable_terminology() then removes them
+# outright, whatever severity they arrived at, which is what actually
+# guarantees a bundle is never failed for something we could not check. This
+# setting is why that filter has so little to undo.
 #
 # Turning it on is one line:
 #

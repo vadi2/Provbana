@@ -3,7 +3,7 @@
 # --user-data-from-file deploy/cloud-init.yaml`, so it runs once, at first boot.
 #
 # It does not deploy the app - it only makes the box ready to receive it. The
-# deploy itself is deploy/provision.sh, which runs from your laptop over SSH.
+# deploy itself is deploy/deploy.sh, which runs from your laptop over SSH.
 
 # Ubuntu's cloud image ships an older docker; the app is built on the box, so
 # it needs buildx and the compose v2 plugin from Docker's own repository.
@@ -51,5 +51,10 @@ runcmd:
   - usermod -aG docker vadi
   - systemctl enable --now docker
   - systemctl restart ssh
-  # A marker provision.sh waits on, so a deploy cannot race the bootstrap.
-  - touch /var/lib/cloud/hackathon2026-ready
+  # The marker deploy.sh waits on, so a deploy cannot race the bootstrap. Gated
+  # on docker actually being there, because cloud-init concatenates runcmd into
+  # a plain `#!/bin/sh` script with no `set -e`: a failed apt-get does not stop
+  # the list, so an unconditional touch here would declare a box ready that
+  # never installed docker, and deploy.sh would take that at its word and sync
+  # onto it, failing somewhere far less obvious.
+  - command -v docker && docker compose version && touch /var/lib/cloud/hackathon2026-ready
