@@ -549,7 +549,7 @@ def build_andrea():
         (sct("911000221103", "Human papillomavirus antigen only vaccine product",
              "Human papillomavirus vaccine"), "2014-09-16", None, None),
         (sct("1119305005", "SARS-CoV-2 antigen vaccine",
-             "COVID-19 vaccine"), "2021-10-11", "J07BX03", "covid-19 vaccines"),
+             "COVID-19 vaccine"), "2021-10-11", "J07BN04", "covid-19, protein subunit"),
         (sct("1181000221105",
              "Vaccine product containing only Influenza virus antigen (medicinal product)",
              "Influenza vaccine"), "2025-10-14", "J07BB02",
@@ -699,8 +699,8 @@ def build_arne():
         dict(code=sct("256262001", "European white birch pollen", "Björkpollen"),
              category="environment", atype="allergy", criticality="low",
              onset="1988-04-02",
-             reaction=sct("1371396001", "Allergic rhinoconjunctivitis",
-                          "Allergisk rinokonjunktivit"),
+             reaction=sct("878820003", "Rhinoconjunctivitis",
+                          "Rinokonjunktivit"),
              severity="mild"),
     ]
     refs = [allergy(b, **a) for a in allergies]
@@ -809,7 +809,7 @@ def build_arne():
              "Influensavaccin"), "2025-10-09", "J07BB02",
          "influenza, inactivated, split virus or surface antigen"),
         (sct("1119305005", "SARS-CoV-2 antigen vaccine", "Covid-19-vaccin"),
-         "2025-10-09", "J07BX03", "covid-19 vaccines"),
+         "2025-10-09", "J07BN04", "covid-19, protein subunit"),
     ]
     refs = [immunization(b, code=c, date=d, atc=a, atc_display=ad)
             for c, d, a, ad in shots]

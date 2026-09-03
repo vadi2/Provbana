@@ -75,7 +75,7 @@
             },
             "text": {
               "status": "generated",
-              "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"sv\" lang=\"sv\"><table><thead><tr><th>Allergen</th><th>Kritikalitet</th><th>Debut</th><th>Reaktion</th><th>Svårighetsgrad</th></tr></thead><tbody><tr><td>Penicillin</td><td>high</td><td>1972-06-18</td><td>Anafylaktisk reaktion</td><td>severe</td></tr><tr><td>Björkpollen</td><td>low</td><td>1988-04-02</td><td>Allergisk rinokonjunktivit</td><td>mild</td></tr></tbody></table></div>"
+              "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"sv\" lang=\"sv\"><table><thead><tr><th>Allergen</th><th>Kritikalitet</th><th>Debut</th><th>Reaktion</th><th>Svårighetsgrad</th></tr></thead><tbody><tr><td>Penicillin</td><td>high</td><td>1972-06-18</td><td>Anafylaktisk reaktion</td><td>severe</td></tr><tr><td>Björkpollen</td><td>low</td><td>1988-04-02</td><td>Rinokonjunktivit</td><td>mild</td></tr></tbody></table></div>"
             },
             "entry": [
               {
@@ -652,11 +652,11 @@
                 "coding": [
                   {
                     "system": "http://snomed.info/sct",
-                    "code": "1371396001",
-                    "display": "Allergic rhinoconjunctivitis"
+                    "code": "878820003",
+                    "display": "Rhinoconjunctivitis"
                   }
                 ],
-                "text": "Allergisk rinokonjunktivit"
+                "text": "Rinokonjunktivit"
               }
             ],
             "severity": "mild"
@@ -665,7 +665,7 @@
         "id": "3da54433-9019-5d7d-b485-b753d4038c4a",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Allergen</th><td>Björkpollen</td></tr><tr><th>Criticality</th><td>low</td></tr><tr><th>Type</th><td>allergy</td></tr><tr><th>Onset</th><td>1988-04-02</td></tr><tr><th>Reaction</th><td>Allergisk rinokonjunktivit</td></tr><tr><th>Severity</th><td>mild</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Allergen</th><td>Björkpollen</td></tr><tr><th>Criticality</th><td>low</td></tr><tr><th>Type</th><td>allergy</td></tr><tr><th>Onset</th><td>1988-04-02</td></tr><tr><th>Reaction</th><td>Rinokonjunktivit</td></tr><tr><th>Severity</th><td>mild</td></tr></table></div>"
         }
       }
     },
@@ -2174,8 +2174,8 @@
             },
             {
               "system": "http://www.whocc.no/atc",
-              "code": "J07BX03",
-              "display": "covid-19 vaccines"
+              "code": "J07BN04",
+              "display": "covid-19, protein subunit"
             }
           ],
           "text": "Covid-19-vaccin"

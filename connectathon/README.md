@@ -66,6 +66,14 @@ product is pictured. `--reset` deletes
 the data directory first - stop the service before, restart it after. Never point it at
 the event instance.
 
+Terminology lookup is off: Matchbox runs with its packaged `txServer: n/a`, so
+structure, profiles and cardinality are checked in full but a SNOMED CT, LOINC
+or ATC code is reported as "cannot be validated" instead of being confirmed.
+Turning it on is one line in `matchbox/config/application.yaml`, and that file
+explains both reasons it is off - an unreachable terminology server stops
+Matchbox booting at all, and one that dies mid-event fails the next bundle
+carrying an uncached code with a hard error, scoring a good bundle 0.
+
 ## Backups
 
 `backup.py` snapshots everything a result is made of - the SQLite database, the

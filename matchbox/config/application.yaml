@@ -10,3 +10,33 @@ hapi:
       sebase:
         name: hl7se.fhir.base
         version: 1.1.0
+
+# Terminology is deliberately left off (Matchbox's packaged default is
+# `txServer: n/a`). With it off, a code from a code system the IGs do not carry
+# - ATC, SNOMED CT, LOINC - produces "the code cannot be validated" as a
+# *warning*, and a bundle is never failed for something we could not check.
+#
+# Turning it on is one line:
+#
+#   matchbox:
+#     fhir:
+#       context:
+#         txServer: https://tx.fhir.org/r4
+#
+# It is genuinely better validation - it found two dead codes in our own
+# samples - and on a good network it costs nothing: 79s on the first bundle
+# while the cache fills, 0.3s after. It is off anyway, because both of its
+# failure modes land on the participants rather than on us:
+#
+#   * Unreachable when Matchbox boots -> Matchbox exits 1 and does not start.
+#     No validator, no event, until the network is back.
+#   * Unreachable once running -> anything already cached still validates, but
+#     the first bundle carrying a code we have not seen gets a hard *error*
+#     ("Refusing to fetch ... / UnknownHostException" from the TerminologyEngine)
+#     and scores 0. It also drags two spurious "Slice 'Bundle.entry:composition':
+#     a matching slice is required" errors along with it, so the team reads a
+#     wifi outage as a broken bundle.
+#
+# There is no middle setting: `suppressWarnInfo` cannot soften an error. Turn
+# this on for a venue on wired network, or once a terminology server runs on
+# this machine - localhost cannot go down separately from the validator.

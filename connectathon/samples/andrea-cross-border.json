@@ -992,8 +992,8 @@
             },
             {
               "system": "http://www.whocc.no/atc",
-              "code": "J07BX03",
-              "display": "covid-19 vaccines"
+              "code": "J07BN04",
+              "display": "covid-19, protein subunit"
             }
           ],
           "text": "COVID-19 vaccine"

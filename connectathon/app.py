@@ -1177,6 +1177,135 @@ def validate_with_matchbox(body: bytes) -> dict:
     return outcome
 
 
+# ------------------------------------------------- unresolvable terminology
+
+# Matchbox runs with `txServer: n/a` (see matchbox/config/application.yaml), so
+# the licensed code systems EPS points at - SNOMED CT, LOINC, WHO ATC - are not
+# resolvable here. The validator is scrupulous about saying so, and says it once
+# per coding: a rich summary picks up hundreds of "the code cannot be validated"
+# lines, which bury the findings a team can actually act on and read like
+# defects in their bundle rather than a gap in ours.
+#
+# Every message id below is from the HL7 validator's own Messages.properties
+# (org.hl7.fhir.utilities 6.10.3) and means "this was not checked", never "this
+# is wrong" - so dropping them removes noise, not findings.
+MSG_ID_EXT = "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id"
+
+UNCHECKABLE_TERMINOLOGY_IDS = frozenset({
+    # no terminology server at all
+    "Error_expanding_ValueSet_running_without_terminology_services",
+    "Error_validating_code_running_without_terminology_services",
+    "TERMINOLOGY_TX_NOSVC_BOUND_EXT",
+    "TERMINOLOGY_TX_NOSVC_BOUND_REQ",
+    "Terminology_TX_NoValid_15",
+    # the code system is missing, unusable or unsupported
+    "TERMINOLOGY_TX_SYSTEM_NOT_USABLE",
+    "TERMINOLOGY_TX_SYSTEM_UNSUPPORTED",
+    "UNKNOWN_CODESYSTEM",
+    "UNKNOWN_CODESYSTEM_EXP",
+    "UNKNOWN_CODESYSTEM_VERSION",
+    "UNKNOWN_CODESYSTEM_VERSION_EXP",
+    "UNKNOWN_CODESYSTEM_VERSION_EXP_NONE",
+    "UNKNOWN_CODESYSTEM_VERSION_NONE",
+    "UNKNOWN_CODESYSTEM_VERSION_UNK",
+    "VALUESET_INC_CS_NO_SUPPORT",
+    "QUESTIONNAIRE_QR_ITEM_BADOPTION_CS",
+    # the value set is missing, so membership could not be tested
+    "CODESYSTEM_PROPERTY_VALUESET_NOT_FOUND",
+    "Terminology_TX_ValueSet_NotFound",
+    "UNABLE_TO_CHECK_IF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_",
+    "UNABLE_TO_CHECK_IF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_CS",
+    "UNABLE_TO_CHECK_IF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_VS",
+    "Unable_to_validate_code_without_using_server",
+})
+
+# `TERMINOLOGY_TX_WARNING` is defined as "{1}" - it passes through whatever the
+# terminology layer said - and some issues carry no message id at all, so the
+# same family has to be recognised by wording as well.
+UNCHECKABLE_TERMINOLOGY_TEXT = (
+    "running without terminology services",
+    "unable to validate code without using server because",
+    "because there is no terminology service",
+    "in the absence of a terminology server",
+    "so the code cannot be validated",
+    "so the code has not been validated",
+    "so the value set cannot be expanded",
+    "so the property codes cannot be validated",
+    "unable to check whether the code is in the value set",
+)
+
+# Systems and value sets are named in those messages as quoted or bare URLs.
+TERMINOLOGY_URL = re.compile(r"(?:https?://|urn:)[^\s'\"),;]+")
+
+
+def _issue_text(issue: dict) -> str:
+    details = issue.get("details")
+    text = (details or {}).get("text") if isinstance(details, dict) else None
+    return text or issue.get("diagnostics") or ""
+
+
+def _message_id(issue: dict) -> str | None:
+    for ext in issue.get("extension") or []:
+        if isinstance(ext, dict) and ext.get("url") == MSG_ID_EXT:
+            return ext.get("valueCode")
+    return None
+
+
+def _named_urls(text: str) -> set[str]:
+    """The systems and value sets a message names, without version suffixes."""
+    return {u.split("|")[0].split("#")[0].rstrip(".,")
+            for u in TERMINOLOGY_URL.findall(text)}
+
+
+def drop_uncheckable_terminology(outcome: dict) -> dict:
+    """Remove findings that only say a code could not be checked here.
+
+    Two passes, because the validator reports the same gap twice. The first
+    pass drops the explicit "could not be found / no terminology service"
+    messages and remembers which systems and value sets they named. The second
+    drops the membership claims - "None of the codings provided are in the value
+    set X" - but *only* where the codes or the value set came from something the
+    first pass just told us was unresolvable. A membership claim about a value
+    set that did resolve is a real finding and stays.
+
+    That makes the filter self-calibrating rather than a hardcoded list of code
+    systems: point Matchbox at a terminology server and the first pass finds
+    nothing, so the second drops nothing and every finding is shown again.
+    """
+    issues = outcome.get("issue")
+    if not isinstance(issues, list):
+        return outcome
+
+    kept, unresolvable = [], set()
+    for issue in issues:
+        if not isinstance(issue, dict):
+            kept.append(issue)
+            continue
+        text = _issue_text(issue)
+        lowered = text.lower()
+        if (_message_id(issue) in UNCHECKABLE_TERMINOLOGY_IDS
+                or any(p in lowered for p in UNCHECKABLE_TERMINOLOGY_TEXT)):
+            unresolvable |= _named_urls(text)
+            continue
+        kept.append(issue)
+
+    if not unresolvable:
+        return outcome
+
+    survivors = []
+    for issue in kept:
+        mid = _message_id(issue) if isinstance(issue, dict) else None
+        if mid and (mid.startswith("Terminology_TX_NoValid")
+                    or mid.startswith("Terminology_TX_Confirm")):
+            if _named_urls(_issue_text(issue)) & unresolvable:
+                continue
+        survivors.append(issue)
+
+    trimmed = dict(outcome)
+    trimmed["issue"] = survivors
+    return trimmed
+
+
 def matchbox_health_url() -> str:
     base = MATCHBOX_URL.rstrip("/")
     if base.endswith("/fhir"):
@@ -1433,6 +1562,13 @@ def submit_eps(
         outcome = validate_with_matchbox(body)
     except MatchboxError as exc:
         raise HTTPException(502, detail=str(exc))
+
+    # Filtered before anything counts it, so the verdict, the stored counts and
+    # the findings the team reads are the same list. Dropping a finding from the
+    # display but not from the count would fail a bundle for something we chose
+    # not to check, and leave the banner asking them to fix errors it will not
+    # show them.
+    outcome = drop_uncheckable_terminology(outcome)
 
     counts = {"fatal": 0, "error": 0, "warning": 0, "information": 0}
     issues = outcome.get("issue")
@@ -2872,9 +3008,11 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <p>Bundles are validated by <a href="https://github.com/ahdis/matchbox"
   target="_blank" rel="noopener">Matchbox</a>, the open-source FHIR validation and
   mapping server from <a href="https://ahdis.ch/" target="_blank" rel="noopener">ahdis</a>,
-  against the HL7 Europe <a href="http://hl7.eu/fhir/eps/" target="_blank"
-  rel="noopener">Patient Summary</a> implementation guide. Terminology is SNOMED CT,
-  LOINC and WHO ATC.</p>
+  which runs the official <a href="https://github.com/hapifhir/org.hl7.fhir.core"
+  target="_blank" rel="noopener">HL7 FHIR validator</a> underneath.</p>
+  <p>Structure, profiles and cardinality are checked in full. External code
+  systems the guide EPS does not itself carry and that require a license (such as
+  SNOMED CT, LOINC, WHO ATC) are not checked.</p>
 </footer>
 <script>
 "use strict";

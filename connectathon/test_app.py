@@ -961,10 +961,24 @@ def test_index_offers_bundle_downloads_and_anonymous_partner_browsing(client):
     assert '/bundle" download>download the FHIR bundle</a>' in text
 
 
-def test_index_credits_matchbox(client):
+def test_index_credits_matchbox_and_the_hl7_validator(client):
+    """Matchbox is what runs, but the verdict is the official HL7 validator's -
+    credit both, so a team that disagrees with a finding knows whose engine to
+    take it up with."""
     text = client.get("/").text
     assert "https://github.com/ahdis/matchbox" in text
-    assert "http://hl7.eu/fhir/eps/" in text
+    assert "https://github.com/hapifhir/org.hl7.fhir.core" in text
+    # the guide being validated against is still named, in the submit tab
+    assert "https://hl7.eu/fhir/eps/1.0.0-ballot/" in text
+
+
+def test_index_does_not_claim_terminology_is_validated(client):
+    """Matchbox runs with txServer: n/a, so SNOMED/LOINC/ATC codes come back as
+    "cannot be validated". Saying otherwise would send a team home trusting a
+    code nothing checked."""
+    text = client.get("/").text
+    assert "that require a license (such as\n  SNOMED CT, LOINC, WHO ATC) are not checked" in text
+
 
 
 # ------------------------------------------------------------- sample documents
@@ -2499,5 +2513,163 @@ def test_no_http_route_can_trigger_a_restore(client):
     participant on the venue network must not have any way to reach it."""
     paths = [r.path for r in app_module.app.routes]
     assert not [p for p in paths if "backup" in p or "restore" in p]
+
+
+# ------------------------------------------- unresolvable terminology filter
+
+MSG_ID_EXT = "http://hl7.org/fhir/StructureDefinition/operationoutcome-message-id"
+
+
+def issue(text, severity="warning", msg_id=None):
+    out = {"severity": severity, "code": "processing", "details": {"text": text}}
+    if msg_id:
+        out["extension"] = [{"url": MSG_ID_EXT, "valueCode": msg_id}]
+    return out
+
+
+def kept(*issues):
+    filtered = app_module.drop_uncheckable_terminology(
+        {"resourceType": "OperationOutcome", "issue": list(issues)})
+    return [i["details"]["text"] for i in filtered["issue"]]
+
+
+@pytest.mark.parametrize("msg_id, text", [
+    ("UNKNOWN_CODESYSTEM",
+     "A definition for CodeSystem 'http://www.whocc.no/atc' could not be found, "
+     "so the code cannot be validated"),
+    ("UNKNOWN_CODESYSTEM_VERSION",
+     "A definition for CodeSystem 'http://snomed.info/sct' version 'null' could "
+     "not be found, so the code cannot be validated"),
+    ("Error_validating_code_running_without_terminology_services",
+     "Unable to validate code '38341003' in system 'http://snomed.info/sct' "
+     "because the validator is running without terminology services"),
+    ("Terminology_TX_ValueSet_NotFound",
+     "ValueSet 'http://terminology.ehdsi.eu/ValueSet/eHDSIAllergenNoDrug' not found"),
+    ("TERMINOLOGY_TX_NOSVC_BOUND_REQ",
+     "Could not confirm that the codes provided are from the required value set "
+     "http://hl7.org/fhir/ValueSet/x because there is no terminology service"),
+    ("TERMINOLOGY_TX_SYSTEM_NOT_USABLE",
+     "The definition for the Code System with URI 'http://loinc.org' from 'x' "
+     "doesn't provide any codes so the code cannot be validated"),
+    ("UNABLE_TO_CHECK_IF_THE_PROVIDED_CODES_ARE_IN_THE_VALUE_SET_CS",
+     "Unable to check whether the code is in the value set "
+     "'http://hl7.org/fhir/ValueSet/y' because the code system "
+     "http://snomed.info/sct was not found"),
+    ("Terminology_TX_NoValid_15",
+     "The value provided ('http://loinc.org') could not be validated in the "
+     "absence of a terminology server"),
+])
+def test_uncheckable_terminology_messages_are_dropped(msg_id, text):
+    assert kept(issue(text, msg_id=msg_id)) == []
+
+
+def test_the_passthrough_terminology_warning_is_matched_on_wording():
+    """TERMINOLOGY_TX_WARNING is defined as "{1}" - it repeats whatever the
+    terminology layer said - and some issues carry no message id at all, so the
+    id set alone would let this family through."""
+    assert kept(issue("Unable to validate code without using server because: "
+                      "Resolved system urn:ietf:bcp:47 (v2.0.1), but the "
+                      "definition doesn't include any codes, so the code has "
+                      "not been validated", msg_id="TERMINOLOGY_TX_WARNING")) == []
+    assert kept(issue("Unable to validate code without using server because: "
+                      "Resolved system http://unitsofmeasure.org (v3.0.1)")) == []
+
+
+def test_membership_claims_about_an_unresolvable_system_are_dropped():
+    """The validator reports the same gap twice: once as "I could not resolve
+    ATC", then again as "none of these codings are in the value set". The second
+    reads like a real finding, so it has to go with the first."""
+    assert kept(
+        issue("A definition for CodeSystem 'http://www.whocc.no/atc' could not "
+              "be found, so the code cannot be validated",
+              msg_id="UNKNOWN_CODESYSTEM"),
+        issue("None of the codings provided are in the value set 'Medications - "
+              "IPS' (http://hl7.org/fhir/uv/ips/ValueSet/medication-uv-ips|2.0.0), "
+              "and a coding is recommended to come from this value set "
+              "(codes = http://www.whocc.no/atc#B01AF02)",
+              severity="information", msg_id="Terminology_TX_NoValid_3_CC"),
+    ) == []
+
+
+def test_a_membership_claim_that_was_actually_checked_survives():
+    """The point of tying the second pass to the first: a value set that did
+    resolve produces a real finding, and dropping it would hide a wrong code."""
+    real = ("The Coding provided (http://hl7.org/fhir/administrative-gender#z) "
+            "was not found in the value set "
+            "http://hl7.org/fhir/ValueSet/administrative-gender, and a code is "
+            "required from this value set")
+    assert kept(
+        issue("A definition for CodeSystem 'http://www.whocc.no/atc' could not "
+              "be found, so the code cannot be validated",
+              msg_id="UNKNOWN_CODESYSTEM"),
+        issue(real, severity="error", msg_id="Terminology_TX_NoValid_4"),
+    ) == [real]
+
+
+def test_nothing_is_dropped_when_every_code_system_resolved():
+    """Self-calibrating rather than a hardcoded list of licensed systems: point
+    Matchbox at a terminology server, the first pass finds nothing to drop, and
+    the membership findings are all real again."""
+    real = ("None of the codings provided are in the value set "
+            "http://hl7.org/fhir/ValueSet/z, and a coding from this value set "
+            "is required) (codes = http://snomed.info/sct#123)")
+    assert kept(issue(real, severity="error",
+                      msg_id="Terminology_TX_NoValid_1_CC")) == [real]
+
+
+def test_real_findings_are_untouched():
+    slice_err = ("Slice 'Bundle.entry:composition': a matching slice is "
+                 "required, but not found")
+    cardinality = "Composition.section: minimum required = 5, but only found 4"
+    assert kept(
+        issue(slice_err, severity="error", msg_id="Validation_VAL_Profile_Minimum_SLICE"),
+        issue("A definition for CodeSystem 'http://loinc.org' could not be "
+              "found, so the code cannot be validated", msg_id="UNKNOWN_CODESYSTEM"),
+        issue(cardinality, severity="error", msg_id="Validation_VAL_Profile_Minimum"),
+    ) == [slice_err, cardinality]
+
+
+def test_the_filter_survives_a_malformed_outcome():
+    assert app_module.drop_uncheckable_terminology({}) == {}
+    assert app_module.drop_uncheckable_terminology(
+        {"issue": "not a list"})["issue"] == "not a list"
+    out = app_module.drop_uncheckable_terminology({"issue": [None, 7]})
+    assert out["issue"] == [None, 7]
+
+
+def test_a_bundle_is_not_failed_for_terminology_we_did_not_check(client, monkeypatch):
+    """If an unresolvable code system ever comes back as an error - a required
+    binding to a value set we cannot expand - it must not cost a team the
+    submission. Filtering before the count is what makes that true."""
+    consume_first_pass(client, monkeypatch)
+    oc = {"resourceType": "OperationOutcome", "issue": [
+        issue("A definition for CodeSystem 'http://snomed.info/sct' could not be "
+              "found, so the code cannot be validated",
+              severity="error", msg_id="UNKNOWN_CODESYSTEM"),
+    ]}
+    token = register(client, "Terminology Gap AB")
+    res = submit(client, token, oc, monkeypatch)
+    assert res.headers["X-Pass"] == "true"
+    assert res.headers["X-Errors"] == "0"
+    assert res.headers["X-Score"] == "50"
+    # and the finding is gone from what the team reads, not just from the count
+    assert res.json()["issue"] == []
+
+
+def test_stored_counts_match_the_findings_that_are_shown(client, monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    oc = {"resourceType": "OperationOutcome", "issue": [
+        issue("A definition for CodeSystem 'http://loinc.org' could not be "
+              "found, so the code cannot be validated", msg_id="UNKNOWN_CODESYSTEM"),
+        issue("Best Practice Recommendation: In general, all observations "
+              "should have a performer"),
+    ]}
+    token = register(client, "Counted Warnings AB")
+    res = submit(client, token, oc, monkeypatch)
+    assert len(res.json()["issue"]) == 1
+    slug = client.get("/api/leaderboard").json()
+    row = [r for r in slug if r["team"] == "Counted Warnings AB"][0]
+    history = client.get("/api/submissions?team=%s" % row["team_slug"]).json()
+    assert history[0]["warnings"] == 1
 
 
