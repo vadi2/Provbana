@@ -2474,8 +2474,15 @@ h2 { margin: 0 0 14px; font-size: var(--fs-large); }
   background: var(--card); border: 1px solid var(--border);
   border-radius: var(--r-card); padding: 26px 28px; margin-top: 22px;
 }
-.grid { display: grid; grid-template-columns: 1fr 1.4fr; gap: 20px; }
-@media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+/* Register above Submit rather than beside it: the submit card carries the
+   bundle textarea, the findings table and the embedded document, and every one
+   of them reads better with the page's full width. The cards space themselves,
+   so this only has to stop them sharing a row. */
+.submit-stack { display: block; }
+/* Their card spans the page now, but a company name, a token and a
+   registration code are still short single values - left at 100% they would
+   stretch a 16-character field across a metre of screen. */
+#register-card .row, #reg-code-row, #token-box, #token { max-width: 520px; }
 label { display: block; font-size: 0.83rem; color: var(--muted); margin: 12px 0 4px; }
 input[type=text], textarea {
   width: 100%; padding: 12px; border: 1px solid var(--field-border);
@@ -2539,6 +2546,8 @@ tr.rank-3 td:first-child { box-shadow: inset 3px 0 0 var(--bronze); color: var(-
 .banner.fail { display: block; color: var(--fail); background: var(--fail-bg);
   border: 1px solid var(--fail); }
 .banner .score { float: right; }
+/* The banner carries its scoring breakdown as a title, so say so. */
+.banner[title] { cursor: help; }
 .spinner { display: none; align-items: center; gap: 10px; margin-top: 14px;
   color: var(--muted); }
 .spinner.on { display: flex; }
@@ -2903,8 +2912,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <div id="tab-submit" class="tab-panel">
 
-<div class="grid">
-  <section class="card">
+<div class="submit-stack">
+  <section class="card" id="register-card">
     <h2>Register your company</h2>
     <p class="muted" style="margin:0 0 4px">One registration per company -
     share the token with your colleagues.</p>
@@ -3031,6 +3040,10 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <details class="card">
   <summary>Or use the API</summary>
+  <p class="muted">Every endpoint is described in the
+  <a href="/openapi.json" target="_blank" rel="noopener">OpenAPI spec</a>, which
+  you can also browse and call from
+  <a href="/docs" target="_blank" rel="noopener">the interactive docs</a>.</p>
   <p class="muted">Fetch a company's exchange document:</p>
   <pre class="curl" id="curl-exchange"></pre>
 </details>
@@ -3148,7 +3161,7 @@ function applyRoute(scroll) {
   showTab(tab);
   if (tab !== "clinical") return;
   if (!parts[1]) {
-    go("clinical/sample/" + DEFAULT_SAMPLE + "/" + cvMode, true);
+    go("clinical/sample/" + DEFAULT_SAMPLE + "/" + CV_DEFAULT, true);
     return;
   }
   if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode = parts[3];
@@ -3236,8 +3249,19 @@ const SEV_ORDER = { fatal: 0, error: 1, warning: 2, information: 3 };
 
 function cleanMessage(text) {
   // "... required, but not found (from http://hl7.eu/.../bundle-eu-eps|1.0.0-ballot)"
-  const m = text.match(/\s*\(from ([^)\s]+)\)\s*$/);
-  if (m) return { msg: text.slice(0, m.index).trim(), profile: m[1] };
+  //
+  // Not anchored to the end: the validator puts the profile last on a
+  // cardinality message but mid-sentence on a slicing one, which continues
+  // ". Note that other slices are allowed ...". Anchoring left every slicing
+  // message with a raw URL inline and no profile chip - and, because the
+  // dedupe key below is the cleaned message, kept the EPS and IPS copies of
+  // one finding apart as two rows. So splice the parenthetical out wherever
+  // it sits and keep whatever follows it.
+  const m = text.match(/\s*\(from ([^)\s]+)\)/);
+  if (m) {
+    return { msg: (text.slice(0, m.index) + text.slice(m.index + m[0].length)).trim(),
+             profile: m[1] };
+  }
   return { msg: text, profile: null };
 }
 
@@ -3839,12 +3863,14 @@ $("#submit-btn").addEventListener("click", async () => {
     const resources = parseInt(res.headers.get("X-Resources") || "0", 10);
     const banner = $("#banner");
     banner.className = "banner " + (pass ? "pass" : "fail");
-    let text;
+    /* Verdict and number on the banner, arithmetic on hover: the score is
+       already spelled out in the badge, and how it was reached only matters
+       when it is not the number the team expected. */
+    let text, why;
     if (pass) {
-      const resPts = Math.min(60, resources * 2);
-      const secPts = Math.min(160, sections * 10);
-      const base = 50 + secPts + resPts;
-      text = "✔ VALID - 50 + " + sections + " distinct section"
+      const base = 50 + Math.min(160, sections * 10) + Math.min(60, resources * 2);
+      text = "✔ VALID";
+      why = "50 valid + " + sections + " distinct section"
         + (sections === 1 ? "" : "s") + " ×10"
         + (sections * 10 > 160 ? " (capped at +160)" : "")
         + " + " + resources + " resource" + (resources === 1 ? "" : "s") + " ×2"
@@ -3852,9 +3878,11 @@ $("#submit-btn").addEventListener("click", async () => {
         + (score > base ? " + 20 first pass" : "")
         + " = " + score;
     } else {
-      text = "✖ INVALID - 0 pts - fix the " + errors + " error"
+      text = "✖ INVALID - fix the " + errors + " error"
         + (errors === 1 ? "" : "s") + " below first";
+      why = "Any error or fatal issue scores 0, whatever else the bundle carries.";
     }
+    banner.title = why;
     banner.innerHTML = esc(text) + '<span class="score">' + score + " pts</span>";
     renderIssues(outcome.issue || [], body);
     refreshLeaderboard();
@@ -3885,7 +3913,12 @@ $("#curl-leaderboard").textContent =
 let cvSubsByTeam = new Map();  // slug -> that company's submissions, fetched when picked
 let cvSamples = [];
 let cvCurrent = null;
-let cvMode = "document";
+/* Which view the open document is in. It follows the route rather than
+   persisting as a preference: opening a document starts in CV_DEFAULT, so
+   picking one summary apart in the dashboard does not decide how the next
+   one opens. A /dashboard or /timeline URL still opens in that view. */
+const CV_DEFAULT = "document";
+let cvMode = CV_DEFAULT;
 let cvDisclaimer = "";
 /* The worked examples are one more entry in the company picker rather than a
    list of their own, so there is a single place to open a document from. */
@@ -4064,7 +4097,7 @@ $("#cv-list").addEventListener("click", (ev) => {
   if (!row) return;
   go("clinical/" + (row.dataset.sample ? "sample/" + row.dataset.sample
                                        : "submission/" + row.dataset.id)
-     + "/" + cvMode);
+     + "/" + CV_DEFAULT);
 });
 
 /* Refetching on a view switch would be a round trip to redraw data already in

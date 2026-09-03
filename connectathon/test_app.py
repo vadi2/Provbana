@@ -905,8 +905,12 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     for leftover in ("cmpCol", "cmp-grid", "cmp-col", "cmp-wide",
                      'data-mode="compare"'):
         assert leftover not in text
-    # the plain document rendering is what opens by default
-    assert 'let cvMode = "document";' in text
+    # the plain document rendering is what opens by default, and it is the
+    # default every time: opening a document goes to CV_DEFAULT rather than to
+    # whichever view the last one was left in
+    assert 'const CV_DEFAULT = "document";' in text
+    assert "let cvMode = CV_DEFAULT;" in text
+    assert '+ "/" + CV_DEFAULT);' in text
     # the switcher is rebuilt with each document rather than parked in the
     # picker card, so it has to come from the render path
     assert "function cvModesHtml(" in text
