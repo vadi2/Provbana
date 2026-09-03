@@ -225,6 +225,44 @@ is the whole procedure.
 | `--data-dir` | `$DATA_DIR`, else `data/` beside `app.py` | Which data directory to snapshot or restore into |
 | `--backup-dir` | `$BACKUP_DIR`, else `backups/` beside `app.py` | Where snapshots live |
 
+## Practice resets
+
+The service goes up months before the event so teams can shake their bundles out
+against the real validator. `reset.py` empties the leaderboard daily so that a trial
+run in September is not still leading in November, and the page says so next to the
+Leaderboard heading while it is happening.
+
+`PRACTICE_ENDS` is the whole configuration - one UTC timestamp that sets both the daily
+wipe time and the last day one runs. The wipe landing exactly on it is the final one:
+
+```
+PRACTICE_ENDS=2026-11-18T03:00:00Z    # 03:00 UTC daily, last wipe the morning of the 18th
+```
+
+After that instant the daemon idles for good and the page stops advertising practice
+mode, both without anyone doing anything. That is the point: the one process able to
+empty the leaderboard must be unable to do it during the event, whether or not the
+container gets turned off. Leave `PRACTICE_ENDS` unset and nothing is ever scheduled.
+
+```
+python reset.py --status     # what is scheduled, and when it stops
+python reset.py --loop       # daily until PRACTICE_ENDS, then idle (how it runs in compose)
+python reset.py --yes        # wipe once, now
+```
+
+A wipe clears the `teams`, `submissions` and `renderings` tables and the per-team
+directories beside them, in that order, inside one transaction. It leaves the database,
+the schema and the trees in place, so it runs against a live service - unlike
+`seed_demo.py --reset`, which deletes the data directory wholesale and needs the service
+stopped. Backups are not touched; `backup.py`'s own pruning ages them out.
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--loop` | off | Wipe daily until `PRACTICE_ENDS`, then idle |
+| `--status` | | Print the schedule and the next wipe |
+| `--yes` | off | Required to wipe once, now; without it nothing is touched |
+| `--data-dir` | `$DATA_DIR`, else `data/` beside `app.py` | Which data directory to clear |
+
 ## Scoring
 
 Any error or fatal validation issue scores the submission **0**. A valid bundle earns
@@ -400,8 +438,13 @@ curl localhost:8095/api/samples/andrea-cross-border/bundle -o example-eps.json
 ```
 curl localhost:8095/api/health
 # {"status":"ok","matchbox":"up","missing_igs":[],"max_body_bytes":5242880,
-#  "max_image_bytes":2097152,"max_note_chars":2000,"register_code_required":false}
+#  "max_image_bytes":2097152,"max_note_chars":2000,"register_code_required":false,
+#  "practice_ends":null}
 ```
 
 `matchbox` is `up`, `degraded` (reachable, but a package named in `VALIDATION_IGS` is
 not loaded - see the restart note under Run) or `down`.
+
+`practice_ends` is `PRACTICE_ENDS` or `null`. The page compares it against the browser's
+own clock rather than being handed a yes/no, so the practice notice clears itself at the
+final wipe even on a tab nobody has reloaded since the night before.

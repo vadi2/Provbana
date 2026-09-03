@@ -9,6 +9,7 @@ resource (capped at +60). Team score = max submission score (+20 one-time
 first pass for the first team ever to go valid).
 """
 
+import datetime
 import io
 import http.client
 import json
@@ -28,6 +29,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import backup
+import reset
 
 
 def bundle(sections=0, resources=0, empty_sections=0):
@@ -2784,3 +2786,119 @@ def test_stored_counts_match_the_findings_that_are_shown(client, monkeypatch):
     assert history[0]["warnings"] == 1
 
 
+# ------------------------------------------------------- practice-mode resets
+
+def practice_data_dir(path):
+    """The shape reset.py clears: the three result tables, plus a per-team
+    directory in each of the write-once trees."""
+    os.makedirs(path, exist_ok=True)
+    conn = sqlite3.connect(os.path.join(path, reset.DB_NAME))
+    conn.execute("CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.execute("CREATE TABLE submissions (id INTEGER PRIMARY KEY, team INTEGER)")
+    conn.execute("CREATE TABLE renderings (id INTEGER PRIMARY KEY, sub INTEGER)")
+    conn.execute("INSERT INTO teams (name) VALUES ('acme')")
+    conn.executemany("INSERT INTO submissions (team) VALUES (?)", [(1,), (1,)])
+    conn.execute("INSERT INTO renderings (sub) VALUES (1)")
+    conn.commit()
+    conn.close()
+    for rel in ("submissions/acme/1.json", "renderings/acme/shot.png"):
+        full = os.path.join(path, rel)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "wb") as fh:
+            fh.write(b"x" * 32)
+    return path
+
+
+def test_reset_clears_every_table_and_both_trees(tmp_path):
+    data = practice_data_dir(str(tmp_path / "data"))
+    removed = reset.clear(data)
+    assert removed == {"renderings": 1, "submissions": 2, "teams": 1}
+    conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
+    for table in reset.TABLES:
+        assert conn.execute("SELECT count(*) FROM %s" % table).fetchone()[0] == 0
+    conn.close()
+    # The trees survive - app.py creates them at boot and expects them there -
+    # but nothing of the teams' is left inside them.
+    for tree in reset.TREES:
+        assert os.path.isdir(os.path.join(data, tree))
+        assert os.listdir(os.path.join(data, tree)) == []
+
+
+def test_reset_on_an_untouched_data_dir_is_not_an_error(tmp_path):
+    """The reset container can win the race to a fresh volume."""
+    data = str(tmp_path / "data")
+    os.makedirs(data)
+    assert reset.clear(data) == {}
+
+
+def test_reset_leaves_the_database_usable(tmp_path):
+    """It empties the tables rather than dropping them: the service is running
+    and holds this file open."""
+    data = practice_data_dir(str(tmp_path / "data"))
+    reset.clear(data)
+    conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
+    conn.execute("INSERT INTO teams (name) VALUES ('after')")
+    conn.commit()
+    assert conn.execute("SELECT name FROM teams").fetchall() == [("after",)]
+    conn.close()
+
+
+def test_practice_ends_parses_utc_forms():
+    stamp = datetime.datetime(2026, 11, 18, 3, 0, tzinfo=datetime.timezone.utc)
+    assert reset.practice_ends("2026-11-18T03:00:00Z") == stamp
+    assert reset.practice_ends("2026-11-18T03:00:00+00:00") == stamp
+    # Naive is read as UTC, not as the box's local time.
+    assert reset.practice_ends("2026-11-18T03:00:00") == stamp
+    # An offset is honoured rather than ignored.
+    assert reset.practice_ends("2026-11-18T04:00:00+01:00") == stamp
+
+
+def test_practice_ends_unset_means_no_practice_period():
+    assert reset.practice_ends("") is None
+    assert reset.practice_ends("   ") is None
+
+
+def test_practice_ends_rejects_nonsense():
+    with pytest.raises(ValueError):
+        reset.practice_ends("next tuesday")
+
+
+def test_wipe_scheduled_on_practice_ends_still_runs():
+    """The boundary the whole design turns on: the slot landing exactly on
+    PRACTICE_ENDS is the last wipe, and it happens."""
+    ends = datetime.datetime(2026, 11, 18, 3, 0, tzinfo=datetime.timezone.utc)
+    day_before = datetime.datetime(2026, 11, 17, 12, 0, tzinfo=datetime.timezone.utc)
+    assert reset.next_run(day_before, ends) == ends
+    # Woken late for that slot, it is still the slot that is due.
+    late = ends + datetime.timedelta(seconds=30)
+    assert reset.next_run(late, ends) is None
+
+
+def test_no_wipe_is_ever_scheduled_during_the_event():
+    """A forgotten container must not empty the board mid-event."""
+    ends = datetime.datetime(2026, 11, 18, 3, 0, tzinfo=datetime.timezone.utc)
+    for day in (18, 19, 20):
+        during = datetime.datetime(2026, 11, day, 10, 0,
+                                   tzinfo=datetime.timezone.utc)
+        assert reset.next_run(during, ends) is None
+
+
+def test_wipes_repeat_daily_at_the_practice_ends_time_of_day():
+    ends = datetime.datetime(2026, 11, 18, 3, 0, tzinfo=datetime.timezone.utc)
+    now = datetime.datetime(2026, 9, 3, 9, 30, tzinfo=datetime.timezone.utc)
+    first = reset.next_run(now, ends)
+    # Past today's 03:00, so the next one is tomorrow's.
+    assert first == datetime.datetime(2026, 9, 4, 3, 0,
+                                      tzinfo=datetime.timezone.utc)
+    second = reset.next_run(first + datetime.timedelta(seconds=1), ends)
+    assert second == first + datetime.timedelta(days=1)
+
+
+def test_health_advertises_the_practice_period(client, monkeypatch):
+    monkeypatch.setattr(app_module, "PRACTICE_ENDS", "2026-11-18T03:00:00Z")
+    assert client.get("/api/health").json()["practice_ends"] == "2026-11-18T03:00:00Z"
+
+
+def test_health_reports_no_practice_period_when_unset(client, monkeypatch):
+    monkeypatch.setattr(app_module, "PRACTICE_ENDS", "")
+    assert client.get("/api/health").json()["practice_ends"] is None

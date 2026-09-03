@@ -76,6 +76,14 @@ FIRST_PASS_BONUS = 20  # one-time, to the first company that submits a valid bun
 # endpoint stays open, which is what you want on a closed event network.
 REGISTER_CODE = os.environ.get("REGISTER_CODE", "")
 
+# While the service is up for practice ahead of the event, reset.py empties the
+# leaderboard daily and this is when that stops - see its docstring, which owns
+# the semantics. The page reads it to say so, and stops saying so by itself at
+# the instant of the final wipe. Held as a string: the value is handed to the
+# browser, which does the comparing, and parsing it here would only mean
+# re-serialising it. Unset means no practice period and no notice.
+PRACTICE_ENDS = os.environ.get("PRACTICE_ENDS", "").strip()
+
 
 class MatchboxError(Exception):
     """Matchbox unreachable, timed out, or returned garbage."""
@@ -2313,6 +2321,10 @@ def health() -> dict:
         "max_image_bytes": MAX_IMAGE_BYTES,
         "max_note_chars": MAX_NOTE_CHARS,
         "register_code_required": bool(REGISTER_CODE),
+        # Null outside the practice period. The browser compares it against its
+        # own clock rather than being told a yes/no here, so the notice clears
+        # itself on a page nobody has reloaded since before the final wipe.
+        "practice_ends": PRACTICE_ENDS or None,
     }
 
 
@@ -2474,6 +2486,15 @@ h1 { margin: clamp(28px, 5vw, 56px) 0 0; font-size: var(--fs-xx-large); }
 .spec-link { flex: none; font-size: var(--fs-medium); color: var(--muted); }
 .spec-link:hover { color: var(--accent); }
 h2 { margin: 0 0 14px; font-size: var(--fs-large); }
+/* Same shape as .sub-row: a heading with a quiet aside pushed to the far end,
+   sharing its baseline and wrapping under it when the card gets narrow. The
+   14px belongs to the row here, so the heading inside it gives up its margin
+   rather than adding a second gap below the aside. */
+.card-head { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 4px 24px; flex-wrap: wrap; margin: 0 0 14px; }
+.card-head h2 { margin: 0; }
+.practice-note { flex: none; margin: 0; font-size: var(--fs-medium);
+  color: var(--muted); }
 /* Explanatory prose gets the site's reading column; the tables and forms
    beside it keep the full width of the card. */
 .card > p.muted { max-width: var(--measure); }
@@ -2887,7 +2908,10 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 <div id="tab-leaderboard" class="tab-panel active">
 
 <section class="card">
-  <h2>Leaderboard<span class="live-dot" title="auto-refreshes every 5s"></span></h2>
+  <div class="card-head">
+    <h2>Leaderboard<span class="live-dot" title="auto-refreshes every 5s"></span></h2>
+    <p class="practice-note" id="practice-note" hidden></p>
+  </div>
   <div class="table-wrap">
   <table id="lb">
     <thead><tr>
@@ -3078,8 +3102,26 @@ const fmtWhen = (ts) => new Date(ts).toLocaleString([],
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+/* ---- practice period ---- */
+/* Before the event the board is wiped daily, so say so - a score that will not
+   survive the night should not look like a standing. Set from /api/health once
+   on load and re-checked on every leaderboard tick, which is what lets the
+   notice clear itself at the final wipe on a page left open overnight. */
+let practiceEnds = null;
+function updatePracticeNote() {
+  const note = $("#practice-note");
+  const active = practiceEnds !== null && Date.now() < practiceEnds;
+  if (active) {
+    note.textContent = "Practice mode - resets daily until "
+      + new Date(practiceEnds).toLocaleDateString([],
+          { day: "numeric", month: "short" });
+  }
+  note.hidden = !active;
+}
+
 /* ---- leaderboard ---- */
 async function refreshLeaderboard() {
+  updatePracticeNote();
   try {
     const res = await fetch("/api/leaderboard");
     if (!res.ok) return;
@@ -3795,6 +3837,11 @@ async function checkValidator() {
     if (h.max_body_bytes) maxBundleBytes = h.max_body_bytes;
     if (h.max_note_chars) maxNote = h.max_note_chars;
     if (h.register_code_required) $("#reg-code-row").hidden = false;
+    /* NaN if the server sends something unparseable, and NaN fails the
+       comparison in updatePracticeNote, so a bad value hides the notice
+       rather than showing "Invalid Date". */
+    practiceEnds = h.practice_ends ? Date.parse(h.practice_ends) : null;
+    updatePracticeNote();
     note.textContent = h.matchbox === "up" ? ""
       : h.matchbox === "degraded"
         ? "The validator is up but has not loaded " + (h.missing_igs || []).join(", ")

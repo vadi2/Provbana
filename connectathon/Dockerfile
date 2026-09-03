@@ -14,6 +14,8 @@ COPY app.py .
 # opens the SQLite database directly, so it has to be beside it. Stdlib only,
 # so it adds nothing to requirements.txt.
 COPY backup.py .
+# Likewise the practice-period reset daemon, which opens the same database.
+COPY reset.py .
 # Only the bundles: generate.py is the authoring tool, not part of the service.
 COPY samples/*.json ./samples/
 

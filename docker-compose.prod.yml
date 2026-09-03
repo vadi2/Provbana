@@ -56,6 +56,9 @@ services:
       # is public from the day it goes up, so set this in .env before the event
       # and hand the code to the teams.
       REGISTER_CODE: ${REGISTER_CODE:-}
+      # Only so the page can say the board is being wiped. The wiping itself is
+      # the reset service's job; this container never deletes anything.
+      PRACTICE_ENDS: ${PRACTICE_ENDS:-}
     volumes:
       - state:/srv
     depends_on:
@@ -75,6 +78,23 @@ services:
       # survive that. Same filesystem is also what keeps link_tree() on its
       # hard-link path instead of falling back to copying every submission.
       BACKUP_DIR: /srv/backups
+    volumes:
+      - state:/srv
+    depends_on:
+      - app
+
+  reset:
+    # Same image again, for the same reason as backup: it opens the database
+    # directly. Empties the leaderboard daily while the service is open for
+    # practice, and stops for good at PRACTICE_ENDS - reset.py's docstring has
+    # the semantics. Unset PRACTICE_ENDS and this container idles, which is the
+    # right state for an event that has started.
+    build: ./connectathon
+    restart: unless-stopped
+    command: ["python", "reset.py", "--loop"]
+    environment:
+      DATA_DIR: /srv/data
+      PRACTICE_ENDS: ${PRACTICE_ENDS:-}
     volumes:
       - state:/srv
     depends_on:
