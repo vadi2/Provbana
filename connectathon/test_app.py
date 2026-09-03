@@ -980,6 +980,23 @@ def test_index_does_not_claim_terminology_is_validated(client):
     assert "that require a license (such as\n  SNOMED CT, LOINC, WHO ATC) are not checked" in text
 
 
+def test_index_offers_to_explain_the_errors_with_an_assistant(client):
+    """One action above the findings sends every error at once to whichever
+    assistant the team already uses. They are the participant's own links,
+    followed by their own browser: nothing goes through this service."""
+    text = client.get("/").text
+    assert 'id="explain-btn"' in text
+    for name in ("ChatGPT", "Claude", "Gemini", "Le Chat"):
+        assert 'name: "%s"' % name in text
+    # three take the question in the URL; Gemini opens blank and is told so
+    assert 'prefill: "https://chatgpt.com/?q="' in text
+    assert 'prefill: "https://claude.ai/new?q="' in text
+    assert 'prefill: "https://chat.mistral.ai/chat?q="' in text
+    assert 'prefill: null, open: "https://gemini.google.com/app"' in text
+    assert '"paste it"' in text
+    # a plain-http venue box has no clipboard API: the prompt is shown instead
+    assert 'id="explain-text"' in text
+
 
 # ------------------------------------------------------------- sample documents
 
@@ -2199,6 +2216,12 @@ console.log(JSON.stringify(cases.map(([expr, msg]) => {
 """
 
 
+def page_script(client):
+    """The page's own script, as served - what participants actually run."""
+    blocks = re.findall(r"<script>\n(.*?)\n</script>", client.get("/").text, re.S)
+    return max(blocks, key=len)
+
+
 def run_locator(client, doc, cases):
     """Resolve validator locations with the page's own code, in node.
 
@@ -2206,8 +2229,7 @@ def run_locator(client, doc, cases):
     point: what is tested is the locator participants actually run.
     Returns one [json path, line number, line text, readable label] per case.
     """
-    blocks = re.findall(r"<script>\n(.*?)\n</script>", client.get("/").text, re.S)
-    js = max(blocks, key=len)
+    js = page_script(client)
     parts = []
     for name in LOCATOR_FUNCS:
         start = js.index("function %s(" % name)
@@ -2291,6 +2313,91 @@ def test_a_location_for_something_missing_lands_on_the_nearest_real_element(clie
     ]
     assert got[1][2].strip().startswith('"section": [')
     assert [got[0][3], got[1][3]] == ["Bundle \u00b7 entry", "Composition #0 \u00b7 section"]
+
+
+EXPLAIN_HARNESS = r"""
+const [groups, severity, reported] = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const prompt = explainPrompt(groups, severity, reported);
+console.log(JSON.stringify({ prompt,
+  urls: Object.fromEntries(EXPLAIN_PROVIDERS.map((p) => [p.id, explainUrl(p, prompt)])) }));
+"""
+
+
+def run_explain(client, groups, severity, reported):
+    """Build the explain-with-an-assistant prompt with the page's own code."""
+    js = page_script(client)
+    parts = []
+    for name in ("EXPLAIN_GUIDE", "EXPLAIN_PROVIDERS"):
+        start = js.index("const %s = " % name)
+        parts.append(js[start:js.index(";\n", start) + 2])
+    for name in ("explainPrompt", "explainUrl"):
+        start = js.index("function %s(" % name)
+        parts.append(js[start:js.index("\n}", start) + 2])
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + EXPLAIN_HARNESS],
+                          input=json.dumps([groups, severity, reported]),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+EXPLAIN_GROUPS = [
+    {"severity": "error", "exprShort": "Bundle.entry[0].resource",
+     "where": "Composition #0 \u00b7 section",
+     "message": "Slice 'Composition.section:sectionAllergies': a matching slice is "
+                "required, but not found",
+     "profiles": ["http://hl7.eu/fhir/eps/StructureDefinition/composition-eu-eps|1.0.0-ballot",
+                  "http://hl7.org/fhir/uv/ips/StructureDefinition/Composition-uv-ips|2.0.0"]},
+    {"severity": "error", "exprShort": "Bundle.entry[1].resource", "where": "Patient #1",
+     "message": "Patient.name: minimum required = 1, but only found 0", "profiles": []},
+]
+
+
+@needs_node
+def test_the_explain_prompt_carries_every_error_with_its_location_and_profiles(client):
+    """The assistant gets what the table shows: each distinct finding, where it
+    is, and which profiles raised it - never the bundle. The banner counted the
+    validator's repeats, the table merged them, and the prompt says so rather
+    than leaving the assistant to wonder where the other two went."""
+    got = run_explain(client, EXPLAIN_GROUPS, "error", 4)
+    prompt = got["prompt"]
+    assert prompt.startswith("I am validating a FHIR European Patient Summary bundle "
+                             "against the HL7 Europe EPS implementation guide "
+                             "(http://hl7.eu/fhir/eps/)")
+    assert "Explain what these errors mean" in prompt
+    assert "starting with whichever change clears the most of them" in prompt
+    assert "The 4 errors, merged into 2 distinct findings:\n\n1. Slice" in prompt
+    assert ("\n   location: Bundle.entry[0].resource (Composition #0 \u00b7 section)"
+            "\n   profile:  http://hl7.eu/fhir/eps/StructureDefinition/"
+            "composition-eu-eps|1.0.0-ballot, http://hl7.org/fhir/uv/ips/"
+            "StructureDefinition/Composition-uv-ips|2.0.0\n\n2. Patient.name") in prompt
+    # a finding without a profile does not get an empty profile line
+    assert prompt.endswith("2. Patient.name: minimum required = 1, but only found 0"
+                           "\n   location: Bundle.entry[1].resource (Patient #1)")
+    # three assistants get the question in the URL, and it survives the trip
+    for pid, base in (("chatgpt", "https://chatgpt.com/?q="),
+                      ("claude", "https://claude.ai/new?q="),
+                      ("mistral", "https://chat.mistral.ai/chat?q=")):
+        url = got["urls"][pid]
+        assert url.startswith(base), url
+        assert urllib.parse.unquote(url[len(base):]) == prompt
+    # Gemini's web app takes no prompt parameter, so it opens on a blank chat
+    assert got["urls"]["gemini"] == "https://gemini.google.com/app"
+
+
+@needs_node
+def test_a_single_finding_is_asked_about_in_the_singular(client):
+    """One warning is "this warning", not "these warnings" with a list of one -
+    and a bundle that passed with warnings gets the same offer as one that
+    failed with errors."""
+    got = run_explain(client, EXPLAIN_GROUPS[1:], "warning", 1)
+    prompt = got["prompt"]
+    assert "Explain what this warning means in plain terms" in prompt
+    assert "to fix it." in prompt
+    assert "\n\nThe warning:\n\nPatient.name: minimum required" in prompt
+    assert "1. " not in prompt and "merged into" not in prompt
+    # the same count on the banner and in the prompt: no "merged" note
+    got = run_explain(client, EXPLAIN_GROUPS, "error", 2)
+    assert "The 2 errors:\n\n1. " in got["prompt"]
 
 
 def test_the_submit_tab_shows_findings_inside_the_document(client):

@@ -2575,6 +2575,32 @@ input[type=file] { font-size: 0.84rem; color: var(--muted); }
 @keyframes pulse { 50% { opacity: 0.3; } }
 #issues-wrap { display: none; margin-top: 14px; }
 .issue-summary { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+/* The count chips on the left and one action for all of them on the right.
+   The table itself is what a team reads, so nothing is added to it. */
+.issue-toolbar { display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+.issue-toolbar .issue-summary { margin-bottom: 0; }
+.menu-wrap { position: relative; display: inline-block; }
+.menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0;
+  min-width: 240px; background: var(--card); border: 1px solid var(--field-border);
+  border-radius: var(--r-ctl); box-shadow: 0 2px 14px rgba(0, 0, 0, 0.22);
+  padding: 4px; }
+.menu[hidden] { display: none; }
+.menu-head { padding: 5px 9px 6px; font-size: 0.68rem; letter-spacing: 0.1em;
+  text-transform: uppercase; font-weight: 700; color: var(--muted);
+  border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+.menu a, .menu button.menu-item { display: flex; align-items: baseline;
+  justify-content: space-between; gap: 12px; width: 100%; padding: 6px 9px;
+  font: inherit; font-size: 0.82rem; font-weight: 500; color: var(--text);
+  text-decoration: none; background: transparent; border: 0; border-radius: 0;
+  text-align: left; cursor: pointer; }
+.menu a:hover, .menu button.menu-item:hover { background: var(--accent-soft);
+  color: var(--accent); }
+.menu .note { font-size: 0.68rem; font-weight: 400; color: var(--muted);
+  white-space: nowrap; }
+.menu a:hover .note, .menu button.menu-item:hover .note { color: var(--accent); }
+.explain-note { margin: -2px 0 10px; font-size: 0.8rem; }
+.explain-text { margin: 0 0 10px; font-size: 0.74rem; line-height: 1.5; }
 .issues-scroll { max-height: 50vh; overflow: auto; border: 1px solid var(--border);
   border-radius: var(--r-ctl); }
 table.issues { font-size: 0.82rem; }
@@ -2925,7 +2951,17 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <div class="error-note" id="submit-error" role="alert"></div>
     <div class="banner" id="banner" role="status"></div>
     <div id="issues-wrap">
-      <div class="issue-summary" id="issue-summary"></div>
+      <div class="issue-toolbar">
+        <div class="issue-summary" id="issue-summary"></div>
+        <span class="menu-wrap" id="explain-wrap" hidden>
+          <button type="button" class="ghost" id="explain-btn" aria-haspopup="true"
+            aria-expanded="false" aria-controls="explain-menu"></button>
+          <div class="menu" id="explain-menu" hidden></div>
+        </span>
+      </div>
+      <p class="muted explain-note" id="explain-note" role="status" hidden></p>
+      <textarea id="explain-text" class="explain-text" readonly rows="8" hidden
+        aria-label="The question to paste into an assistant"></textarea>
       <div id="issue-groups"></div>
       <details id="doc-wrap" class="issue-fold" hidden>
         <summary id="doc-summary">Embedded view</summary>
@@ -3515,10 +3551,162 @@ $("#issue-groups").addEventListener("click", (ev) => {
   if (btn) jumpToLine(Number(btn.dataset.jump));
 });
 
+/* ---- explain the findings with an assistant ----
+
+   One action for the whole verdict: every error the table shows, in one
+   prompt, opened in whichever assistant the team already uses. Sent together
+   rather than one at a time, the assistant sees the failing bundle's whole
+   story and can say which fix comes first - nine slicing errors are usually
+   one missing section.
+
+   Nothing goes through this service. These are ordinary links the
+   participant's own browser follows, under their own account, and the bundle
+   itself is not in the prompt - only the findings. A team can paste more if
+   they want to; that is their call to make. */
+const EXPLAIN_GUIDE = "http://hl7.eu/fhir/eps/";
+
+/* ChatGPT, Claude and Le Chat take the question in the URL and open with it
+   already in the composer. Gemini's web app has no such parameter, so it
+   opens on an empty chat and the prompt goes to the clipboard instead - and
+   the menu says so on the row rather than letting someone find out. */
+const EXPLAIN_PROVIDERS = [
+  { id: "chatgpt", name: "ChatGPT", prefill: "https://chatgpt.com/?q=" },
+  { id: "claude", name: "Claude", prefill: "https://claude.ai/new?q=" },
+  { id: "gemini", name: "Gemini", prefill: null, open: "https://gemini.google.com/app" },
+  { id: "mistral", name: "Le Chat", prefill: "https://chat.mistral.ai/chat?q=" },
+];
+
+/* `groups` are the table's rows: identical findings already merged, each with
+   its location and the profiles that raised it. `reported` is how many times
+   the validator said them - the number on the banner and the chip - so the
+   prompt can own the difference instead of the assistant wondering. */
+function explainPrompt(groups, severity, reported) {
+  const many = groups.length > 1;
+  const noun = severity + (many ? "s" : "");
+  const list = groups.map((g, i) =>
+    (many ? (i + 1) + ". " : "") + g.message
+    + "\n   location: " + g.exprShort + (g.where ? " (" + g.where + ")" : "")
+    + (g.profiles.length ? "\n   profile:  " + g.profiles.join(", ") : "")
+  ).join("\n\n");
+  const heading = !many ? "The " + severity
+    : reported > groups.length
+      ? "The " + reported + " " + noun + ", merged into " + groups.length
+        + " distinct findings"
+      : "The " + groups.length + " " + noun;
+  return "I am validating a FHIR European Patient Summary bundle against the HL7 "
+    + "Europe EPS implementation guide (" + EXPLAIN_GUIDE + ") with the official "
+    + "HL7 FHIR validator. Explain what " + (many ? "these " + noun + " mean"
+                                                  : "this " + noun + " means")
+    + " in plain terms and what to change in the bundle to fix "
+    + (many ? "them, starting with whichever change clears the most of them."
+            : "it.")
+    + "\n\n" + heading + ":\n\n" + list;
+}
+
+function explainUrl(provider, prompt) {
+  return provider.prefill ? provider.prefill + encodeURIComponent(prompt)
+                          : provider.open;
+}
+
+async function copyText(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch (e) { /* permission denied - the caller shows the text instead */ }
+  }
+  return false;
+}
+
+let explainPromptText = "";
+
+function closeExplainMenu() {
+  $("#explain-menu").hidden = true;
+  $("#explain-btn").setAttribute("aria-expanded", "false");
+}
+
+function paintExplain(groups, severity, reported) {
+  const wrap = $("#explain-wrap");
+  closeExplainMenu();
+  $("#explain-note").hidden = true;
+  $("#explain-text").hidden = true;
+  if (!groups.length) { wrap.hidden = true; explainPromptText = ""; return; }
+  explainPromptText = explainPrompt(groups, severity, reported);
+  $("#explain-btn").textContent = "Explain "
+    + (reported === 1 ? "the " + severity : "all " + reported + " " + severity + "s")
+    + " \u25BE";
+  $("#explain-menu").innerHTML = '<div class="menu-head">Explain with</div>'
+    + EXPLAIN_PROVIDERS.map((p) =>
+      '<a href="' + esc(explainUrl(p, explainPromptText)) + '" target="_blank"'
+      + ' rel="noopener" data-provider="' + p.id + '">' + esc(p.name)
+      + '<span class="note">' + (p.prefill ? "prefilled" : "paste it")
+      + "</span></a>").join("")
+    + '<button type="button" class="menu-item" data-copy="1">Copy the prompt'
+    + '<span class="note">any assistant</span></button>';
+  wrap.hidden = false;
+}
+
+/* Plain-http origins - which is what a LAN hackathon box is - have no
+   clipboard API. Then the prompt is shown selected, one keystroke from
+   copied, rather than promised to a clipboard it never reached. */
+function showExplainText() {
+  const text = $("#explain-text");
+  text.value = explainPromptText;
+  text.hidden = false;
+  text.focus();
+  text.select();
+}
+
+function explainNote(message) {
+  const note = $("#explain-note");
+  note.textContent = message;
+  note.hidden = false;
+}
+
+async function explainWith(provider) {
+  const copied = await copyText(explainPromptText);
+  if (provider.prefill) {
+    explainNote("Opening " + provider.name + " in a new tab with the question filled in.");
+  } else if (copied) {
+    explainNote(provider.name + " takes no prefilled question - the prompt is on your "
+      + "clipboard, paste it there.");
+  } else {
+    explainNote(provider.name + " takes no prefilled question and this page cannot "
+      + "reach your clipboard - copy the prompt below (Ctrl+C) and paste it there.");
+    showExplainText();
+  }
+}
+
+async function copyExplainPrompt() {
+  if (await copyText(explainPromptText)) {
+    explainNote("Copied - paste it into any assistant.");
+    $("#explain-text").hidden = true;
+  } else {
+    explainNote("Select the prompt below and press Ctrl+C.");
+    showExplainText();
+  }
+}
+
+$("#explain-btn").addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const menu = $("#explain-menu");
+  menu.hidden = !menu.hidden;
+  ev.currentTarget.setAttribute("aria-expanded", String(!menu.hidden));
+});
+$("#explain-menu").addEventListener("click", (ev) => {
+  /* The link itself opens the assistant; this only copies and explains.
+     Left to bubble so the document handler closes the menu. */
+  const link = ev.target.closest("a[data-provider]");
+  if (link) explainWith(EXPLAIN_PROVIDERS.find((p) => p.id === link.dataset.provider));
+  else if (ev.target.closest("[data-copy]")) copyExplainPrompt();
+});
+document.addEventListener("click", closeExplainMenu);
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape") closeExplainMenu();
+});
+
 function renderIssues(issues, bundleText) {
   const known = issues.filter((i) => i.severity in SEV_ORDER);
   const wrap = $("#issues-wrap");
-  if (!known.length) { wrap.style.display = "none"; return; }
+  if (!known.length) { wrap.style.display = "none"; paintExplain([]); return; }
 
   const counts = { fatal: 0, error: 0, warning: 0, information: 0 };
   known.forEach((i) => counts[i.severity]++);
@@ -3539,6 +3727,10 @@ function renderIssues(issues, bundleText) {
   const errG = groups.filter((g) => g.severity === "fatal" || g.severity === "error");
   const warnG = groups.filter((g) => g.severity === "warning");
   const infoG = groups.filter((g) => g.severity === "information");
+  /* Errors are what the verdict turns on, so they are what gets explained.
+     A bundle that passed with warnings gets the same offer for those. */
+  if (errG.length) paintExplain(errG, "error", errN);
+  else paintExplain(warnG, "warning", counts.warning);
 
   let html = errG.length ? issueTable(errG)
                          : '<p class="no-errors">No errors \u{1F389}</p>';

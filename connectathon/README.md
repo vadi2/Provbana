@@ -305,6 +305,20 @@ about something that is not in the document at all land on the nearest thing tha
 All of it happens in the browser, against the JSON it has just sent - nothing is
 uploaded twice and the server keeps no extra state.
 
+Above the findings, **Explain all N errors** hands every error at once to ChatGPT,
+Claude, Gemini or Le Chat, so a team that cannot parse `Slice
+'Bundle.entry:composition': a matching slice is required` can ask something that can.
+Sent together rather than one by one, the assistant sees the failing bundle's whole
+story and is asked which fix comes first - nine slicing errors are usually one missing
+section. ChatGPT, Claude and Le Chat open with the question already in the composer;
+Gemini's web app takes no prompt in its URL, so it opens on a blank chat with the
+prompt on the clipboard, and the menu says so on the row. *Copy the prompt* covers any
+other assistant, and on a plain-http venue box with no clipboard API the prompt is
+shown selected instead. These are ordinary links the participant's own browser follows
+under their own account: nothing is sent by this service, and the prompt carries the
+findings, their locations and the profiles that raised them - never the bundle. A
+bundle that passed with warnings gets the same offer for those.
+
 ```
 # submission history (all teams, or one team by its team_slug; limit 1-1000, default 100)
 curl 'localhost:8095/api/submissions?team=my-team&limit=20'
