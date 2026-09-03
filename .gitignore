@@ -5,3 +5,6 @@ connectathon/data/
 connectathon/backups/
 connectathon/data.replaced-*/
 .claude/
+
+# Production secrets - see .env.example for the template.
+.env

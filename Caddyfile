@@ -1,0 +1,46 @@
+# The only thing on the box listening to the public internet.
+#
+# Caddy terminates real Let's Encrypt TLS here, which is why the DNS record for
+# this name must be grey-cloud (DNS-only) in Cloudflare. The zone is still on
+# SSL/TLS mode "Flexible" for the GitHub Pages apex; proxying this hostname
+# through it would have Cloudflare speak plain HTTP to port 443 and loop.
+# Switch the zone to Full (strict) - or scope it with a Configuration Rule -
+# before you orange-cloud this record.
+
+# No global options block on purpose. An `email {$ACME_EMAIL:}` directive here
+# expands to zero arguments when the variable is unset and Caddy refuses the
+# whole config with "wrong argument count", crash-looping on boot - so the
+# optional-email convenience costs you the entire front door. ACME issues
+# certificates perfectly well without an address; if you want Let's Encrypt's
+# expiry warnings, hardcode a real one:
+#
+#   {
+#   	email you@example.com
+#   }
+
+{$SITE_ADDRESS:hackathon2026.vadimperetok.in} {
+	# A backstop, not the real limit: app.py enforces MAX_BODY_BYTES (5 MB for
+	# a bundle) and MAX_IMAGE_BYTES (2 MB) itself and returns a message that
+	# says which. This just stops something absurd streaming into Python.
+	request_body {
+		max_size 8MB
+	}
+
+	# No `encode` on purpose. The service runs GZipMiddleware, so responses
+	# arrive already compressed and Caddy would only skip them again.
+	reverse_proxy app:8095 {
+		# The service reads these for nothing today, but a request that has
+		# been through a proxy should say so.
+		header_up X-Real-IP {remote_host}
+	}
+
+	# Subdomain-scoped, no includeSubDomains and no preload: this must not be
+	# able to pin anything onto vadimperetok.in itself.
+	header Strict-Transport-Security "max-age=31536000"
+
+	# To `docker compose -f docker-compose.prod.yml logs caddy`.
+	log {
+		output stdout
+		format console
+	}
+}

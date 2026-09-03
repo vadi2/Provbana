@@ -1,0 +1,105 @@
+# The event stack, as it runs on the VPS behind hackathon2026.vadimperetok.in.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Differs from itb/docker-compose.yml in three ways that matter:
+#
+#   * Nothing but Caddy publishes a port. Matchbox (8080) and the service
+#     (8095) are reachable only on the compose network, so the Hetzner Cloud
+#     Firewall in front of the box only ever has to allow 22, 80 and 443.
+#   * The JVM heap is capped. The matchbox image hardcodes -Xmx12g in its CMD;
+#     _JAVA_OPTIONS overrides that without having to restate the whole java
+#     command, and mem_limit stops a runaway JVM taking the box down with it.
+#   * State lives in one named volume, not the checkout.
+#
+# itb/docker-compose.yml stays as it is - it is the local development
+# validator, and its project name pins the itb_default network that
+# connectathon/README.md's `docker run` line joins.
+
+name: hackathon2026
+
+services:
+  matchbox:
+    # Pinned to the same tag as the dev compose file: a validator that changes
+    # under the participants mid-event changes the scores.
+    image: europe-west6-docker.pkg.dev/ahdis-ch/ahdis/matchbox:v4.1.14
+    restart: unless-stopped
+    volumes:
+      # Read-only here: on the event box the package list is changed by editing
+      # the file and recreating the container, never by the container itself.
+      - ./matchbox/config:/config:ro
+    environment:
+      # Read once at boot, like application.yaml. Bump both numbers together -
+      # the limit needs headroom over the heap for JVM metaspace, code cache
+      # and thread stacks, or the kernel OOM-kills the validator instead of
+      # the JVM throwing an OutOfMemoryError you can see in the log.
+      _JAVA_OPTIONS: -Xmx${MATCHBOX_HEAP:-8g}
+      # Matchbox ships with OpenTelemetry export on and nothing listening, so
+      # the log fills with "Failed to export" noise.
+      OTEL_TRACES_EXPORTER: none
+      OTEL_METRICS_EXPORTER: none
+      OTEL_LOGS_EXPORTER: none
+    mem_limit: ${MATCHBOX_MEM_LIMIT:-10g}
+    # No ports: reached as http://matchbox:8080/matchboxv3/fhir from the app.
+
+  app:
+    build: ./connectathon
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /srv/data
+      MATCHBOX_URL: http://matchbox:8080/matchboxv3/fhir
+      # Loading the IGs takes a minute or two from cold, and every submission
+      # in that window would otherwise score 0 against a validator that is
+      # merely still booting. Raise if a validation on this box measures close.
+      MATCHBOX_TIMEOUT: ${MATCHBOX_TIMEOUT:-60}
+      # Unset leaves registration open to anyone who can reach the URL. The box
+      # is public from the day it goes up, so set this in .env before the event
+      # and hand the code to the teams.
+      REGISTER_CODE: ${REGISTER_CODE:-}
+    volumes:
+      - state:/srv
+    depends_on:
+      - matchbox
+    # No ports: Caddy is the only front door.
+
+  backup:
+    # Same image as the service - backup.py opens the database directly, so it
+    # has to see the same bytes on the same filesystem, not an HTTP endpoint.
+    build: ./connectathon
+    restart: unless-stopped
+    command: ["python", "backup.py", "--loop"]
+    environment:
+      DATA_DIR: /srv/data
+      # Beside the data directory inside the one volume, never inside it: a
+      # restore moves the data directory wholesale and the backups have to
+      # survive that. Same filesystem is also what keeps link_tree() on its
+      # hard-link path instead of falling back to copying every submission.
+      BACKUP_DIR: /srv/backups
+    volumes:
+      - state:/srv
+    depends_on:
+      - app
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # The certificate and its account key. Losing this volume means
+      # re-issuing from Let's Encrypt, which is rate-limited - keep it.
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-hackathon2026.vadimperetok.in}
+    depends_on:
+      - app
+
+volumes:
+  # One volume, holding data/ and backups/ side by side. Both the hard-linking
+  # and the restore rename depend on them sharing a filesystem.
+  state:
+  caddy_data:
+  caddy_config:

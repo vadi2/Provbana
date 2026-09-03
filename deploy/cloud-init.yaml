@@ -1,0 +1,55 @@
+#cloud-config
+# Bootstrap for the hackathon2026 VPS. Passed to `hcloud server create
+# --user-data-from-file deploy/cloud-init.yaml`, so it runs once, at first boot.
+#
+# It does not deploy the app - it only makes the box ready to receive it. The
+# deploy itself is deploy/provision.sh, which runs from your laptop over SSH.
+
+# Ubuntu's cloud image ships an older docker; the app is built on the box, so
+# it needs buildx and the compose v2 plugin from Docker's own repository.
+package_update: true
+package_upgrade: true
+
+users:
+  - name: vadi
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP2h5RuUaLVYe29pB9wzrLCY9mBjzn0CkBJqVax5ywh+ hackathon2026.vadimperetok.in (eps-hackathon deploy)
+
+# Keys only, everywhere. Hetzner injects the same key for root, which stays as
+# break-glass access if the vadi account's sudo ever breaks.
+ssh_pwauth: false
+
+write_files:
+  - path: /etc/ssh/sshd_config.d/99-hardening.conf
+    permissions: "0644"
+    content: |
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      PermitRootLogin prohibit-password
+
+  # Security updates only, and never a reboot on its own - a box that reboots
+  # itself on day two of the event is worse than one running a stale package.
+  # Turn the whole thing off for the event window:
+  #   sudo systemctl disable --now unattended-upgrades
+  - path: /etc/apt/apt.conf.d/52unattended-upgrades-local
+    permissions: "0644"
+    content: |
+      Unattended-Upgrade::Automatic-Reboot "false";
+
+runcmd:
+  # Docker CE from Docker's apt repository, verified by their signing key.
+  - install -m 0755 -d /etc/apt/keyrings
+  - curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+  - chmod a+r /etc/apt/keyrings/docker.asc
+  # arch and codename resolved on the box, not hardcoded: the CX line is out of
+  # stock, so this may well be an arm64 CAX server.
+  - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin unattended-upgrades
+  - usermod -aG docker vadi
+  - systemctl enable --now docker
+  - systemctl restart ssh
+  # A marker provision.sh waits on, so a deploy cannot race the bootstrap.
+  - touch /var/lib/cloud/hackathon2026-ready
