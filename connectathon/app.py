@@ -2444,21 +2444,20 @@ header { max-width: 1060px; margin: 0 auto; padding: 20px var(--pad-x) 6px; }
 .site-title { margin: 0; font-size: var(--fs-medium); font-weight: 700; }
 .site-title a { color: var(--text); text-decoration: none; }
 .head-nav { display: flex; align-items: center; gap: 10px 22px; flex-wrap: wrap; }
-.theme-toggle { display: flex; flex: none;
-  border: 1px solid var(--field-border); border-radius: var(--r-ctl);
-  overflow: hidden; }
-.th-btn { font: inherit; display: grid; place-items: center;
+/* One button, not three: it shows the mode currently in force and cycles
+   system -> light -> dark on click. All three icons ship in the markup and the
+   inactive two are `hidden`, so switching costs no request and no repaint of
+   anything but this button. */
+.theme-toggle { font: inherit; display: grid; place-items: center; flex: none;
   background: transparent; color: var(--muted);
-  border: none; border-left: 1px solid var(--field-border); border-radius: 0;
+  border: 1px solid var(--field-border); border-radius: var(--r-ctl);
   padding: 6px 10px; cursor: pointer; }
-/* Icons carry no text, so they inherit the button's colour in every state -
-   hover and the pressed fill below both recolour the stroke for free. */
-.th-btn svg { display: block; width: 15px; height: 15px; fill: none;
+/* Icons carry no text, so they inherit the button's colour in every state. */
+.theme-toggle svg { display: block; width: 15px; height: 15px; fill: none;
   stroke: currentColor; stroke-width: 1.6; stroke-linecap: round;
   stroke-linejoin: round; }
-.th-btn:first-child { border-left: none; }
-.th-btn:hover { color: var(--accent); background: transparent; }
-.th-btn[aria-pressed="true"] { background: var(--btn); color: var(--btn-on); }
+.theme-toggle svg[hidden] { display: none; }
+.theme-toggle:hover { color: var(--accent); }
 /* Hierarchy comes from size, not weight: the site sets every heading level at
    400 and gives them all the body's -0.1px tracking. */
 h1, h2, h3, h4, h5, h6 { font-weight: 400; letter-spacing: -0.1px;
@@ -2466,6 +2465,14 @@ h1, h2, h3, h4, h5, h6 { font-weight: 400; letter-spacing: -0.1px;
 h1 { margin: clamp(28px, 5vw, 56px) 0 0; font-size: var(--fs-xx-large); }
 .sub { margin: 14px 0 0; color: var(--muted); font-size: var(--fs-large);
   max-width: var(--measure); }
+/* The profile link used to sit inside .sub, where the hero's --fs-large blew a
+   six-word label up to the size of the sentence around it. Out on the right at
+   body size it reads as a reference rather than a headline. Baseline alignment
+   keeps it on the sentence's last line, and it wraps under on narrow screens. */
+.sub-row { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px 24px; flex-wrap: wrap; }
+.spec-link { flex: none; font-size: var(--fs-medium); color: var(--muted); }
+.spec-link:hover { color: var(--accent); }
 h2 { margin: 0 0 14px; font-size: var(--fs-large); }
 /* Explanatory prose gets the site's reading column; the tables and forms
    beside it keep the full width of the card. */
@@ -2853,27 +2860,27 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
         <a class="tab-btn" data-tab="interop" href="#interop">Interop testing</a>
         <a class="tab-btn" data-tab="clinical" href="#clinical">Clinical view</a>
       </nav>
-      <div class="theme-toggle" role="group" aria-label="Colour theme">
-        <button class="th-btn" data-theme-set="system" title="System theme"
-                aria-label="System theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+      <button class="theme-toggle" id="theme-btn" type="button">
+        <svg data-icon="system" viewBox="0 0 16 16" aria-hidden="true">
           <rect x="1.8" y="2.8" width="12.4" height="8.4" rx="1.2"/>
-          <path d="M5.5 14h5M8 11.2V14"/></svg></button>
-        <button class="th-btn" data-theme-set="light" title="Light theme"
-                aria-label="Light theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5.5 14h5M8 11.2V14"/></svg>
+        <svg data-icon="light" viewBox="0 0 16 16" aria-hidden="true" hidden>
           <circle cx="8" cy="8" r="3.1"/>
           <path d="M8 1.2v1.5M8 13.3v1.5M1.2 8h1.5M13.3 8h1.5M3.3 3.3l1.1 1.1M11.6
-          11.6l1.1 1.1M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1"/></svg></button>
-        <button class="th-btn" data-theme-set="dark" title="Dark theme"
-                aria-label="Dark theme"><svg viewBox="0 0 16 16" aria-hidden="true">
+          11.6l1.1 1.1M12.7 3.3l-1.1 1.1M4.4 11.6l-1.1 1.1"/></svg>
+        <svg data-icon="dark" viewBox="0 0 16 16" aria-hidden="true" hidden>
           <path d="M13.4 9.9A5.7 5.7 0 0 1 6.1 2.6a5.7 5.7 0 1 0 7.3 7.3z"/>
-          </svg></button>
-      </div>
+          </svg>
+      </button>
     </div>
   </div>
-  <h1>Nordic Hackathon 2026 - Patient Summary Challenge</h1>
-  <p class="sub">Submit your European Patient Summary (FHIR R4 Bundle) and get it
-  validated against the <a href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
-  target="_blank" rel="noopener">HL7 EU EPS 1.0.0-ballot profile</a>.</p>
+  <h1>Nordic Hackathon 2026</h1>
+  <div class="sub-row">
+    <p class="sub">Submit your European Patient Summary (FHIR R4 Bundle) and get
+    it validated against the HL7 EU EPS 1.0.0-ballot profile.</p>
+    <a class="spec-link" href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
+       target="_blank" rel="noopener">EPS 1.0.0-ballot spec</a>
+  </div>
 </header>
 <main>
 
@@ -3020,16 +3027,14 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 <section class="card">
   <h2>Interop testing</h2>
   <p class="muted" style="margin:0 0 8px">Compliance proves you can produce a
-  valid patient summary; interoperability testing proves another system can
-  consume it. Every company's best valid submission is published below as its
-  exchange document - load one into your own system and see what breaks.</p>
-  <p class="muted" style="margin:0 0 8px">Nothing here is scored or tracked. Take a
-  partner's document, test it, and tell them what you found: the useful output
-  of this track is a defect the producer can go and fix.</p>
-  <p class="muted" style="margin:0">When you have loaded one, add a screenshot of
-  how it came out in your system, with a note saying what to look at. Everyone at
-  the event can see them, and one summary shown side by side in a dozen products
-  is the one thing this room can produce that nowhere else can.</p>
+  valid patient summary, while interoperability testing proves another system
+  can consume it. Every company's best valid submission is published below as
+  its exchange document - take one, load one into your own system and see how
+  well it renders.</p>
+  <p class="muted" style="margin:0">After you've loaded the document, add a
+  screenshot below showing how it renders in your system with an optional note.
+  This will enable everyone in the hackathon, including the clinicians, to
+  appreciate how well your system renders the patient summary data.</p>
 </section>
 
 <section class="card">
@@ -4899,19 +4904,32 @@ function storeTheme(mode) {
     else localStorage.setItem("theme", mode);
   } catch (e) {}
 }
+const THEME_MODES = ["system", "light", "dark"];
+const THEME_LABEL = { system: "System theme", light: "Light theme",
+                      dark: "Dark theme" };
 function initTheme() {
-  const btns = [...document.querySelectorAll(".th-btn")];
-  const show = (mode) => btns.forEach((b) =>
-    b.setAttribute("aria-pressed", String(b.dataset.themeSet === mode)));
+  const btn = document.getElementById("theme-btn");
+  const icons = [...btn.querySelectorAll("svg")];
+  /* The button is its own label: the icon says what is in force now, and the
+     accessible name has to say so too, plus what a click will do - a bare
+     "System theme" would read as a command rather than a state. */
+  const show = (mode) => {
+    icons.forEach((svg) => { svg.hidden = svg.dataset.icon !== mode; });
+    const next = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length];
+    btn.title = THEME_LABEL[mode] + " - click for " + THEME_LABEL[next].toLowerCase();
+    btn.setAttribute("aria-label",
+      THEME_LABEL[mode] + ", click for " + THEME_LABEL[next].toLowerCase());
+  };
   const stored = storedTheme();
-  show(stored === "light" || stored === "dark" ? stored : "system");
-  btns.forEach((b) => b.addEventListener("click", () => {
-    const mode = b.dataset.themeSet;
+  let mode = stored === "light" || stored === "dark" ? stored : "system";
+  show(mode);
+  btn.addEventListener("click", () => {
+    mode = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length];
     if (mode === "system") delete document.documentElement.dataset.theme;
     else document.documentElement.dataset.theme = mode;
     storeTheme(mode);
     show(mode);
-  }));
+  });
 }
 
 /* initial state: the hash decides what is shown, including on a cold load */
