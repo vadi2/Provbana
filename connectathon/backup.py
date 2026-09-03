@@ -24,12 +24,15 @@ Only you can restore
 Restore is this script, run on this machine, by the user who owns the backup
 directory. It is deliberately not reachable from the service: there is no HTTP
 endpoint, no token that grants it and nothing a participant on the venue network
-can send that will trigger it. The backup directory is created 0700 and its
-files 0600, so another account on the same laptop can neither read the results
-nor swap a snapshot for a doctored one.
+can send that will trigger it. The backup directory is created 0700 and the
+database copy 0600; the bundles and screenshots are hard links, so they cannot
+carry a mode of their own and keep whatever the service wrote. The 0700
+directory is therefore what stops another account on the same laptop reading
+the results or swapping a snapshot for a doctored one.
 
 Restoring never destroys anything. The current data directory is renamed aside
-(`data.replaced-<timestamp>`) and the snapshot is moved into its place, so a
+(`data.replaced-<timestamp>`) and a *copy* of the snapshot is renamed into its
+place - the snapshot itself is never moved, so it can be restored again - and a
 restore can itself be undone by renaming the two back. Stop the service first:
 the rename is atomic, but a running service keeps writing into the directory it
 already has open, and those writes would land in the set-aside copy.
@@ -56,6 +59,12 @@ STAMP = "%Y%m%dT%H%M%SZ"
 # pruner never reaches back past the start of the day it is protecting.
 DEFAULT_KEEP = 96
 DEFAULT_EVERY = 900
+
+
+class SnapshotError(Exception):
+    """A snapshot could not be taken. An ordinary Exception on purpose, so the
+    --loop guard catches it and keeps the schedule; main() turns it into a
+    SystemExit on the one-shot path, where exiting is the right answer."""
 
 
 def log(msg):
@@ -99,7 +108,16 @@ def link_tree(src, dest):
     """Hard-link a write-once tree; fall back to copying across filesystems."""
     try:
         shutil.copytree(src, dest, copy_function=os.link)
-    except OSError:
+    except OSError as exc:
+        # copytree creates the directories before it copies anything, and on a
+        # cross-device link it collects every per-file EXDEV and raises at the
+        # end - so `dest` is already there, half-built. Clear it before the
+        # retry: copytree refuses an existing directory, and copy2 onto a file
+        # that is already a hard link to its own source raises SameFileError.
+        # Say so, because a snapshot that quietly became a full copy is the
+        # difference between kilobytes and gigabytes a day.
+        log("linking failed (%s) - copying %s instead" % (exc, src))
+        shutil.rmtree(dest, ignore_errors=True)
         shutil.copytree(src, dest, copy_function=shutil.copy2)
 
 
@@ -125,7 +143,13 @@ def human(n):
 def take_snapshot(data_dir, backup_dir, keep):
     db = os.path.join(data_dir, DB_NAME)
     if not os.path.isfile(db):
-        raise SystemExit("no database at %s - is DATA_DIR right?" % db)
+        # Not SystemExit: it derives from BaseException, so the loop's
+        # `except Exception` guard below would miss the one error this module
+        # raises on purpose, and the daemon would exit where it meant to log.
+        # That is most likely on a cold volume, where backup can start before
+        # app has created the database, and during a restore, which moves the
+        # data directory aside for a moment.
+        raise SnapshotError("no database at %s - is DATA_DIR right?" % db)
 
     os.makedirs(backup_dir, mode=0o700, exist_ok=True)
     os.chmod(backup_dir, 0o700)
@@ -163,7 +187,14 @@ def prune(backup_dir, keep):
     snaps = list_snapshots(backup_dir)
     dropped = 0
     for old in snaps[:max(0, len(snaps) - keep)]:
-        shutil.rmtree(os.path.join(backup_dir, old), ignore_errors=True)
+        # Counting the attempt rather than the success would report the
+        # retention promise as kept on every cycle while the directory grew
+        # without bound - a snapshot this uid cannot unlink is recounted daily.
+        try:
+            shutil.rmtree(os.path.join(backup_dir, old))
+        except OSError as exc:
+            log("could not prune %s: %s" % (old, exc))
+            continue
         dropped += 1
     return dropped
 
@@ -295,8 +326,11 @@ def main():
         return 0
 
     if not args.loop:
-        path, files, total, pruned = take_snapshot(
-            args.data_dir, args.backup_dir, args.keep)
+        try:
+            path, files, total, pruned = take_snapshot(
+                args.data_dir, args.backup_dir, args.keep)
+        except SnapshotError as exc:
+            raise SystemExit(str(exc))
         log("snapshot %s - %d files, %s%s"
             % (os.path.basename(path), files, human(total),
                ", pruned %d old" % pruned if pruned else ""))

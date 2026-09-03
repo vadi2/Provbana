@@ -19,6 +19,7 @@ import shutil
 import sqlite3
 import struct
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2719,6 +2720,40 @@ def test_a_membership_claim_that_was_actually_checked_survives():
     ) == [real]
 
 
+def test_noise_that_names_no_url_is_still_dropped():
+    """Two of the message ids carry no URL in their text at all. The filter
+    used to return the original outcome whenever `unresolvable` came out empty,
+    undoing its own first pass - so the same bundle scored 0 or 50 depending on
+    whether some unrelated finding happened to mention a URL."""
+    outcome = {"resourceType": "OperationOutcome", "issue": [
+        issue("Error validating code: running without terminology services",
+              msg_id="Error_validating_code_running_without_terminology_services"),
+        issue("Error expanding ValueSet: running without terminology services",
+              msg_id="Error_expanding_ValueSet_running_without_terminology_services"),
+    ]}
+    assert app_module.drop_uncheckable_terminology(outcome)["issue"] == []
+
+
+def test_a_profile_named_in_the_from_suffix_is_not_a_code_system():
+    """The validator appends "(from <profile>)" to its messages. Harvesting
+    that URL as an unresolvable code system would drop every genuine
+    terminology error raised by the same profile."""
+    prof = "http://hl7.eu/fhir/eps/StructureDefinition/Composition-eu-eps|1.0.0-ballot"
+    noise = issue(
+        "A definition for CodeSystem 'http://snomed.info/sct' could not be found, "
+        "so the code cannot be validated (from %s)" % prof,
+        msg_id="UNKNOWN_CODESYSTEM")
+    real = issue(
+        "The Coding provided (http://hl7.org/fhir/administrative-gender#z) was not "
+        "found in the value set http://hl7.org/fhir/ValueSet/administrative-gender, "
+        "and a code is required from this value set (from %s)" % prof,
+        msg_id="Terminology_TX_NoValid_4")
+    kept = app_module.drop_uncheckable_terminology(
+        {"resourceType": "OperationOutcome", "issue": [noise, real]})["issue"]
+    assert kept == [real]
+    assert prof.split("|")[0] not in app_module._named_urls(app_module._issue_text(noise))
+
+
 def test_nothing_is_dropped_when_every_code_system_resolved():
     """Self-calibrating rather than a hardcoded list of licensed systems: point
     Matchbox at a terminology server, the first pass finds nothing to drop, and
@@ -2812,7 +2847,10 @@ def practice_data_dir(path):
 def test_reset_clears_every_table_and_both_trees(tmp_path):
     data = practice_data_dir(str(tmp_path / "data"))
     removed = reset.clear(data)
-    assert removed == {"renderings": 1, "submissions": 2, "teams": 1}
+    # The directories are counted too: a wipe that took forty teams' uploads
+    # but no rows must not report itself as "nothing to clear".
+    assert removed == {"renderings": 1, "submissions": 2, "teams": 1,
+                       "team directories": 2}
     conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
     for table in reset.TABLES:
         assert conn.execute("SELECT count(*) FROM %s" % table).fetchone()[0] == 0
@@ -2824,11 +2862,78 @@ def test_reset_clears_every_table_and_both_trees(tmp_path):
         assert os.listdir(os.path.join(data, tree)) == []
 
 
+def test_status_counts_exactly_what_a_wipe_would_take(tmp_path):
+    """--status is the one command an operator runs to check the schedule, so
+    it is also where a wrong --data-dir has to become visible."""
+    data = practice_data_dir(str(tmp_path / "data"))
+    counted = reset.count(data)
+    # Counting must not be a wipe: the numbers have to still be there after.
+    assert reset.count(data) == counted
+    assert counted == reset.clear(data)
+
+
+def test_status_on_the_wrong_directory_says_so_rather_than_reporting_zero(tmp_path):
+    data = str(tmp_path / "nowhere")
+    os.makedirs(data)
+    assert reset.count(data) is None
+    assert "check --data-dir" in reset.describe(reset.count(data))
+
+
+def test_a_wipe_of_the_wrong_directory_exits_non_zero(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv",
+                        ["reset.py", "--yes", "--data-dir", str(tmp_path / "nowhere")])
+    assert reset.main() == 1
+    assert "check --data-dir" in capsys.readouterr().out
+
+
 def test_reset_on_an_untouched_data_dir_is_not_an_error(tmp_path):
     """The reset container can win the race to a fresh volume."""
     data = str(tmp_path / "data")
     os.makedirs(data)
-    assert reset.clear(data) == {}
+    assert reset.clear(data) is None
+    assert "check --data-dir" in reset.describe(None)
+
+
+def test_no_database_means_the_trees_are_left_alone(tmp_path):
+    """--data-dir one keystroke out must not wipe a live event's uploads while
+    reporting that there was nothing to clear."""
+    data = str(tmp_path / "data")
+    os.makedirs(os.path.join(data, "submissions", "acme"))
+    with open(os.path.join(data, "submissions", "acme", "1.json"), "wb") as fh:
+        fh.write(b"{}")
+    assert reset.clear(data) is None
+    assert os.listdir(os.path.join(data, "submissions")) == ["acme"]
+
+
+def test_a_wipe_that_only_removes_files_still_says_so(tmp_path):
+    data = practice_data_dir(str(tmp_path / "data"))
+    conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
+    for table in reset.TABLES:
+        conn.execute("DELETE FROM %s" % table)
+    conn.commit()
+    conn.close()
+    said = reset.describe(reset.clear(data))
+    assert "team directories" in said and said != "nothing to clear"
+
+
+def test_a_failed_wipe_does_not_end_the_daily_loop(tmp_path, monkeypatch):
+    """Exiting here would skip every later wipe, including the last one on the
+    morning the doors open."""
+    data = practice_data_dir(str(tmp_path / "data"))
+    monkeypatch.setattr(reset, "clear", lambda _d: (_ for _ in ()).throw(
+        sqlite3.OperationalError("database is locked")))
+    ends = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=1)
+    # One slot is due immediately; after it the period is over and run_loop
+    # idles, so break out of the idle sleep to end the test.
+    monkeypatch.setattr(reset.time, "sleep",
+                        lambda _s: (_ for _ in ()).throw(KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        reset.run_loop(data, ends)
+    # The tables are untouched, because clear() blew up - but we got here at
+    # all, which is the point: the exception did not escape run_loop.
+    conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
+    assert conn.execute("SELECT count(*) FROM teams").fetchone()[0] == 1
+    conn.close()
 
 
 def test_reset_leaves_the_database_usable(tmp_path):

@@ -40,8 +40,9 @@ DB_NAME = "connectathon.db"
 # Child rows first: renderings reference submissions and teams, so deleting in
 # this order never leaves a row pointing at one that has gone.
 TABLES = ("renderings", "submissions", "teams")
-# Each holds one directory per team slug. The trees themselves stay - app.py
-# creates them at boot and expects to find them.
+# Each holds one directory per team slug. The trees themselves stay: app.py
+# creates submissions/ at boot and renderings/ on the first upload, both with
+# exist_ok=True, so removing them would be survivable but pointless churn.
 TREES = ("submissions", "renderings")
 # Long enough that an idle container is not spinning, short enough that a
 # suspended container or a stepped clock cannot overshoot a wipe by a day.
@@ -92,34 +93,49 @@ def next_run(after: datetime, ends: datetime) -> "datetime | None":
     return run if run <= ends else None
 
 
-def clear(data_dir: str) -> "dict[str, int]":
-    """Delete every result in place. Returns what each table lost."""
-    removed = {}
+def clear(data_dir: str) -> "dict[str, int] | None":
+    """Delete every result in place. Returns what each table and tree lost, or
+    None when there is no database here and nothing was touched.
+
+    No database means one of two things: a volume the service has not written
+    to yet, or the wrong directory. Deleting the trees anyway is harmless in the
+    first case and unrecoverable in the second - an operator one keystroke out
+    on --data-dir would wipe a live event's uploads and read the resulting
+    "nothing to clear" as confirmation the board was already empty. So touch
+    nothing, and say which it was.
+    """
     db = os.path.join(data_dir, DB_NAME)
-    if os.path.exists(db):
-        conn = sqlite3.connect(db)
-        try:
-            present = {
-                row[0]
-                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            }
-            # One transaction for the lot: a leaderboard read landing mid-wipe
-            # sees the board either before or after, never a team whose
-            # submissions have already gone.
-            conn.execute("BEGIN IMMEDIATE")
-            for table in TABLES:
-                if table not in present:
-                    continue
-                removed[table] = conn.execute(
-                    "SELECT count(*) FROM %s" % table
-                ).fetchone()[0]
-                conn.execute("DELETE FROM %s" % table)
-            conn.commit()
-        finally:
-            conn.close()
+    if not os.path.exists(db):
+        return None
+
+    removed = {}
+    # timeout=30 to match app.py and backup.py. On the default 5s a wipe that
+    # lands while the service is committing a submission raises "database is
+    # locked", and the slot it was scheduled for is gone until tomorrow.
+    conn = sqlite3.connect(db, timeout=30)
+    try:
+        present = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        # One transaction for the lot: a leaderboard read landing mid-wipe
+        # sees the board either before or after, never a team whose
+        # submissions have already gone.
+        conn.execute("BEGIN IMMEDIATE")
+        for table in TABLES:
+            if table not in present:
+                continue
+            removed[table] = conn.execute(
+                "SELECT count(*) FROM %s" % table
+            ).fetchone()[0]
+            conn.execute("DELETE FROM %s" % table)
+        conn.commit()
+    finally:
+        conn.close()
 
     # After the rows, never before. A bundle whose row has gone is simply
     # unreachable; a row whose bundle has gone is a 500 on the way out.
+    dirs = 0
     for tree in TREES:
         path = os.path.join(data_dir, tree)
         if not os.path.isdir(path):
@@ -128,10 +144,44 @@ def clear(data_dir: str) -> "dict[str, int]":
             target = os.path.join(path, name)
             if os.path.isdir(target):
                 shutil.rmtree(target)
+                dirs += 1
+    # Counted, because the tables and the trees empty independently: a wipe
+    # that removed forty teams' screenshots but no rows used to report
+    # "nothing to clear".
+    if dirs:
+        removed["team directories"] = dirs
     return removed
 
 
-def describe(removed: "dict[str, int]") -> str:
+def count(data_dir: str) -> "dict[str, int] | None":
+    """What clear() would remove, without removing it."""
+    db = os.path.join(data_dir, DB_NAME)
+    if not os.path.exists(db):
+        return None
+    found = {}
+    conn = sqlite3.connect(db, timeout=30)
+    try:
+        present = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        for table in TABLES:
+            if table in present:
+                found[table] = conn.execute(
+                    "SELECT count(*) FROM %s" % table).fetchone()[0]
+    finally:
+        conn.close()
+    dirs = sum(len([n for n in os.listdir(os.path.join(data_dir, tree))
+                    if os.path.isdir(os.path.join(data_dir, tree, n))])
+               for tree in TREES if os.path.isdir(os.path.join(data_dir, tree)))
+    if dirs:
+        found["team directories"] = dirs
+    return found
+
+
+def describe(removed: "dict[str, int] | None") -> str:
+    if removed is None:
+        return "no database here - nothing was touched, check --data-dir"
     if not removed or not any(removed.values()):
         return "nothing to clear"
     return ", ".join("%d %s" % (n, t) for t, n in removed.items() if n)
@@ -146,7 +196,14 @@ def run_loop(data_dir: str, ends: datetime) -> int:
         if delay > 0:
             time.sleep(min(delay, MAX_SLEEP))
             continue
-        log("resetting (%s slot): %s" % (pending.isoformat(), describe(clear(data_dir))))
+        try:
+            done = describe(clear(data_dir))
+        except Exception as exc:
+            # A locked database or an undeletable tree must not end the loop:
+            # exiting here skips every later wipe too, and the one that matters
+            # is the last, on the morning the doors open.
+            done = "FAILED: %s" % exc
+        log("resetting (%s slot): %s" % (pending.isoformat(), done))
         # Step a second past the slot just run so the next lookup lands on
         # tomorrow's rather than repeating this one.
         pending = next_run(pending + timedelta(seconds=1), ends)
@@ -188,6 +245,12 @@ def main() -> int:
             print("practice ends: %s" % ends.isoformat())
             print("next reset:    %s" % (upcoming.isoformat() if upcoming
                                          else "none - the practice period is over"))
+        # What a wipe would take, so the one command an operator runs to check
+        # the schedule also proves this process is looking at the right data
+        # directory. A count of 0 beside a board that is visibly full is the
+        # signal that --data-dir is wrong.
+        print("data dir:      %s" % args.data_dir)
+        print("would clear:   %s" % describe(count(args.data_dir)))
         return 0
 
     if args.loop:
@@ -202,8 +265,12 @@ def main() -> int:
               "Re-run with --yes if that is what you want, or --status to see "
               "what is scheduled." % args.data_dir, file=sys.stderr)
         return 2
-    log("resetting on request: %s" % describe(clear(args.data_dir)))
-    return 0
+    removed = clear(args.data_dir)
+    log("resetting on request: %s" % describe(removed))
+    # Non-zero when there was no database to clear: an operator who typed
+    # --data-dir wrong asked for a wipe and got nothing, and the message alone
+    # is easy to read past in a terminal that is already full of output.
+    return 0 if removed is not None else 1
 
 
 if __name__ == "__main__":

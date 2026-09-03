@@ -34,9 +34,15 @@ PROFILE = os.environ.get(
 # meta.profile claim from anywhere else comes back "not checked" unless its
 # package is named here. The Swedish base profiles are in by default because
 # this is a Swedish event and teams will claim them on Patient.
+# EPS itself is listed first because /api/health reports "degraded" for
+# anything here that Matchbox did not load, and deploy.sh gates on that. Left
+# out, the one package every submission is scored against was the one package
+# nothing checked - matchbox/config/application.yaml is where they are loaded.
 VALIDATION_IGS = [
     ig.strip()
-    for ig in os.environ.get("VALIDATION_IGS", "hl7se.fhir.base#1.1.0").split(",")
+    for ig in os.environ.get(
+        "VALIDATION_IGS", "hl7.fhir.eu.eps#1.0.0-ballot,hl7se.fhir.base#1.1.0"
+    ).split(",")
     if ig.strip()
 ]
 
@@ -82,7 +88,31 @@ REGISTER_CODE = os.environ.get("REGISTER_CODE", "")
 # the instant of the final wipe. Held as a string: the value is handed to the
 # browser, which does the comparing, and parsing it here would only mean
 # re-serialising it. Unset means no practice period and no notice.
-PRACTICE_ENDS = os.environ.get("PRACTICE_ENDS", "").strip()
+def _practice_ends() -> str:
+    """PRACTICE_ENDS with an explicit UTC offset, or "" when unset or unusable.
+
+    reset.py reads a naive timestamp as UTC on purpose; the browser's
+    Date.parse reads the same string as *local* time. Left as typed, a value
+    without a "Z" made the page drop the practice notice an hour before the
+    final wipe in CET - the board presenting itself as the event's real
+    leaderboard, and then being emptied. Normalising here keeps the one
+    parser that matters agreeing with the one that does the deleting.
+    """
+    raw = os.environ.get("PRACTICE_ENDS", "").strip()
+    if not raw:
+        return ""
+    try:
+        import reset
+        return reset.practice_ends(raw).isoformat()
+    except Exception as exc:
+        # Not fatal: the reset container fails loudly on the same value, and
+        # taking the validator down over a cosmetic notice is the worse trade.
+        print("PRACTICE_ENDS is not a usable timestamp (%s) - the practice "
+              "notice will not be shown" % exc, flush=True)
+        return ""
+
+
+PRACTICE_ENDS = _practice_ends()
 
 
 class MatchboxError(Exception):
@@ -1244,6 +1274,9 @@ UNCHECKABLE_TERMINOLOGY_TEXT = (
 
 # Systems and value sets are named in those messages as quoted or bare URLs.
 TERMINOLOGY_URL = re.compile(r"(?:https?://|urn:)[^\s'\"),;]+")
+# "... not found (from http://hl7.eu/.../bundle-eu-eps|1.0.0-ballot)" - the
+# profile the finding came from, not a code system. Mirrors cleanMessage().
+FROM_PROFILE = re.compile(r"\s*\(from [^)\s]+\)")
 
 
 def _issue_text(issue: dict) -> str:
@@ -1260,9 +1293,15 @@ def _message_id(issue: dict) -> str | None:
 
 
 def _named_urls(text: str) -> set[str]:
-    """The systems and value sets a message names, without version suffixes."""
+    """The systems and value sets a message names, without version suffixes.
+
+    The trailing "(from <profile>)" the validator appends is stripped first -
+    the same parenthetical cleanMessage() removes for display. A profile URL is
+    not a code system, and letting one into the unresolvable set would drop
+    every real terminology error raised by that same profile.
+    """
     return {u.split("|")[0].split("#")[0].rstrip(".,")
-            for u in TERMINOLOGY_URL.findall(text)}
+            for u in TERMINOLOGY_URL.findall(FROM_PROFILE.sub("", text))}
 
 
 def drop_uncheckable_terminology(outcome: dict) -> dict:
@@ -1297,13 +1336,15 @@ def drop_uncheckable_terminology(outcome: dict) -> dict:
             continue
         kept.append(issue)
 
-    if not unresolvable:
-        return outcome
-
     survivors = []
     for issue in kept:
         mid = _message_id(issue) if isinstance(issue, dict) else None
-        if mid and (mid.startswith("Terminology_TX_NoValid")
+        # `unresolvable` can legitimately be empty: two of the ids above carry
+        # no URL in their text at all ("running without terminology services").
+        # Returning `outcome` here instead of `kept` used to undo the whole
+        # first pass, so a bundle scored 0 or 50 depending on whether some
+        # unrelated finding happened to mention a URL.
+        if unresolvable and mid and (mid.startswith("Terminology_TX_NoValid")
                     or mid.startswith("Terminology_TX_Confirm")):
             if _named_urls(_issue_text(issue)) & unresolvable:
                 continue
@@ -2618,6 +2659,10 @@ input[type=file] { font-size: 0.84rem; color: var(--muted); }
   gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .issue-toolbar .issue-summary { margin-bottom: 0; }
 .menu-wrap { position: relative; display: inline-block; }
+/* Needed because the rule above is an author rule and outranks the UA sheet's
+   [hidden] { display: none } - without this, wrap.hidden = true has no effect
+   and last submission's Explain menu stays on screen beside a green banner. */
+.menu-wrap[hidden] { display: none; }
 .menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0;
   min-width: 240px; background: var(--card); border: 1px solid var(--field-border);
   border-radius: var(--r-ctl); box-shadow: 0 2px 14px rgba(0, 0, 0, 0.22);
@@ -2985,9 +3030,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     </div>
     <p class="muted" id="validator-note" role="status" style="margin:8px 0 0"></p>
     <div class="spinner" id="spinner"><span class="ring"></span>
-      <span>Validating against <a href="https://github.com/ahdis/matchbox"
-      target="_blank" rel="noopener">Matchbox</a> - usually a few seconds, up
-      to a minute on the first submission after it starts...</span></div>
+      <span>Validating...</span></div>
     <div class="error-note" id="submit-error" role="alert"></div>
     <div class="banner" id="banner" role="status"></div>
     <div id="issues-wrap">
@@ -3699,7 +3742,15 @@ function paintExplain(groups, severity, reported) {
   closeExplainMenu();
   $("#explain-note").hidden = true;
   $("#explain-text").hidden = true;
-  if (!groups.length) { wrap.hidden = true; explainPromptText = ""; return; }
+  if (!groups.length) {
+    /* Emptied, not just hidden: a resubmission that now passes must not leave
+       the previous bundle's question behind the button. */
+    $("#explain-btn").textContent = "";
+    $("#explain-menu").innerHTML = "";
+    wrap.hidden = true;
+    explainPromptText = "";
+    return;
+  }
   explainPromptText = explainPrompt(groups, severity, reported);
   $("#explain-btn").textContent = "Explain "
     + (reported === 1 ? "the " + severity : "all " + reported + " " + severity + "s")
@@ -3733,10 +3784,15 @@ function explainNote(message) {
 }
 
 async function explainWith(provider) {
-  const copied = await copyText(explainPromptText);
   if (provider.prefill) {
+    /* No copyText here: it used to run for every provider and silently
+       replaced whatever the participant had on their clipboard - often the
+       company token they had just copied - to no purpose. */
     explainNote("Opening " + provider.name + " in a new tab with the question filled in.");
-  } else if (copied) {
+    return;
+  }
+  const copied = await copyText(explainPromptText);
+  if (copied) {
     explainNote(provider.name + " takes no prefilled question - the prompt is on your "
       + "clipboard, paste it there.");
   } else {
@@ -4961,7 +5017,11 @@ function initTheme() {
      accessible name has to say so too, plus what a click will do - a bare
      "System theme" would read as a command rather than a state. */
   const show = (mode) => {
-    icons.forEach((svg) => { svg.hidden = svg.dataset.icon !== mode; });
+    /* toggleAttribute, not .hidden: `hidden` is an IDL attribute of
+       HTMLElement and SVGElement does not inherit it, so `svg.hidden = true`
+       sets a JS expando and never the content attribute the CSS selects on.
+       The icon stayed on whatever the markup shipped, forever. */
+    icons.forEach((svg) => { svg.toggleAttribute("hidden", svg.dataset.icon !== mode); });
     const next = THEME_MODES[(THEME_MODES.indexOf(mode) + 1) % THEME_MODES.length];
     btn.title = THEME_LABEL[mode] + " - click for " + THEME_LABEL[next].toLowerCase();
     btn.setAttribute("aria-label",
