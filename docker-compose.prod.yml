@@ -158,7 +158,7 @@ services:
       # participant is never left hanging, and a warm pass that has to compile
       # from cold needs minutes. warm.py overrides it per call.
       WARM_INTERVAL: ${WARM_INTERVAL:-1200}
-      WARM_TIMEOUT: ${WARM_TIMEOUT:-300}
+      WARM_TIMEOUT: ${WARM_TIMEOUT:-600}
     depends_on:
       - matchbox
     # Five HTTP calls every twenty minutes. The work is all on the validator's

@@ -40,10 +40,13 @@ import app
 # Long enough that a warm pass is a rounding error against the validator's day,
 # short enough to sit well inside the shortest disuse window measured (~75min).
 INTERVAL = int(os.environ.get("WARM_INTERVAL", "1200"))
-# A cold engine can take over two minutes to compile. The service's own budget
-# is deliberately short so that a participant is never left hanging; this is
-# not that budget, and being slow here is the normal case on the first pass.
-TIMEOUT = float(os.environ.get("WARM_TIMEOUT", "300"))
+# A cold engine can take over two minutes to compile, and the first pass after
+# a matchbox restart can wait on the package load on top of that - measured at
+# 288s once. The service's own budget is deliberately short so that a
+# participant is never left hanging; this is not that budget, nobody is waiting
+# on it, and giving up early on the one pass that matters most is the only way
+# this number can do harm.
+TIMEOUT = float(os.environ.get("WARM_TIMEOUT", "600"))
 # Matchbox refuses work until its packages are loaded, which takes a minute or
 # two from cold. Retry rather than spend a whole interval waiting.
 RETRY = 30
