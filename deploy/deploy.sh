@@ -103,11 +103,13 @@ echo "==> Waiting for the validator to load its IGs (a minute or two from cold)"
 "${SSH[@]}" "cd $DEST && for i in \$(seq 1 60); do
 	if docker compose -f docker-compose.prod.yml exec -T app python -c \"
 import json,urllib.request
-h=json.load(urllib.request.urlopen('http://localhost:8095/api/health'))
-# 'status' is always 'ok' - the validator's state is in 'matchbox', and
-# 'degraded' means it is up but missing a package application.yaml should
-# have loaded, which scores real submissions wrong. Only 'up' will do.
-raise SystemExit(0 if h.get('matchbox')=='up' else 1)\" 2>/dev/null; then
+# \\\$status answers with a FHIR Parameters resource, so the value is one part
+# among many rather than a top-level key. 'degraded' means Matchbox is up but
+# missing a package application.yaml should have loaded, which scores real
+# submissions wrong, so only 'up' will do.
+p=json.load(urllib.request.urlopen('http://localhost:8095/fhir/\\\$status'))
+m=[x.get('valueString') for x in p['parameter'] if x['name']=='matchbox']
+raise SystemExit(0 if m[:1]==['up'] else 1)\" 2>/dev/null; then
 		echo '    healthy'; exit 0
 	fi
 	sleep 10
@@ -116,19 +118,37 @@ echo '    still not healthy - check: docker compose -f docker-compose.prod.yml l
 exit 1"
 
 echo "==> Warming the validator"
-# /api/health says "up" as soon as Matchbox answers, but Matchbox only compiles
+# $status says "up" as soon as Matchbox answers, but Matchbox only compiles
 # the profile snapshots on the first $validate call - measured at 64s on this
 # box, against a 60s MATCHBOX_TIMEOUT. Left alone, the first team to submit at
 # the event eats a 502 and every submission after theirs takes under a second.
 # So spend that minute here instead, with a timeout long enough to absorb it.
 # Re-run this if you ever restart the matchbox container mid-event.
+#
+# Every category gets its own engine, so every category pays that cost once.
+# The patient summary is warmed first and is the one that has to succeed - it
+# is what the event scores. The rest are warmed with the same sample, which is
+# not a document of their kind and will fail validation; that is fine and the
+# verdict is discarded, because compiling the profile snapshots is the whole
+# point and Matchbox does that before it can decide anything. A failure there
+# costs a slow first submission of a second-class document, so it is reported
+# and not fatal.
 "${SSH[@]}" "cd $DEST && docker compose -f docker-compose.prod.yml exec -T app python -c \"
 import time, app
 app.MATCHBOX_TIMEOUT = 300
+body = open('samples/andrea-cross-border.json', 'rb').read()
 t = time.monotonic()
-app.validate_with_matchbox(open('samples/andrea-cross-border.json', 'rb').read())
-print('    warm after %.0fs' % (time.monotonic() - t))\"" || {
-	echo "    warm-up failed - the validator answers /api/health but cannot validate," >&2
+app.validate_with_matchbox(body, app.PRIMARY_DOCUMENT)
+print('    %s warm after %.0fs' % (app.PRIMARY_DOCUMENT['id'], time.monotonic() - t))
+for doc in app.SECONDARY_DOCUMENTS:
+    t = time.monotonic()
+    try:
+        app.validate_with_matchbox(body, doc)
+        print('    %s warm after %.0fs' % (doc['id'], time.monotonic() - t))
+    except Exception as exc:
+        print('    %s NOT warmed (%s) - first submission of one will be slow'
+              % (doc['id'], exc))\"" || {
+	echo "    warm-up failed - the validator answers \$status but cannot validate," >&2
 	echo "    so the first submission at the event would time out. Check:" >&2
 	echo "    docker compose -f docker-compose.prod.yml logs matchbox" >&2
 	exit 1
@@ -136,4 +156,4 @@ print('    warm after %.0fs' % (time.monotonic() - t))\"" || {
 
 echo
 echo "==> Up. Check it:"
-echo "    curl -sS https://\$(grep -oP '(?<=^SITE_ADDRESS=).*' $ROOT/.env)/api/health | python3 -m json.tool"
+echo "    curl -sS https://\$(grep -oP '(?<=^SITE_ADDRESS=).*' $ROOT/.env)/fhir/\\\$status | python3 -m json.tool"

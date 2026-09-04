@@ -1,9 +1,14 @@
 """Nordic Hackathon 2026 - gamified FHIR European Patient Summary validation service.
 
 Teams register, submit EPS bundles, Matchbox validates, leaderboard keeps score.
+Other EHDS document categories - laboratory report, prescription and dispense,
+imaging report, discharge report - are accepted and validated against their own
+HL7 Europe guide, but the patient summary is what the track is about and what
+the leaderboard ranks; the rest are worth a small bonus. See EHDS_DOCUMENTS.
 Stdlib sqlite3 + FastAPI, no other runtime deps.
 """
 
+import base64
 import http.client
 import json
 import os
@@ -19,6 +24,11 @@ from datetime import datetime, timezone
 
 import anyio.to_thread
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+# The router raises Starlette's HTTPException, not FastAPI's subclass, so an
+# unrouted path and a wrong method arrive as the base class. Handling that one
+# covers both, since everything raised here is a subclass of it.
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, Response
@@ -26,22 +36,176 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 MATCHBOX_URL = os.environ.get(
     "MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir"
 ).rstrip("/")
-PROFILE = os.environ.get(
+# ------------------------------------------------------- EHDS document types
+#
+# The track is the European Patient Summary: it is what the scenarios are
+# written for, what the samples are, and what the leaderboard ranks. But EHDS
+# (Regulation (EU) 2025/327, Article 14) names six priority categories of health
+# data that EHR systems have to exchange, HL7 Europe publishes a FHIR guide for
+# five of them, and a team that brings a lab report to the room should get it
+# checked properly rather than scored against the wrong profile. So the other
+# four are accepted, detected, and validated against their own guide - second
+# class by design: they earn SECONDARY_CATEGORY_POINTS apiece and never the
+# richness points or the first-pass bonus. See team_score().
+#
+# Each entry carries what it takes to check one category:
+#
+#   profile   the canonical handed to Matchbox's $validate?profile=. Matchbox
+#             refuses the call without one, so even MPD - which defines no
+#             bundle profile of its own - names a profile here.
+#   igs       the packages the validation engine is scoped to. Matchbox builds
+#             an engine from the requested profile's dependency closure, so
+#             anything outside it comes back "not checked" unless named.
+#   bundles   canonicals that identify this category when a submission claims
+#             one in Bundle.meta.profile. The explicit claim wins over
+#             everything else in detect_document().
+#   loinc     Composition.type codes that identify it when nothing is claimed.
+#
+# Adding a category is adding an entry here plus its package in
+# matchbox/config/application.yaml. Nothing else in the service knows the list.
+EPS_PROFILE = os.environ.get(
     "PROFILE", "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
 )
-# Extra packages to load into the validation engine alongside PROFILE's own.
-# Matchbox scopes an engine to the IG that defines the requested profile, so a
-# meta.profile claim from anywhere else comes back "not checked" unless its
-# package is named here. The Swedish base profiles are in by default because
-# this is a Swedish event and teams will claim them on Patient.
-# EPS itself is listed first because /api/health reports "degraded" for
-# anything here that Matchbox did not load, and deploy.sh gates on that. Left
-# out, the one package every submission is scored against was the one package
-# nothing checked - matchbox/config/application.yaml is where they are loaded.
+# The documented override for the profile the event scores against, and the one
+# a box may already have set, so it keeps its old name as well as its new one.
+PROFILE = EPS_PROFILE
+
+EHDS_DOCUMENTS = [
+    {
+        "id": "eps",
+        "label": "Patient summary",
+        "long_label": "European Patient Summary",
+        "short": "PS",
+        "category": "Patient summary",
+        "primary": True,
+        "profile": EPS_PROFILE,
+        # hl7se.fhir.base rides along on this one only: it is a Swedish event
+        # and teams claim the Swedish base profiles on Patient, but they have
+        # nothing to say about a lab report or an imaging study.
+        "igs": ["hl7.fhir.eu.eps#1.0.0-ballot", "hl7se.fhir.base#1.1.0"],
+        "bundles": ["http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"],
+        "loinc": ["60591-5"],
+        "maturity": "ballot",
+        "spec": "https://hl7.eu/fhir/eps/1.0.0-ballot/",
+    },
+    {
+        "id": "laboratory",
+        "label": "Laboratory report",
+        "long_label": "Laboratory Report",
+        "short": "LAB",
+        "category": "Medical test result",
+        "primary": False,
+        "profile": "http://hl7.eu/fhir/laboratory/StructureDefinition/Bundle-eu-lab",
+        # hl7.fhir.eu.base#2.0.0-ballot is not a typo and not belt-and-braces.
+        # DiagnosticReport-eu-lab in Laboratory Report 2.0.0 references
+        # http://hl7.eu/fhir/base/StructureDefinition/patient-animal-eu-core,
+        # which existed in eu.base 2.0.0-ballot and was dropped from the 2.0.0
+        # release the IG then pinned. Scoped to its declared closure alone,
+        # every lab bundle - including the IG's own published examples - fails
+        # with "Unable to resolve the profile reference ...patient-animal-eu-core"
+        # and scores 0. Naming the ballot alongside puts the missing definition
+        # back in scope; measured on Bundle-SimpleChemistryResultReport: one
+        # hard error without it, none with it. Remove when eu.base restores the
+        # profile or the lab IG stops pointing at it.
+        "igs": ["hl7.fhir.eu.laboratory#2.0.0", "hl7.fhir.eu.base#2.0.0-ballot"],
+        "bundles": ["http://hl7.eu/fhir/laboratory/StructureDefinition/Bundle-eu-lab"],
+        # The IG binds Composition.type to a value set of exactly one code.
+        "loinc": ["11502-2"],
+        "maturity": "STU 2.0",
+        "spec": "https://hl7.eu/fhir/laboratory/",
+    },
+    {
+        "id": "mpd",
+        "label": "Prescription and dispense",
+        "long_label": "Medication Prescription and Dispense",
+        "short": "eP/eD",
+        "category": "ePrescription / eDispensation",
+        "primary": False,
+        # MPD profiles MedicationRequest, MedicationDispense, Medication and
+        # Dosage, and defines no Bundle or Composition profile at all - a
+        # prescription travels as a plain collection, not as a document. So the
+        # bundle is checked against base Bundle, and the MPD conformance comes
+        # from the entries' own meta.profile claims, which Matchbox descends
+        # into and checks. Verified by breaking a MedicationRequest inside an
+        # otherwise valid bundle: the failure comes back attributed "(from
+        # http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd)",
+        # so the profile really is being applied and not merely loaded.
+        "profile": "http://hl7.org/fhir/StructureDefinition/Bundle",
+        "igs": ["hl7.fhir.eu.mpd#1.0.0"],
+        "bundles": [],
+        "loinc": [],
+        # What an entry has to claim for a bundle to be read as MPD.
+        "entry_profiles": [
+            "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd",
+            "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd",
+            "http://hl7.eu/fhir/mpd/StructureDefinition/Medication-eu-mpd",
+        ],
+        "maturity": "STU 1.0",
+        "spec": "https://hl7.eu/fhir/mpd/",
+    },
+    {
+        "id": "imaging",
+        "label": "Imaging report",
+        "long_label": "Imaging Report",
+        "short": "IMG",
+        "category": "Medical imaging study and report",
+        "primary": False,
+        "profile": "http://hl7.eu/fhir/imaging/StructureDefinition/BundleReportEuImaging",
+        "igs": ["hl7.fhir.eu.imaging#1.0.0-ballot"],
+        "bundles": [
+            "http://hl7.eu/fhir/imaging/StructureDefinition/BundleReportEuImaging",
+            "http://hl7.eu/fhir/imaging/StructureDefinition/"
+            "BundleReportMinimalMetadataEuImaging",
+        ],
+        # Deliberately empty. Imaging binds Composition.type to "any LOINC
+        # descendant of 18726-0", which cannot be decided without a terminology
+        # server - the IG's own examples use 24802-1 (MR Knee) and even a CPT
+        # code. So an imaging report is recognised by its profile claim, or by
+        # carrying an ImagingStudy (see detect_document), never by its type code.
+        "loinc": [],
+        "maturity": "ballot",
+        "spec": "https://hl7.eu/fhir/imaging/",
+    },
+    {
+        "id": "hdr",
+        "label": "Discharge report",
+        "long_label": "Hospital Discharge Report",
+        "short": "HDR",
+        "category": "Discharge report",
+        "primary": False,
+        "profile": "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-eu-hdr",
+        "igs": ["hl7.fhir.eu.hdr#0.1.0-ballot"],
+        "bundles": [
+            "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-eu-hdr",
+            "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-obl-eu-hdr",
+        ],
+        "loinc": ["34105-7"],
+        "maturity": "ballot",
+        "spec": "https://hl7.eu/fhir/hdr/",
+    },
+]
+
+DOCUMENTS_BY_ID = {doc["id"]: doc for doc in EHDS_DOCUMENTS}
+# The track. Also the fallback for a bundle that announces nothing, so an
+# unrecognised submission is scored exactly as it was before any of the other
+# categories existed.
+PRIMARY_DOCUMENT = DOCUMENTS_BY_ID["eps"]
+SECONDARY_DOCUMENTS = [doc for doc in EHDS_DOCUMENTS if not doc["primary"]]
+
+# Packages $status insists Matchbox actually loaded. Every document's list,
+# de-duplicated in registry order: a package missing here is a category whose
+# profile claims come back "not checked", which scores real submissions wrong,
+# and deploy.sh gates the deploy on this being empty. EPS is first because it
+# is the one every fallback submission is scored against. Overridable as one
+# comma-separated list, which is also how a box can be run with a narrower set
+# of IGs than the registry describes.
+DEFAULT_VALIDATION_IGS = list(
+    dict.fromkeys(ig for doc in EHDS_DOCUMENTS for ig in doc["igs"])
+)
 VALIDATION_IGS = [
     ig.strip()
     for ig in os.environ.get(
-        "VALIDATION_IGS", "hl7.fhir.eu.eps#1.0.0-ballot,hl7se.fhir.base#1.1.0"
+        "VALIDATION_IGS", ",".join(DEFAULT_VALIDATION_IGS)
     ).split(",")
     if ig.strip()
 ]
@@ -76,9 +240,16 @@ SECTION_POINTS = 10    # per populated top-level Composition section
 RESOURCE_POINTS = 2    # per clinical resource (not Composition/Patient)
 RESOURCE_CAP = 60      # max points from clinical resources
 SECTION_CAP = 160      # max points from sections (the IPS set is ~16 sections)
-FIRST_PASS_BONUS = 20  # one-time, to the first company that submits a valid bundle
+FIRST_PASS_BONUS = 20  # one-time, to the first company to pass a patient summary
+# Per non-EPS EHDS category a company has passed, once each. Deliberately small
+# and flat: EHDS obliges EHR systems to exchange six categories rather than one,
+# so breadth is worth acknowledging, but this is the patient summary track and a
+# stack of lab reports must not out-rank a well-built summary. A company that
+# submits only patient summaries scores precisely what it scored before any of
+# the other categories existed.
+SECONDARY_CATEGORY_POINTS = 15
 
-# Set REGISTER_CODE to require a shared secret on /api/register. Left empty the
+# Set REGISTER_CODE to require a shared secret on $register. Left empty the
 # endpoint stays open, which is what you want on a closed event network.
 REGISTER_CODE = os.environ.get("REGISTER_CODE", "")
 
@@ -166,6 +337,7 @@ def init_db() -> None:
                 score     INTEGER NOT NULL,
                 sections  INTEGER NOT NULL DEFAULT 0,
                 resources INTEGER NOT NULL DEFAULT 0,
+                doc_type  TEXT NOT NULL DEFAULT 'eps',
                 filename  TEXT NOT NULL
             );
             """
@@ -177,6 +349,13 @@ def init_db() -> None:
                 conn.execute(
                     f"ALTER TABLE submissions ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0"
                 )
+        # Every submission that predates multi-category validation was scored
+        # against the patient summary, so that is what the default backfills.
+        if "doc_type" not in cols:
+            conn.execute(
+                "ALTER TABLE submissions ADD COLUMN doc_type TEXT NOT NULL "
+                "DEFAULT 'eps'"
+            )
         # The bonus used to be called "first blood", which is not a phrase for a
         # clinical event. CREATE TABLE IF NOT EXISTS leaves an existing table
         # alone, so databases from before the rename need the column moved.
@@ -313,20 +492,49 @@ def count_bundle_richness(bundle) -> tuple[int, int]:
     return len(section_keys), resources
 
 
-def submission_score(passed: bool, sections: int, resources: int) -> int:
-    """Conformance gates the score: any error/fatal issue means 0.
+def submission_score(
+    passed: bool, sections: int, resources: int, doc: dict | None = None
+) -> int:
+    """What one submission is worth. Conformance gates it: any error means 0.
 
-    A valid submission earns VALID_BASE, plus SECTION_POINTS per distinct
+    A valid patient summary earns VALID_BASE, plus SECTION_POINTS per distinct
     populated Composition section capped at SECTION_CAP points, plus
     RESOURCE_POINTS per clinical resource capped at RESOURCE_CAP points.
     Both halves are capped so no amount of padding outruns a real document.
+
+    Any other EHDS category earns the flat SECONDARY_CATEGORY_POINTS instead -
+    richness is measured against what a patient summary is meant to carry, and
+    counting sections on a lab report would only reward the wrong shape. That
+    flat figure is what the category is worth *the first time* it passes;
+    team_score() is what decides whether a given submission adds it.
+
+    `doc` is an EHDS_DOCUMENTS entry, defaulting to the patient summary so an
+    existing caller keeps its old behaviour.
     """
     if not passed:
         return 0
+    if not (doc or PRIMARY_DOCUMENT)["primary"]:
+        return SECONDARY_CATEGORY_POINTS
     return (
         VALID_BASE
         + min(SECTION_CAP, SECTION_POINTS * sections)
         + min(RESOURCE_CAP, RESOURCE_POINTS * resources)
+    )
+
+
+def team_score(best_primary: int, first_pass: bool, secondary: int) -> int:
+    """A company's leaderboard score.
+
+    `best_primary` is its best patient summary, which is the whole contest;
+    `secondary` is how many *other* EHDS categories it has a passing submission
+    in, each worth a flat bonus. A company with no patient summary therefore
+    sits near the bottom whatever else it has passed, which is the intent - the
+    other categories are credit for breadth, not a route around the track.
+    """
+    return (
+        best_primary
+        + (FIRST_PASS_BONUS if first_pass else 0)
+        + SECONDARY_CATEGORY_POINTS * secondary
     )
 
 
@@ -1158,16 +1366,125 @@ def bundle_response(raw: bytes, filename: str, **headers: str) -> Response:
     )
 
 
+# ------------------------------------------------------- document detection
+
+
+def _meta_profiles(resource) -> list[str]:
+    """meta.profile as a list of strings, version suffix stripped.
+
+    A claim may be versioned ("...|1.0.0"), and a team that pins the version
+    still means the same profile.
+    """
+    if not isinstance(resource, dict):
+        return []
+    meta = resource.get("meta")
+    claimed = meta.get("profile") if isinstance(meta, dict) else None
+    return [c.split("|", 1)[0] for c in claimed or [] if isinstance(c, str)]
+
+
+def _composition_type_codes(bundle: dict) -> set[str]:
+    """LOINC codes on the first Composition's type, for identifying a document."""
+    for entry in bundle.get("entry") or []:
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        if resource.get("resourceType") != "Composition":
+            continue
+        ctype = resource.get("type")
+        codings = ctype.get("coding") if isinstance(ctype, dict) else None
+        return {
+            c["code"]
+            for c in codings or []
+            if isinstance(c, dict)
+            and isinstance(c.get("code"), str)
+            and c.get("system") == "http://loinc.org"
+        }
+    return set()
+
+
+def detect_document(bundle) -> dict:
+    """Which EHDS category a submission is, as an EHDS_DOCUMENTS entry.
+
+    Ordered by how much the bundle is actually telling us, strongest first:
+
+      1. Bundle.meta.profile naming a category's bundle profile. This is the
+         submitter saying what they built, and it is the only signal that
+         separates the two imaging bundle shapes from anything else.
+      2. An entry claiming an MPD profile. A prescription has no bundle-level
+         profile to claim, so its evidence is one level down.
+      3. Composition.type. Fixed to one LOINC code by EPS, laboratory and HDR,
+         and the natural fallback for a document that claims no profile.
+      4. An ImagingStudy in the bundle. Imaging's type codes are a LOINC
+         subsumption query we cannot answer offline, so this stands in for
+         the code check that the other categories get.
+      5. Medication resources in a non-document bundle - a prescription that
+         claims nothing at all.
+
+    Falls back to the patient summary, which is the event's own track: an
+    unrecognised bundle is scored exactly as it was before this function
+    existed, rather than being rejected for failing to announce itself. That
+    fallback is also why the secondary categories cost a team nothing to
+    ignore - not claiming one cannot accidentally demote a summary.
+    """
+    if not isinstance(bundle, dict):
+        return PRIMARY_DOCUMENT
+
+    claimed = set(_meta_profiles(bundle))
+    for doc in EHDS_DOCUMENTS:
+        if claimed.intersection(doc["bundles"]):
+            return doc
+
+    entries = bundle.get("entry")
+    entries = entries if isinstance(entries, list) else []
+    entry_claims: set[str] = set()
+    resource_types: set[str] = set()
+    for entry in entries:
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        rtype = resource.get("resourceType")
+        if isinstance(rtype, str):
+            resource_types.add(rtype)
+        entry_claims.update(_meta_profiles(resource))
+    for doc in EHDS_DOCUMENTS:
+        if entry_claims.intersection(doc.get("entry_profiles") or ()):
+            return doc
+
+    codes = _composition_type_codes(bundle)
+    for doc in EHDS_DOCUMENTS:
+        if codes.intersection(doc["loinc"]):
+            return doc
+
+    if "ImagingStudy" in resource_types:
+        return DOCUMENTS_BY_ID["imaging"]
+    # Only when there is no Composition: a patient summary carries a medication
+    # section, and reading one as a prescription would score it against the
+    # wrong profile entirely.
+    if "Composition" not in resource_types and resource_types.intersection(
+        {"MedicationRequest", "MedicationDispense"}
+    ):
+        return DOCUMENTS_BY_ID["mpd"]
+    return PRIMARY_DOCUMENT
+
+
 # ---------------------------------------------------------------- matchbox
 
 
-def validate_with_matchbox(body: bytes) -> dict:
+def validate_with_matchbox(body: bytes, doc: dict | None = None) -> dict:
     """POST the bundle to Matchbox $validate; return the OperationOutcome dict.
+
+    `doc` is an EHDS_DOCUMENTS entry and decides both the profile the bundle is
+    checked against and the packages the engine is scoped to. Scoping matters:
+    an engine built for the patient summary does not carry the laboratory
+    profiles, so a lab report validated against it comes back with its
+    conformance unchecked rather than checked and failed. Defaults to the
+    patient summary so an existing caller keeps its old behaviour.
 
     Raises MatchboxError when the validator is unreachable or unusable.
     Monkeypatched in tests.
     """
-    query = [("profile", PROFILE)] + [("igs", ig) for ig in VALIDATION_IGS]
+    doc = doc or PRIMARY_DOCUMENT
+    query = [("profile", doc["profile"])] + [("igs", ig) for ig in doc["igs"]]
     url = f"{MATCHBOX_URL}/$validate?{urllib.parse.urlencode(query)}"
     req = urllib.request.Request(
         url,
@@ -1442,6 +1759,180 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
+# ------------------------------------------------------------ FHIR plumbing
+
+FHIR_JSON = "application/fhir+json"
+# The service's own canonical base, used in CapabilityStatement and in the
+# fullUrls of any searchset. Relative URLs would be ambiguous the moment a
+# response is saved to disk or passed to a second tool.
+FHIR_BASE = "/fhir"
+
+# HTTP status -> the OperationOutcome issue code FHIR asks for. Anything not
+# listed falls back to "processing", the spec's own catch-all, so an
+# unanticipated status still produces a legal resource rather than a KeyError.
+OUTCOME_CODES = {
+    400: "invalid",
+    401: "login",
+    403: "forbidden",
+    404: "not-found",
+    405: "not-supported",
+    409: "conflict",
+    413: "too-costly",
+    415: "not-supported",
+    422: "processing",
+    500: "exception",
+    502: "transient",
+    503: "transient",
+}
+
+
+def operation_outcome(status: int, diagnostics: str) -> dict:
+    """An OperationOutcome for an error, which is what FHIR returns instead of
+    a bespoke error object. Severity is always `error`: FHIR reserves `fatal`
+    for "the whole exchange is unusable", and a 404 on one read is not that."""
+    return {
+        "resourceType": "OperationOutcome",
+        "issue": [
+            {
+                "severity": "error",
+                "code": OUTCOME_CODES.get(status, "processing"),
+                "diagnostics": diagnostics,
+            }
+        ],
+    }
+
+
+def fhir_response(payload: dict, status: int = 200, **headers: str) -> Response:
+    """Any FHIR resource, served as fhir+json.
+
+    JSONResponse would send application/json, which a conformant FHIR client is
+    entitled to reject.
+    """
+    return Response(
+        content=json.dumps(payload),
+        status_code=status,
+        media_type=FHIR_JSON,
+        headers=headers or None,
+    )
+
+
+def _param_value(value) -> dict:
+    """The value[x] element for a Python value.
+
+    bool before int deliberately - bool is a subclass of int in Python, so the
+    obvious ordering turns every `true` into `valueInteger: 1`.
+    """
+    if isinstance(value, bool):
+        return {"valueBoolean": value}
+    if isinstance(value, int):
+        return {"valueInteger": value}
+    if isinstance(value, float):
+        return {"valueDecimal": value}
+    if isinstance(value, dict) and "resourceType" in value:
+        return {"resource": value}
+    if isinstance(value, dict):
+        return {"part": _named_params(value.items())}
+    return {"valueString": str(value)}
+
+
+def _named_param(name: str, value) -> dict:
+    return {"name": name, **_param_value(value)}
+
+
+def _named_params(pairs) -> list:
+    """Named parameters (or parts) from (name, value) pairs.
+
+    The two FHIR rules that make this more than a comprehension, applied at
+    every depth rather than only at the top: a list repeats the name, because
+    FHIR has no array type, and a `None` is dropped, because FHIR has no null
+    and an absent element *is* the null. A nested list used to fall through to
+    `str(value)` and go out as `valueString: "['laboratory']"`.
+    """
+    out = []
+    for name, value in pairs:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            out.extend(_named_param(name, item) for item in value)
+        else:
+            out.append(_named_param(name, value))
+    return out
+
+
+def parameters(pairs) -> dict:
+    """A Parameters resource from (name, value) pairs.
+
+    Parameters is FHIR's answer to "the server computed something that is not a
+    stored resource" - a leaderboard, a health check, a token. `None` values are
+    dropped rather than sent as null, because FHIR has no null: an absent
+    element *is* the null, and emitting one is invalid.
+
+    A list value repeats the parameter, which is how FHIR expresses
+    multiplicity - it has no array type.
+    """
+    return {"resourceType": "Parameters", "parameter": _named_params(pairs)}
+
+
+def searchset(resources: list, total: int | None = None) -> dict:
+    """A searchset Bundle, which is how FHIR returns a list of resources.
+
+    `total` defaults to the number carried, which is right whenever the whole
+    result is in one page - this server never pages, so it always is.
+    """
+    return {
+        "resourceType": "Bundle",
+        "type": "searchset",
+        "total": len(resources) if total is None else total,
+        "entry": [
+            {
+                "fullUrl": "%s/%s/%s" % (FHIR_BASE, r["resourceType"], r["id"]),
+                "resource": r,
+            }
+            for r in resources
+        ],
+    }
+
+
+@app.exception_handler(StarletteHTTPException)
+def http_exception_to_outcome(
+    _request: Request, exc: StarletteHTTPException
+) -> Response:
+    """Every error leaves as an OperationOutcome.
+
+    FastAPI's default is `{"detail": "..."}`, which is the one custom JSON shape
+    a FHIR client has no way to read. Registered for the exception class rather
+    than wrapped around each raise, so the errors the framework raises on its
+    own - an unrouted path, a wrong method - are converted too.
+    """
+    detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    return fhir_response(
+        operation_outcome(exc.status_code, detail),
+        status=exc.status_code,
+        **(exc.headers or {}),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+def validation_error_to_outcome(
+    _request: Request, exc: RequestValidationError
+) -> Response:
+    """A bad query or path parameter, as an OperationOutcome.
+
+    FastAPI answers these with a list of error objects of its own design -
+    another shape a FHIR client would have to learn. The location it names
+    ("query", "count") is the useful half, so that is what is kept.
+    """
+    parts = []
+    for err in exc.errors():
+        where = ".".join(str(bit) for bit in err.get("loc", ()) if bit != "body")
+        parts.append("%s: %s" % (where, err.get("msg", "invalid")) if where
+                     else err.get("msg", "invalid"))
+    return fhir_response(
+        operation_outcome(422, "; ".join(parts) or "Invalid request"),
+        status=422,
+    )
+
+
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
     """Read the body, refusing anything over `limit` before it is all resident.
 
@@ -1465,18 +1956,6 @@ async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
-
-
-async def small_json_body(request: Request) -> dict:
-    """Size-capped JSON object body for the non-bundle endpoints."""
-    raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
-    try:
-        payload = json.loads(raw)
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        raise HTTPException(400, detail="Body is not valid JSON")
-    if not isinstance(payload, dict):
-        raise HTTPException(400, detail="Body must be a JSON object")
-    return payload
 
 
 def team_from_token(
@@ -1523,31 +2002,77 @@ async def image_body(
     return await read_limited_body(request, MAX_IMAGE_BYTES, "Screenshot")
 
 
-@app.post("/api/register",
+# The company slug doubles as the Organization's logical id, so a partner's
+# document is reachable at a URL a human can type. The identifier system names
+# who mints them - a bare slug with no system is unmergeable with anything.
+TEAM_IDENTIFIER_SYSTEM = "https://nordichackathon2026.blogs.dsv.su.se/fhir/company"
+
+
+def organization_resource(row: sqlite3.Row) -> dict:
+    return {
+        "resourceType": "Organization",
+        "id": row["slug"],
+        "identifier": [{"system": TEAM_IDENTIFIER_SYSTEM, "value": row["slug"]}],
+        "active": True,
+        "name": row["name"],
+    }
+
+
+async def parameters_body(request: Request) -> dict:
+    """A Parameters resource body, flattened to {name: value}.
+
+    FHIR operations take their input as Parameters, so that is what the
+    operations here accept. Only the first value[x] of each part is read;
+    repeats and nested parts are not used by any operation on this server.
+    """
+    raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise HTTPException(400, detail="Body is not valid JSON")
+    if not isinstance(payload, dict) or payload.get("resourceType") != "Parameters":
+        raise HTTPException(
+            400, detail="Body must be a FHIR Parameters resource"
+        )
+    out: dict = {}
+    parts = payload.get("parameter")
+    for part in parts if isinstance(parts, list) else []:
+        if not isinstance(part, dict) or not isinstance(part.get("name"), str):
+            continue
+        for key, value in part.items():
+            if key.startswith("value"):
+                out[part["name"]] = value
+                break
+    return out
+
+
+@app.post("/fhir/$register",
     tags=["Companies"],
     summary="Register a company and get its token",
     description=(
-        "One registration per company. The token comes back once and is not "
-        "retrievable afterwards, so share it inside the company rather than "
-        "registering again. Set REGISTER_CODE on the server to require a "
-        "`code` field in the body as well."
+        "One registration per company. Takes a Parameters resource with a "
+        "`name`, and a `code` as well when the server sets REGISTER_CODE. The "
+        "token comes back once and is not retrievable afterwards, so share it "
+        "inside the company rather than registering again."
     ),
 )
-def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
+def register(params: dict = Depends(parameters_body)) -> Response:
     if REGISTER_CODE:
-        supplied = payload.get("code")
+        supplied = params.get("code")
         if not isinstance(supplied, str) or not secrets.compare_digest(
             supplied.encode("utf-8"), REGISTER_CODE.encode("utf-8")
         ):
             raise HTTPException(403, detail="Registration code required")
-    team = payload.get("team")
+    team = params.get("name")
     if not isinstance(team, str):
-        raise HTTPException(400, detail="Body must be {\"team\": \"<name>\"}")
+        raise HTTPException(
+            400, detail="Parameters must carry a `name` with the company name"
+        )
     # Collapse runs of whitespace so "Acme  Health" is the same company as
     # "Acme Health" rather than a way around the one-registration rule.
     team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
-        raise HTTPException(400, detail="Team name must be 2-40 characters")
+        raise HTTPException(400, detail="Company name must be 2-40 characters")
     token = secrets.token_hex(8)
     with connect() as conn:
         # The slug probe and the insert have to see the same table state, or
@@ -1560,18 +2085,39 @@ def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
                 (team, slug, token, datetime.now(timezone.utc).isoformat()),
             )
         except sqlite3.IntegrityError:
-            raise HTTPException(409, detail="Team name already taken")
-    return JSONResponse(
-        {
-            "team": team,
-            "token": token,
-            "note": "One registration per company. Register once and share "
-            "this token with your colleagues.",
-        }
+            raise HTTPException(409, detail="Company name already taken")
+        row = conn.execute(
+            "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
+        ).fetchone()
+    return fhir_response(
+        parameters(
+            [
+                ("token", token),
+                ("organization", organization_resource(row)),
+                (
+                    "note",
+                    "One registration per company. Register once and share "
+                    "this token with your colleagues.",
+                ),
+            ]
+        )
     )
 
 
-@app.get("/api/me",
+@app.get("/fhir/Organization",
+    tags=["Companies"],
+    summary="Every registered company",
+    description="A searchset Bundle of Organizations, by name.",
+)
+def search_organizations() -> Response:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
+        ).fetchall()
+    return fhir_response(searchset([organization_resource(r) for r in rows]))
+
+
+@app.get("/fhir/Organization/$me",
     tags=["Companies"],
     summary="Which company this token belongs to",
     description=(
@@ -1580,24 +2126,61 @@ def register(payload: dict = Depends(small_json_body)) -> JSONResponse:
         "caller already has it."
     ),
 )
-def whoami(team: sqlite3.Row = Depends(current_team)) -> dict:
-    return {"team": team["name"], "team_slug": team["slug"]}
+def whoami(team: sqlite3.Row = Depends(current_team)) -> Response:
+    return fhir_response(organization_resource(team))
 
 
-@app.post("/api/eps",
+@app.get("/fhir/Organization/{slug}",
+    tags=["Companies"],
+    summary="One company",
+)
+def read_organization(slug: str) -> Response:
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
+        ).fetchone()
+    if row is None:
+        raise HTTPException(404, detail="Unknown company")
+    return fhir_response(organization_resource(row))
+
+
+@app.post("/fhir/Bundle/$validate",
     tags=["Submissions"],
     summary="Validate and score a bundle",
     description=(
-        "Sends the bundle to Matchbox for validation against the EPS profile, "
-        "stores the result and returns the FHIR OperationOutcome. The score is "
-        "in the response headers, not the body. 413 if the bundle is larger "
-        "than MAX_BODY_BYTES, 502 if Matchbox cannot be reached."
+        "The FHIR $validate operation. POST the Bundle as the body and it is "
+        "checked, scored and recorded; the response is the OperationOutcome. "
+        "The profile is the European Patient Summary unless the bundle says "
+        "otherwise: another EHDS category is detected from the bundle, or you "
+        "can name that category's profile in `profile` to be certain. Which "
+        "one was used comes back as X-Document-Type; see $documents. The score "
+        "is in the response headers rather than the body, because $validate is "
+        "defined to return an OperationOutcome and nothing else. 413 if the "
+        "bundle is larger than MAX_BODY_BYTES, 502 if Matchbox cannot be "
+        "reached."
     ),
 )
-def submit_eps(
+def validate_bundle(
     body: bytes = Depends(bundle_body),
     team: sqlite3.Row = Depends(current_team),
+    profile: str | None = None,
 ) -> Response:
+    # $validate takes an optional profile. Honouring an arbitrary one would let
+    # a team pick a profile their bundle already satisfies and score full marks
+    # on it, so the accepted values are exactly the ones this event scores
+    # against - one per EHDS category. Naming one settles the category outright,
+    # which is the escape hatch for a document detect_document() reads wrongly.
+    requested = None
+    if profile is not None:
+        requested = next(
+            (d for d in EHDS_DOCUMENTS if d["profile"] == profile), None
+        )
+        if requested is None:
+            raise HTTPException(
+                400,
+                detail="This server validates against %s only"
+                % ", ".join(d["profile"] for d in EHDS_DOCUMENTS),
+            )
     try:
         bundle = json.loads(body)
     except (ValueError, UnicodeDecodeError, RecursionError):
@@ -1607,8 +2190,11 @@ def submit_eps(
     if not isinstance(bundle, dict):
         raise HTTPException(400, detail="Body must be a FHIR Bundle JSON object")
 
+    # Decided before validation, because it chooses the profile and the packages
+    # the bundle is checked against.
+    doc = requested or detect_document(bundle)
     try:
-        outcome = validate_with_matchbox(body)
+        outcome = validate_with_matchbox(body, doc)
     except MatchboxError as exc:
         raise HTTPException(502, detail=str(exc))
 
@@ -1628,7 +2214,7 @@ def submit_eps(
     errors = counts["fatal"] + counts["error"]
     passed = errors == 0
     sections, resources = count_bundle_richness(bundle)
-    score = submission_score(passed, sections, resources)
+    score = submission_score(passed, sections, resources, doc)
 
     # Audit log: the raw bytes, kept only for attempts that got a verdict, so
     # a validator outage does not leave files with no submission row behind.
@@ -1641,19 +2227,22 @@ def submit_eps(
     with open(os.path.join(team_dir, filename), "xb") as fh:
         fh.write(body)
 
-    awarded_first_pass = False
     with connect() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        if passed:
-            cur = conn.execute(
+        # The bonus is for the first company to pass *the track's own document*.
+        # A lab report cannot claim it - it is the patient summary prize, and
+        # handing it to whoever happened to bring the easiest other category
+        # would make it the opposite of what it is for.
+        if passed and doc["primary"]:
+            conn.execute(
                 "UPDATE teams SET first_pass = 1 WHERE id = ? "
                 "AND NOT EXISTS (SELECT 1 FROM teams WHERE first_pass = 1)",
                 (team["id"],),
             )
-            awarded_first_pass = cur.rowcount == 1
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO submissions (team_id, ts, pass, errors, warnings, infos, "
-            "score, sections, resources, filename) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "score, sections, resources, doc_type, filename) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 team["id"],
                 now.isoformat(),
@@ -1664,39 +2253,80 @@ def submit_eps(
                 score,
                 sections,
                 resources,
+                doc["id"],
                 filename,
             ),
         )
+        submission_id = cur.lastrowid
+        # Read back inside the same transaction as the insert, so both include
+        # this submission and two attempts landing together cannot miss each
+        # other.
+        standing = conn.execute(
+            "SELECT COALESCE(MAX(CASE WHEN doc_type = ? THEN score END), 0) AS best, "
+            "COUNT(DISTINCT CASE WHEN doc_type <> ? THEN doc_type END) AS secondary "
+            "FROM submissions WHERE team_id = ? AND pass = 1",
+            (PRIMARY_DOCUMENT["id"], PRIMARY_DOCUMENT["id"], team["id"]),
+        ).fetchone()
+        best = standing["best"] or 0
+        secondary = standing["secondary"] or 0
+        # Read here rather than from `team`: current_team() selects the columns
+        # authentication needs, and the bonus may have been won by an earlier
+        # submission of this same team.
+        held = conn.execute(
+            "SELECT first_pass FROM teams WHERE id = ?", (team["id"],)
+        ).fetchone()
+        holds_first_pass = bool(held and held["first_pass"])
 
-    effective_score = score + (FIRST_PASS_BONUS if awarded_first_pass else 0)
-    return Response(
-        content=json.dumps(outcome),
-        media_type="application/fhir+json",
-        headers={
+    # The team's standing after this submission, not this bundle's own points.
+    # The two used to be the same number; with the secondary categories in play
+    # they are not, and the header feeds a banner that sits next to a
+    # leaderboard showing the team total. Reporting the bundle alone made
+    # submitting a lab report look like the score had collapsed.
+    effective_score = team_score(best, holds_first_pass, secondary)
+    return fhir_response(
+        outcome,
+        # Content-Location is FHIR's own way of saying "what you just sent is
+        # readable here". Without it a team has to search their own history to
+        # find the id of the bundle they are holding in their hand.
+        **{
+            "Content-Location": "%s/Bundle/%d" % (FHIR_BASE, submission_id),
             "X-Pass": "true" if passed else "false",
             "X-Score": str(effective_score),
             "X-Errors": str(errors),
             "X-Sections": str(sections),
             "X-Resources": str(resources),
+            # This bundle's own points, before any team bonus. X-Score is the
+            # standing; without this the banner cannot show its arithmetic.
+            "X-Submission-Score": str(score),
+            # Which category the bundle was taken to be, and so which profile
+            # the findings below came from. A team that meant to send a lab
+            # report and sees "eps" here has its answer before reading one
+            # finding: the bundle never claimed what it was.
+            "X-Document-Type": doc["id"],
+            "X-Document-Profile": doc["profile"],
+            # Non-EPS categories passed, which is what the bonus is paid on.
+            "X-Secondary-Categories": str(secondary),
+            # The summary half of the standing, on its own. The banner needs to
+            # tell a company that has only ever sent other categories that it
+            # has no summary yet, and 0 here is the only thing that says so -
+            # X-Score alone cannot distinguish "no summary" from "a summary
+            # that scored nothing", and a summary that passed never scores
+            # nothing.
+            "X-Best-Patient-Summary": str(best),
+            # The other term in the standing. Without it the banner's
+            # arithmetic silently loses 20 points for whoever passed first.
+            "X-First-Pass": "true" if holds_first_pass else "false",
         },
     )
 
 
-@app.get("/api/leaderboard",
-    tags=["Submissions"],
-    summary="Current standings",
-    description=(
-        "One row per registered company, best score first. Companies that have "
-        "registered but never submitted appear at the bottom with no score."
-    ),
-)
-def leaderboard() -> list[dict]:
+def _leaderboard_rows() -> list[dict]:
     with connect() as conn:
         teams = conn.execute(
             "SELECT id, name, slug, first_pass FROM teams"
         ).fetchall()
         subs = conn.execute(
-            "SELECT team_id, ts, pass, errors, score, sections, resources "
+            "SELECT team_id, ts, pass, errors, score, sections, resources, doc_type "
             "FROM submissions ORDER BY ts"
         ).fetchall()
 
@@ -1709,40 +2339,68 @@ def leaderboard() -> list[dict]:
         team_subs = by_team.get(team["id"], [])
         first_pass = bool(team["first_pass"])
         if team_subs:
-            # Highest-scoring submission drives the team score and the
-            # richness columns; its timestamp is the moment the team first
-            # achieved its current best score (used as ranking tiebreak, so
-            # re-submitting never hurts).
-            best = min(team_subs, key=lambda s: (-s["score"], s["ts"]))
-            score = best["score"] + (FIRST_PASS_BONUS if first_pass else 0)
+            # The standing rests on the best patient summary, so that is what
+            # picks the headline submission and fills the richness columns.
+            primary_subs = [
+                s for s in team_subs if s["doc_type"] == PRIMARY_DOCUMENT["id"]
+            ]
+            # Highest-scoring submission of the two sets; its timestamp is the
+            # moment the team first achieved its current best score (used as
+            # ranking tiebreak, so re-submitting never hurts).
+            best = min(primary_subs or team_subs, key=lambda s: (-s["score"], s["ts"]))
+            best_primary = max((s["score"] for s in primary_subs), default=0)
+            # Registry order, not submission order, so the column reads the same
+            # for every team however they got there.
+            secondary = [
+                d["id"]
+                for d in SECONDARY_DOCUMENTS
+                if any(s["pass"] and s["doc_type"] == d["id"] for s in team_subs)
+            ]
+            score = team_score(best_primary, first_pass, len(secondary))
             rows.append(
                 {
-                    "team": team["name"],
-                    "team_slug": team["slug"],
+                    "organization": team["name"],
+                    "organizationSlug": team["slug"],
                     "score": score,
                     "passed": any(s["pass"] for s in team_subs),
                     "attempts": len(team_subs),
-                    "best_errors": min(s["errors"] for s in team_subs),
-                    "best_sections": best["sections"],
-                    "best_resources": best["resources"],
-                    "last_submission": team_subs[-1]["ts"],
-                    "first_pass": first_pass,
+                    # Across every category: this is "did anything come back
+                    # clean", a progress signal rather than a term of the
+                    # score, and a passing lab report really is 0 errors.
+                    "bestErrors": min(s["errors"] for s in team_subs),
+                    # Summary-scoped, and absent when there is no summary. A
+                    # lab report's 21 resources under a column that means "how
+                    # rich is your patient summary" is not comparable with the
+                    # row above it, and the status and category chips already
+                    # say the team submitted, so empty cannot be misread as
+                    # never having tried.
+                    "bestSections": best["sections"] if primary_subs else None,
+                    "bestResources": best["resources"] if primary_subs else None,
+                    # Absent rather than false for a team with no summary yet:
+                    # "has not passed the track's document" is the thing the
+                    # column is for, and 0 would read as a passing empty one.
+                    "bestPatientSummary": best_primary if primary_subs else None,
+                    "secondaryCategories": secondary,
+                    "lastSubmission": team_subs[-1]["ts"],
+                    "firstPass": first_pass,
                     "_best_ts": best["ts"],
                 }
             )
         else:
             rows.append(
                 {
-                    "team": team["name"],
-                    "team_slug": team["slug"],
+                    "organization": team["name"],
+                    "organizationSlug": team["slug"],
                     "score": 0,
                     "passed": False,
                     "attempts": 0,
-                    "best_errors": None,
-                    "best_sections": None,
-                    "best_resources": None,
-                    "last_submission": None,
-                    "first_pass": first_pass,
+                    "bestErrors": None,
+                    "bestSections": None,
+                    "bestResources": None,
+                    "bestPatientSummary": None,
+                    "secondaryCategories": [],
+                    "lastSubmission": None,
+                    "firstPass": first_pass,
                     "_best_ts": "9999",  # sorts after any real ISO timestamp
                 }
             )
@@ -1751,12 +2409,29 @@ def leaderboard() -> list[dict]:
     # Attempts and last submission are deliberately not tiebreaks: trying
     # again must never hurt a team's rank.
     rows.sort(
-        key=lambda r: (-r["score"], r["_best_ts"], r["team"].casefold())
+        key=lambda r: (-r["score"], r["_best_ts"], r["organization"].casefold())
     )
     for i, row in enumerate(rows, start=1):
         row["rank"] = i
         del row["_best_ts"]
     return rows
+
+
+@app.get("/fhir/$leaderboard",
+    tags=["Submissions"],
+    summary="Current standings",
+    description=(
+        "One `entry` parameter per registered company, best score first. "
+        "Companies that have registered but never submitted appear at the "
+        "bottom with no score. This is an operation rather than a search "
+        "because a ranking is computed on the way out - it is not a resource "
+        "the server stores, and pretending otherwise would mean inventing one."
+    ),
+)
+def leaderboard() -> Response:
+    return fhir_response(
+        parameters([("entry", row) for row in _leaderboard_rows()])
+    )
 
 
 # ---------------------------------------------------------------- submissions API
@@ -1791,89 +2466,52 @@ def _submission_row(sub_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-@app.get("/api/submissions",
+@app.get("/fhir/$submissions",
     tags=["Submissions"],
     summary="Submission history",
     description=(
-        "Every company's attempts, newest first, or one company's with `team`."
+        "Every company's attempts, newest first, or one company's with "
+        "`organization`. One `entry` parameter per attempt."
     ),
 )
-def list_submissions(team: str | None = None, limit: int = 100) -> list[dict]:
-    limit = max(1, min(limit, 1000))
+def list_submissions(organization: str | None = None, count: int = 100) -> Response:
+    count = max(1, min(count, 1000))
     query = (
         "SELECT s.id, t.name AS team, t.slug AS team_slug, s.ts, s.pass, "
-        "s.errors, s.warnings, s.score, s.sections, s.resources "
+        "s.errors, s.warnings, s.score, s.sections, s.resources, s.doc_type "
         "FROM submissions s JOIN teams t ON t.id = s.team_id "
     )
     params: tuple = ()
-    if team:
+    if organization:
         query += "WHERE t.slug = ? "
-        params = (team,)
+        params = (organization,)
     query += "ORDER BY s.ts DESC, s.id DESC LIMIT ?"
     with connect() as conn:
-        rows = conn.execute(query, params + (limit,)).fetchall()
-    return [
-        {
-            "id": r["id"],
-            "team": r["team"],
-            "team_slug": r["team_slug"],
-            "ts": r["ts"],
-            "pass": bool(r["pass"]),
-            "score": r["score"],
-            "errors": r["errors"],
-            "warnings": r["warnings"],
-            "sections": r["sections"],
-            "resources": r["resources"],
-        }
-        for r in rows
-    ]
-
-
-@app.get("/api/submissions/{sub_id}",
-    tags=["Submissions"],
-    summary="One submission in full",
-    description=(
-        "The validation verdict plus a readable summary of the bundle: patient, "
-        "sections and the clinical items under each one."
-    ),
-)
-def submission_detail(sub_id: int) -> dict:
-    row = _submission_row(sub_id)
-    if row is None:
-        raise HTTPException(404, detail="Unknown submission")
-    raw = read_submission_bytes(row["team_slug"], row["filename"])
-    if raw is None:
-        raise HTTPException(404, detail="Submission file missing")
-    bundle = _loads_or_none(raw)  # None: the summary degrades gracefully
-    return {
-        "id": row["id"],
-        "team": row["team_name"],
-        "team_slug": row["team_slug"],
-        "ts": row["ts"],
-        "pass": bool(row["pass"]),
-        "errors": row["errors"],
-        "warnings": row["warnings"],
-        "score": row["score"],
-        # The stored verdict stands even when the file no longer parses, so say
-        # so explicitly: an empty summary otherwise reads as an empty document.
-        "bundle_readable": bundle is not None,
-        "summary": safe_summary(bundle),
-    }
-
-
-@app.get("/api/submissions/{sub_id}/bundle",
-    tags=["Submissions"],
-    summary="Download the submitted bytes",
-    description="The exact bytes that were posted, unmodified.",
-)
-def submission_bundle(sub_id: int) -> Response:
-    row = _submission_row(sub_id)
-    if row is None:
-        raise HTTPException(404, detail="Unknown submission")
-    raw = read_submission_bytes(row["team_slug"], row["filename"])
-    if raw is None:
-        raise HTTPException(404, detail="Submission file missing")
-    return bundle_response(raw, "%s-%d-eps.json" % (row["team_slug"], row["id"]))
+        rows = conn.execute(query, params + (count,)).fetchall()
+    return fhir_response(
+        parameters(
+            [
+                (
+                    "entry",
+                    {
+                        "bundle": "%s/Bundle/%d" % (FHIR_BASE, r["id"]),
+                        "id": r["id"],
+                        "organization": r["team"],
+                        "organizationSlug": r["team_slug"],
+                        "recorded": r["ts"],
+                        "pass": bool(r["pass"]),
+                        "score": r["score"],
+                        "errors": r["errors"],
+                        "warnings": r["warnings"],
+                        "sections": r["sections"],
+                        "resources": r["resources"],
+                        "documentType": r["doc_type"],
+                    },
+                )
+                for r in rows
+            ]
+        )
+    )
 
 
 # ----------------------------------------------------------------- sample API
@@ -1943,64 +2581,85 @@ def read_sample_bytes(sample_id: str) -> bytes | None:
         return None
 
 
-@app.get("/api/samples",
+@app.get("/fhir/$samples",
     tags=["Samples"],
     summary="List the worked examples",
     description=(
-        "Synthetic documents for the event scenarios. No real patient data."
+        "Synthetic documents for the event scenarios. No real patient data. "
+        "Each `entry` carries the scenario it illustrates and the Bundle URL "
+        "to fetch it from."
     ),
 )
-def list_samples() -> dict:
-    return {
-        "disclaimer": SAMPLE_DISCLAIMER,
-        "samples": [dict(s, available=read_sample_bytes(s["id"]) is not None)
-                    for s in SAMPLES],
-    }
+def list_samples() -> Response:
+    return fhir_response(
+        parameters(
+            [("disclaimer", SAMPLE_DISCLAIMER)]
+            + [
+                (
+                    "entry",
+                    {
+                        "id": sample["id"],
+                        "bundle": "%s/Bundle/%s" % (FHIR_BASE, sample["id"]),
+                        "name": sample["name"],
+                        "tagline": sample["tagline"],
+                        "scenario": sample["scenario"],
+                        "scenarioName": sample["scenario_name"],
+                        "scenarioUrl": sample["scenario_url"],
+                        "language": sample["language"],
+                        "available": read_sample_bytes(sample["id"]) is not None,
+                    },
+                )
+                for sample in SAMPLES
+            ]
+        )
+    )
 
 
-@app.get("/api/samples/{sample_id}",
-    tags=["Samples"],
-    summary="One worked example",
-    description=(
-        "The same readable summary shape as a submission, plus the scenario it "
-        "illustrates."
-    ),
-)
-def sample_detail(sample_id: str) -> dict:
-    meta = _sample_meta(sample_id)
-    raw = read_sample_bytes(sample_id)
-    if meta is None or raw is None:
-        raise HTTPException(404, detail="Unknown sample")
-    return {
-        "id": meta["id"],
-        "team": meta["name"],
-        "team_slug": meta["id"],
-        "ts": None,
-        "pass": True,
-        "errors": 0,
-        "warnings": 0,
-        "score": None,
-        "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
-        "summary": safe_summary(_loads_or_none(raw)),
-    }
+def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
+    """(bytes, download filename) for a Bundle id, or None if there is none.
 
-
-@app.get("/api/samples/{sample_id}/bundle",
-    tags=["Samples"],
-    summary="Download a worked example",
-    description="The example bundle as FHIR JSON, for use as test input.",
-)
-def sample_bundle(sample_id: str) -> Response:
-    raw = read_sample_bytes(sample_id)
+    Submissions and samples share one id space, which is safe because they
+    cannot collide: a submission id is the decimal row id and a sample id is a
+    slug, which always carries a letter. One space means a partner's document
+    and a worked example are fetched exactly the same way.
+    """
+    if bundle_id.isdigit():
+        row = _submission_row(int(bundle_id))
+        if row is None:
+            return None
+        raw = read_submission_bytes(row["team_slug"], row["filename"])
+        if raw is None:
+            return None
+        # The category is in the name so a folder of downloads stays sortable
+        # once a team has sent more than patient summaries.
+        return raw, "%s-%s-%s.json" % (row["team_slug"], bundle_id, row["doc_type"])
+    raw = read_sample_bytes(bundle_id)
     if raw is None:
-        raise HTTPException(404, detail="Unknown sample")
-    return bundle_response(raw, "%s-example-eps.json" % sample_id)
+        return None
+    return raw, "%s-example-eps.json" % bundle_id
+
+
+@app.get("/fhir/Bundle/{bundle_id}",
+    tags=["Submissions"],
+    summary="Read a document",
+    description=(
+        "The exact bytes that were submitted, unmodified - or, for a worked "
+        "example, the example itself. Submitted documents and samples share "
+        "one id space, so anything the service holds is fetched the same way."
+    ),
+)
+def read_bundle(bundle_id: str) -> Response:
+    found = resolve_bundle(bundle_id)
+    if found is None:
+        raise HTTPException(404, detail="Unknown Bundle")
+    raw, filename = found
+    return bundle_response(raw, filename)
 
 
 # ---------------------------------------------------------------- interop API
 
 
-@app.get("/api/exchange",
+@app.get("/fhir/$exchange",
     tags=["Interop"],
     summary="Documents published for exchange",
     description=(
@@ -2008,8 +2667,8 @@ def sample_bundle(sample_id: str) -> Response:
         "list is open - the documents are the event's shared test corpus."
     ),
 )
-def exchange_list() -> list[dict]:
-    out = []
+def exchange_list() -> Response:
+    entries = []
     with connect() as conn:
         teams = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
@@ -2018,45 +2677,56 @@ def exchange_list() -> list[dict]:
             best = best_valid_submission(conn, team["id"])
             if best is None:
                 continue
-            out.append(
-                {
-                    "team": team["name"],
-                    "team_slug": team["slug"],
-                    "exchange_id": best["id"],
-                    "ts": best["ts"],
-                    "sections": best["sections"],
-                    "resources": best["resources"],
-                    "renderings": conn.execute(
-                        "SELECT COUNT(*) FROM renderings WHERE submission_id = ?",
-                        (best["id"],),
-                    ).fetchone()[0],
-                }
+            entries.append(
+                (
+                    "entry",
+                    {
+                        "organization": team["name"],
+                        "organizationSlug": team["slug"],
+                        "bundle": "%s/Bundle/%d" % (FHIR_BASE, best["id"]),
+                        "id": best["id"],
+                        "recorded": best["ts"],
+                        "sections": best["sections"],
+                        "resources": best["resources"],
+                        "renderings": conn.execute(
+                            "SELECT COUNT(*) FROM renderings WHERE submission_id = ?",
+                            (best["id"],),
+                        ).fetchone()[0],
+                    },
+                )
             )
-    return out
+    return fhir_response(parameters(entries))
 
 
-@app.get("/api/exchange/{team_slug}",
+@app.get("/fhir/Organization/{slug}/$document",
     tags=["Interop"],
-    summary="Fetch a partner's document",
-    description="The published bundle, ready to load into your own system.",
+    summary="Fetch a company's published document",
+    description=(
+        "The company's best valid submission, ready to load into your own "
+        "system. An instance operation rather than a search because the answer "
+        "is one document and it changes the moment they beat their own score."
+    ),
 )
-def exchange_fetch(team_slug: str) -> Response:
+def exchange_fetch(slug: str) -> Response:
     with connect() as conn:
         producer = conn.execute(
-            "SELECT id, name, slug FROM teams WHERE slug = ?", (team_slug,)
+            "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
         ).fetchone()
         if producer is None:
-            raise HTTPException(404, detail="Unknown team")
+            raise HTTPException(404, detail="Unknown company")
         best = best_valid_submission(conn, producer["id"])
     if best is None:
-        raise HTTPException(404, detail="Team has no valid submission yet")
+        raise HTTPException(404, detail="Company has no valid submission yet")
     raw = read_submission_bytes(producer["slug"], best["filename"])
     if raw is None:
         raise HTTPException(404, detail="Exchange document file missing")
     return bundle_response(
         raw,
         "%s-eps.json" % producer["slug"],
-        **{"X-Exchange-Id": str(best["id"]), "X-Producer": producer["slug"]},
+        **{
+            "Content-Location": "%s/Bundle/%d" % (FHIR_BASE, best["id"]),
+            "X-Producer": producer["slug"],
+        },
     )
 
 
@@ -2100,17 +2770,37 @@ RENDERING_SELECT = """
 """
 
 
-def rendering_dict(row: sqlite3.Row) -> dict:
+def documentreference_resource(row: sqlite3.Row) -> dict:
+    """One screenshot as a DocumentReference.
+
+    author is the company that took the picture, custodian is the company whose
+    document it is, and context.related points at the exact Bundle that was
+    opened - `subject` cannot be used for that, because R4 restricts it to a
+    Patient or similar and the thing being rendered here is a document.
+    """
     return {
-        "id": row["id"],
-        "document": row["submission_id"],
-        "producer": row["producer_name"],
-        "producer_slug": row["producer_slug"],
-        "consumer": row["consumer_name"],
-        "consumer_slug": row["consumer_slug"],
-        "ts": row["ts"],
-        "note": row["note"],
-        "image": "/api/renderings/%d/image" % row["id"],
+        "resourceType": "DocumentReference",
+        "id": str(row["id"]),
+        "status": "current",
+        "date": row["ts"],
+        "description": row["note"] or None,
+        "author": [{
+            "reference": "Organization/%s" % row["consumer_slug"],
+            "display": row["consumer_name"],
+        }],
+        "custodian": {
+            "reference": "Organization/%s" % row["producer_slug"],
+            "display": row["producer_name"],
+        },
+        "content": [{
+            "attachment": {
+                "contentType": row["mime"],
+                "url": "%s/Binary/%d" % (FHIR_BASE, row["id"]),
+            }
+        }],
+        "context": {
+            "related": [{"reference": "Bundle/%d" % row["submission_id"]}]
+        },
     }
 
 
@@ -2141,35 +2831,105 @@ def owned_rendering(
     return row
 
 
-@app.post("/api/exchange/{team_slug}/renderings",
+# base64 inflates by four bytes for every three, and a DocumentReference
+# carries a little JSON around the attachment. The decoded image is what
+# MAX_IMAGE_BYTES governs; this is only the envelope it arrives in.
+MAX_DOCREF_BODY_BYTES = MAX_IMAGE_BYTES * 4 // 3 + 8192
+
+
+async def docref_body(
+    request: Request, team: sqlite3.Row = Depends(current_team)
+) -> dict:
+    """The uploaded DocumentReference, read only once the uploader is known."""
+    raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise HTTPException(400, detail="Body is not valid JSON")
+    if not isinstance(payload, dict) or payload.get("resourceType") != "DocumentReference":
+        raise HTTPException(400, detail="Body must be a FHIR DocumentReference")
+    return payload
+
+
+def _reference_id(ref, expected_type: str) -> str | None:
+    """The logical id out of a {"reference": "Type/id"} element."""
+    if not isinstance(ref, dict):
+        return None
+    value = ref.get("reference")
+    if not isinstance(value, str):
+        return None
+    prefix = expected_type + "/"
+    return value[len(prefix):] if value.startswith(prefix) else None
+
+
+def _attachment_bytes(payload: dict) -> bytes:
+    content = payload.get("content")
+    first = content[0] if isinstance(content, list) and content else None
+    attachment = first.get("attachment") if isinstance(first, dict) else None
+    data = attachment.get("data") if isinstance(attachment, dict) else None
+    if not isinstance(data, str):
+        raise HTTPException(
+            400,
+            detail="content[0].attachment.data must carry the image, "
+            "base64-encoded",
+        )
+    try:
+        # validate=True so stray characters are an error rather than being
+        # silently skipped into bytes that are not the picture anyone uploaded.
+        raw = base64.b64decode(data, validate=True)
+    except (ValueError, TypeError):
+        raise HTTPException(400, detail="attachment.data is not valid base64")
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            413,
+            detail="Screenshot too large (%d bytes); limit is %d bytes"
+            % (len(raw), MAX_IMAGE_BYTES),
+        )
+    return raw
+
+
+@app.post("/fhir/DocumentReference",
     tags=["Interop"],
     status_code=201,
     summary="Publish a screenshot of a partner's document in your system",
     description=(
-        "Load a partner's exchange document into your own system, screenshot "
-        "what it looks like, and POST the image bytes here. The body is the "
-        "raw image - PNG, JPEG or WebP - not a multipart form. Use `note` to "
-        "say what the picture shows. Nothing about this is scored. 400 if the "
-        "body is not one of those three formats or the document is your own, "
-        "413 over MAX_IMAGE_BYTES."
+        "Load a partner's document into your own system, screenshot what it "
+        "looks like, and POST a DocumentReference whose "
+        "`content[0].attachment.data` is the image bytes base64-encoded - PNG, "
+        "JPEG or WebP. `custodian` names the company whose document it is, and "
+        "`description` is where you say what the picture shows. `author` is "
+        "taken from your token, not from the body. Nothing about this is "
+        "scored. 400 if the attachment is not one of those three formats or "
+        "the document is your own, 413 over MAX_IMAGE_BYTES."
     ),
 )
 def add_rendering(
-    team_slug: str,
-    note: str = "",
-    image: bytes = Depends(image_body),
+    payload: dict = Depends(docref_body),
     consumer: sqlite3.Row = Depends(current_team),
-) -> JSONResponse:
+) -> Response:
+    image = _attachment_bytes(payload)
     kind = sniff_image(image)
     if kind is None:
-        raise HTTPException(400, detail="Body must be a PNG, JPEG or WebP image")
+        raise HTTPException(
+            400, detail="Attachment must be a PNG, JPEG or WebP image"
+        )
     mime, ext = kind
+    slug = _reference_id(payload.get("custodian"), "Organization")
+    if not slug:
+        raise HTTPException(
+            400,
+            detail="custodian must reference the company whose document this "
+            "is, as Organization/<slug>",
+        )
+    note = payload.get("description")
+    note = note if isinstance(note, str) else ""
+
     with connect() as conn:
         producer = conn.execute(
-            "SELECT id, name, slug FROM teams WHERE slug = ?", (team_slug,)
+            "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
         ).fetchone()
         if producer is None:
-            raise HTTPException(404, detail="Unknown team")
+            raise HTTPException(404, detail="Unknown company")
         if producer["id"] == consumer["id"]:
             raise HTTPException(
                 400,
@@ -2181,7 +2941,7 @@ def add_rendering(
         # stay attached to the bytes somebody actually opened.
         best = best_valid_submission(conn, producer["id"])
         if best is None:
-            raise HTTPException(404, detail="Team has no valid submission yet")
+            raise HTTPException(404, detail="Company has no valid submission yet")
 
     now = datetime.now(timezone.utc)
     dest_dir = os.path.join(DATA_DIR, "renderings", consumer["slug"])
@@ -2200,51 +2960,74 @@ def add_rendering(
              note.strip()[:MAX_NOTE_CHARS], filename, mime),
         )
         row = fetch_rendering(conn, cur.lastrowid)
-    return JSONResponse(rendering_dict(row), status_code=201)
+    resource = documentreference_resource(row)
+    return fhir_response(
+        resource,
+        status=201,
+        Location="%s/DocumentReference/%s" % (FHIR_BASE, resource["id"]),
+    )
 
 
-@app.get("/api/renderings",
+@app.get("/fhir/DocumentReference",
     tags=["Interop"],
     summary="Screenshots of documents in other systems",
     description=(
-        "Newest first. Filter by `document` (a submission id), by `producer` "
-        "or by `consumer` (company slugs). Unfiltered it is every screenshot "
+        "Newest first, as a searchset. Filter by `related` (a Bundle id), by "
+        "`custodian` (the company whose document it is) or by `author` (the "
+        "company that took the screenshot). Unfiltered it is every screenshot "
         "the event has collected."
     ),
 )
 def list_renderings(
-    document: int | None = None,
-    producer: str | None = None,
-    consumer: str | None = None,
-) -> list[dict]:
+    related: int | None = None,
+    custodian: str | None = None,
+    author: str | None = None,
+) -> Response:
     where, params = [], []
-    if document is not None:
+    if related is not None:
         where.append("r.submission_id = ?")
-        params.append(document)
-    if producer:
+        params.append(related)
+    if custodian:
         where.append("p.slug = ?")
-        params.append(producer)
-    if consumer:
+        params.append(custodian)
+    if author:
         where.append("c.slug = ?")
-        params.append(consumer)
+        params.append(author)
     sql = RENDERING_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY r.ts DESC, r.id DESC"
     with connect() as conn:
-        return [rendering_dict(row) for row in conn.execute(sql, params)]
+        rows = [documentreference_resource(row) for row in conn.execute(sql, params)]
+    return fhir_response(searchset(rows))
 
 
-@app.get("/api/renderings/{rendering_id}/image",
+@app.get("/fhir/DocumentReference/{rendering_id}",
+    tags=["Interop"],
+    summary="One screenshot's metadata",
+)
+def read_rendering(rendering_id: int) -> Response:
+    with connect() as conn:
+        row = fetch_rendering(conn, rendering_id)
+    if row is None:
+        raise HTTPException(404, detail="Unknown DocumentReference")
+    return fhir_response(documentreference_resource(row))
+
+
+@app.get("/fhir/Binary/{rendering_id}",
     tags=["Interop"],
     summary="The screenshot itself",
-    description="The image bytes, served as the type its own bytes proved.",
+    description=(
+        "The image bytes, served as the type its own bytes proved. FHIR serves "
+        "a Binary as its own content type when that is what the client asked "
+        "for, which is what lets an <img> point straight at it."
+    ),
 )
 def rendering_image(rendering_id: int) -> Response:
     with connect() as conn:
         row = fetch_rendering(conn, rendering_id)
     if row is None:
-        raise HTTPException(404, detail="Unknown rendering")
+        raise HTTPException(404, detail="Unknown Binary")
     raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
     if raw is None:
         raise HTTPException(404, detail="Rendering image file missing")
@@ -2268,43 +3051,48 @@ def rendering_image(rendering_id: int) -> Response:
     )
 
 
-@app.patch("/api/renderings/{rendering_id}",
+@app.put("/fhir/DocumentReference/{rendering_id}",
     tags=["Interop"],
     summary="Rewrite the note on a screenshot you uploaded",
     description=(
-        "The note is where the uploader says what to look at - which section "
-        "came through wrong, what the picture is meant to show. It can be "
-        "rewritten as often as you like; only the company that uploaded the "
-        "screenshot may do it."
+        "`description` is where the uploader says what to look at - which "
+        "section came through wrong, what the picture is meant to show. It can "
+        "be rewritten as often as you like; only the company that uploaded the "
+        "screenshot may do it. Everything else in the body is ignored: the "
+        "image, the companies and the document it points at are settled at "
+        "upload and are not the note's to change."
     ),
 )
 def update_rendering(
     rendering_id: int,
-    payload: dict = Depends(small_json_body),
+    payload: dict = Depends(docref_body),
     team: sqlite3.Row = Depends(current_team),
-) -> dict:
-    if "note" not in payload:
-        raise HTTPException(400, detail="Body must carry a \"note\"")
-    note = payload["note"]
+) -> Response:
+    if "description" not in payload:
+        raise HTTPException(400, detail="Body must carry a \"description\"")
+    note = payload["description"]
     if not isinstance(note, str):
-        raise HTTPException(400, detail="\"note\" must be a string")
+        raise HTTPException(400, detail="\"description\" must be a string")
     with connect() as conn:
         owned_rendering(conn, rendering_id, team)
         conn.execute(
             "UPDATE renderings SET note = ? WHERE id = ?",
             (note.strip()[:MAX_NOTE_CHARS], rendering_id),
         )
-        return rendering_dict(fetch_rendering(conn, rendering_id))
+        return fhir_response(
+            documentreference_resource(fetch_rendering(conn, rendering_id))
+        )
 
 
-@app.delete("/api/renderings/{rendering_id}",
+@app.delete("/fhir/DocumentReference/{rendering_id}",
     tags=["Interop"],
+    status_code=204,
     summary="Withdraw a screenshot you uploaded",
     description="Only the company that uploaded it can remove it; 403 otherwise.",
 )
 def delete_rendering(
     rendering_id: int, team: sqlite3.Row = Depends(current_team)
-) -> dict:
+) -> Response:
     with connect() as conn:
         row = owned_rendering(conn, rendering_id, team)
         conn.execute("DELETE FROM renderings WHERE id = ?", (rendering_id,))
@@ -2315,21 +3103,33 @@ def delete_rendering(
         )
     except OSError:
         pass
-    return {"deleted": rendering_id}
+    # 204 is what FHIR returns for a delete: no body, and repeating it is not
+    # an error the second time.
+    return Response(status_code=204)
 
 
-@app.get("/api/health",
-    tags=["Service"],
-    summary="Service and validator health",
-    description=(
-        "Reports whether Matchbox is reachable (`up`), reachable but missing a "
-        "package named in VALIDATION_IGS (`degraded` - profile claims from that "
-        "package go unchecked), or unreachable (`down` - submissions fail). "
-        "Also carries the bundle size limit and whether registration needs a "
-        "code, for clients that want to warn before a doomed request."
-    ),
-)
-def health() -> dict:
+# Canonicals for the operations this server defines itself. They do not
+# resolve to an OperationDefinition anywhere - CapabilityStatement requires a
+# canonical for every operation, and a URL in our own namespace is at least
+# unambiguous about who coined it.
+CANONICAL_BASE = "https://nordichackathon2026.blogs.dsv.su.se/fhir"
+
+# name -> the one-line description that goes in $status and the docs. Kept
+# beside the CapabilityStatement so a new operation cannot be added to one and
+# forgotten in the other.
+SERVER_OPERATIONS = [
+    ("register", "Register a company and get its token"),
+    ("leaderboard", "Current standings"),
+    ("submissions", "Submission history"),
+    ("samples", "The worked examples for the event scenarios"),
+    ("exchange", "Documents published for interop testing"),
+    ("documents", "The document categories this validator checks"),
+    ("status", "Validator health and the service's limits"),
+]
+
+
+def matchbox_status() -> tuple[str, list[str]]:
+    """(state, missing packages) - `up`, `degraded` or `down`."""
     matchbox = "down"
     try:
         with urllib.request.urlopen(
@@ -2353,19 +3153,269 @@ def health() -> dict:
                 # Alive, validating, and quietly not checking what we asked
                 # for. Recreate the container after editing application.yaml.
                 matchbox = "degraded"
+    return matchbox, missing
+
+
+@app.get("/fhir/metadata",
+    tags=["Service"],
+    summary="What this server can do",
+    description=(
+        "The CapabilityStatement. Every FHIR server has one at this path, so a "
+        "client pointed at the base URL can discover the whole API without "
+        "being told any of it."
+    ),
+)
+def metadata() -> Response:
+    return fhir_response(
+        {
+            "resourceType": "CapabilityStatement",
+            "status": "active",
+            "date": datetime.now(timezone.utc).date().isoformat(),
+            "publisher": "Nordic Hackathon 2026",
+            "kind": "instance",
+            "software": {"name": app.title, "version": APP_VERSION},
+            "implementation": {
+                "description": "Nordic Hackathon 2026 EPS validation service",
+                "url": FHIR_BASE,
+            },
+            "fhirVersion": "4.0.1",
+            "format": [FHIR_JSON, "json"],
+            "rest": [
+                {
+                    "mode": "server",
+                    "security": {
+                        "description": (
+                            "Submitting, and anything that writes, needs the "
+                            "token from $register, sent as "
+                            "`Authorization: Bearer TOKEN` or "
+                            "`X-Team-Token: TOKEN`. Reads are open."
+                        )
+                    },
+                    "resource": [
+                        {
+                            "type": "Bundle",
+                            # profile is the one this server is *about*;
+                            # supportedProfile is the rest it will also check.
+                            # CapabilityStatement draws exactly that
+                            # distinction, so the demotion is expressed in the
+                            # conformance resource and not only in the prose.
+                            "profile": PRIMARY_DOCUMENT["profile"],
+                            "supportedProfile": [
+                                d["profile"] for d in SECONDARY_DOCUMENTS
+                            ],
+                            "interaction": [{"code": "read"}],
+                            "operation": [
+                                {
+                                    "name": "validate",
+                                    "definition":
+                                        "http://hl7.org/fhir/OperationDefinition/"
+                                        "Resource-validate",
+                                    "documentation":
+                                        "Validate against %s - or, for a bundle "
+                                        "that is another EHDS category, against "
+                                        "that category's profile - score the "
+                                        "result and record the attempt. See "
+                                        "$documents." % PRIMARY_DOCUMENT["profile"],
+                                }
+                            ],
+                        },
+                        {
+                            "type": "Organization",
+                            "interaction": [
+                                {"code": "read"}, {"code": "search-type"}
+                            ],
+                            "operation": [
+                                {
+                                    "name": "document",
+                                    "definition":
+                                        CANONICAL_BASE
+                                        + "/OperationDefinition/document",
+                                    "documentation":
+                                        "The company's best valid submission.",
+                                },
+                                {
+                                    "name": "me",
+                                    "definition":
+                                        CANONICAL_BASE + "/OperationDefinition/me",
+                                    "documentation":
+                                        "Which company the calling token belongs to.",
+                                },
+                            ],
+                        },
+                        {
+                            "type": "DocumentReference",
+                            "interaction": [
+                                {"code": "read"},
+                                {"code": "search-type"},
+                                {"code": "create"},
+                                {"code": "update"},
+                                {"code": "delete"},
+                            ],
+                            "searchParam": [
+                                {"name": "related", "type": "reference",
+                                 "documentation": "The Bundle that was rendered"},
+                                {"name": "custodian", "type": "reference",
+                                 "documentation": "Whose document it is"},
+                                {"name": "author", "type": "reference",
+                                 "documentation": "Who took the screenshot"},
+                            ],
+                        },
+                        {"type": "Binary", "interaction": [{"code": "read"}]},
+                    ],
+                    "operation": [
+                        {
+                            "name": name,
+                            "definition":
+                                CANONICAL_BASE + "/OperationDefinition/" + name,
+                            "documentation": doc,
+                        }
+                        for name, doc in SERVER_OPERATIONS
+                    ],
+                }
+            ],
+        }
+    )
+
+
+@app.get("/fhir/$documents",
+    tags=["Service"],
+    summary="The document categories this validator checks",
+    description=(
+        "One `entry` per document category, the patient summary first and "
+        "flagged `primary` - it is the track, and the only category that earns "
+        "richness points or the first-pass bonus. The rest are EHDS Article 14 "
+        "categories the service also accepts, each validated against its own "
+        "HL7 Europe guide and worth a flat bonus once. `ready` is false when "
+        "Matchbox has not loaded that category's packages, which means bundles "
+        "of that kind would be scored without their conformance being checked."
+    ),
+)
+def documents() -> Response:
+    loaded = loaded_ig_packages()
+    entries = []
+    for doc in EHDS_DOCUMENTS:
+        entries.append(
+            {
+                "id": doc["id"],
+                "label": doc["long_label"],
+                "abbreviation": doc["short"],
+                "ehdsCategory": doc["category"],
+                "primary": doc["primary"],
+                "profile": doc["profile"],
+                "ig": list(doc["igs"]),
+                "maturity": doc["maturity"],
+                "spec": doc["spec"],
+                "points": (
+                    "best submission: %d + %d per section (max %d) + %d per "
+                    "resource (max %d)"
+                    % (VALID_BASE, SECTION_POINTS, SECTION_CAP, RESOURCE_POINTS,
+                       RESOURCE_CAP)
+                    if doc["primary"]
+                    else "%d, once, the first time it passes"
+                    % SECONDARY_CATEGORY_POINTS
+                ),
+                "detectedByBundleProfile": list(doc["bundles"]),
+                "detectedByEntryProfile": list(doc.get("entry_profiles") or []),
+                "detectedByCompositionType": list(doc["loinc"]),
+                # None, not false, when Matchbox could not be asked: "we do not
+                # know" and "we know it is not loaded" send an organiser to two
+                # different places.
+                "ready": None if loaded is None
+                         else all(_ig_loaded(ig, loaded) for ig in doc["igs"]),
+            }
+        )
+    return fhir_response(parameters([("entry", e) for e in entries]))
+
+
+@app.get("/fhir/$status",
+    tags=["Service"],
+    summary="Validator health and the service's limits",
+    description=(
+        "Reports whether Matchbox is reachable (`up`), reachable but missing a "
+        "package named in VALIDATION_IGS (`degraded` - profile claims from that "
+        "package go unchecked), or unreachable (`down` - submissions fail). "
+        "Also carries the bundle size limit and whether registration needs a "
+        "code, for clients that want to warn before a doomed request. Separate "
+        "from `metadata` on purpose: what the server can do does not change, "
+        "and whether the validator is answering right now does."
+    ),
+)
+def status() -> Response:
+    matchbox, missing = matchbox_status()
+    return fhir_response(
+        parameters(
+            [
+                ("matchbox", matchbox),
+                ("missingIg", missing),
+                # The UI reads these so it can warn before a doomed request.
+                ("maxBundleBytes", MAX_BODY_BYTES),
+                ("maxImageBytes", MAX_IMAGE_BYTES),
+                ("maxNoteChars", MAX_NOTE_CHARS),
+                ("registerCodeRequired", bool(REGISTER_CODE)),
+                ("profile", PROFILE),
+                # Absent outside the practice period. The browser compares it
+                # against its own clock rather than being told a yes/no here, so
+                # the notice clears itself on a page nobody has reloaded since
+                # before the final wipe.
+                ("practiceEnds", PRACTICE_ENDS or None),
+            ]
+        )
+    )
+
+
+# ------------------------------------------------------------ page view model
+
+# The clinician view is a rendering, not data: a patient line, sections, and
+# the items under each one, shaped for the DOM that draws them. There is no
+# FHIR resource for that - the closest honest answer is "read the Bundle and
+# summarise it yourself" - so it is served from /ui, kept out of the
+# CapabilityStatement and out of the OpenAPI document, and is explicitly not
+# part of the API anyone should build against. The FHIR surface stays FHIR.
+
+
+@app.get("/ui/documents/{doc_id}", include_in_schema=False)
+def ui_document(doc_id: str) -> dict:
+    """The readable view of one submitted document or worked example."""
+    meta = _sample_meta(doc_id)
+    if meta is not None:
+        raw = read_sample_bytes(doc_id)
+        if raw is None:
+            raise HTTPException(404, detail="Unknown sample")
+        return {
+            "id": meta["id"],
+            "team": meta["name"],
+            "team_slug": meta["id"],
+            "ts": None,
+            "pass": True,
+            "errors": 0,
+            "warnings": 0,
+            "score": None,
+            "bundle_readable": True,
+            "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
+            "summary": safe_summary(_loads_or_none(raw)),
+        }
+    if not doc_id.isdigit():
+        raise HTTPException(404, detail="Unknown document")
+    row = _submission_row(int(doc_id))
+    if row is None:
+        raise HTTPException(404, detail="Unknown submission")
+    raw = read_submission_bytes(row["team_slug"], row["filename"])
+    if raw is None:
+        raise HTTPException(404, detail="Submission file missing")
+    bundle = _loads_or_none(raw)  # None: the summary degrades gracefully
     return {
-        "status": "ok",
-        "matchbox": matchbox,
-        "missing_igs": missing,
-        # The UI reads these so it can warn before a doomed request.
-        "max_body_bytes": MAX_BODY_BYTES,
-        "max_image_bytes": MAX_IMAGE_BYTES,
-        "max_note_chars": MAX_NOTE_CHARS,
-        "register_code_required": bool(REGISTER_CODE),
-        # Null outside the practice period. The browser compares it against its
-        # own clock rather than being told a yes/no here, so the notice clears
-        # itself on a page nobody has reloaded since before the final wipe.
-        "practice_ends": PRACTICE_ENDS or None,
+        "id": row["id"],
+        "team": row["team_name"],
+        "team_slug": row["team_slug"],
+        "ts": row["ts"],
+        "pass": bool(row["pass"]),
+        "errors": row["errors"],
+        "warnings": row["warnings"],
+        "score": row["score"],
+        # The stored verdict stands even when the file no longer parses, so say
+        # so explicitly: an empty summary otherwise reads as an empty document.
+        "bundle_readable": bundle is not None,
+        "summary": safe_summary(bundle),
     }
 
 
@@ -2701,6 +3751,18 @@ table.issues td.loc, table.issues th.loc-h { min-width: 190px; }
 .count-badge { display: inline-block; font-size: 0.68rem; font-weight: 600;
   color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 0 6px; margin-left: 4px; white-space: nowrap; }
+/* One per other EHDS category a company has passed. Small and quiet on
+   purpose: the column is a glance at breadth, and the score column - which the
+   patient summary dominates - is what ranks anyone. */
+.cat-chip { display: inline-block; font-size: 0.66rem; font-weight: 600;
+  letter-spacing: 0.02em; text-transform: uppercase; color: var(--muted);
+  background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: var(--r-ctl); padding: 1px 5px; white-space: nowrap;
+  vertical-align: middle; }
+/* The banner's own chip names the guide the findings below came from, so it
+   carries the accent the banner does rather than receding like the table's. */
+.banner .cat-chip { color: var(--accent); background: var(--accent-soft);
+  margin-left: 6px; }
 .profile-chip { display: inline-block; font-size: 0.66rem; color: var(--muted);
   background: var(--code-bg); border: 1px solid var(--border);
   border-radius: var(--r-ctl); padding: 0 6px; margin-left: 6px; white-space: nowrap;
@@ -2961,6 +4023,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <table id="lb">
     <thead><tr>
       <th scope="col">#</th><th scope="col">Company</th><th scope="col">Score</th><th scope="col">Status</th>
+      <th scope="col" title="Other EHDS document types this company has also passed">Also</th>
       <th scope="col">Sections</th><th scope="col">Resources</th><th scope="col">Errors (best)</th><th scope="col">Last submission</th>
     </tr></thead>
     <tbody id="lb-body"></tbody>
@@ -2978,11 +4041,34 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     Composition section that actually has entries (capped at +160), and +2 for
     every clinical resource outside the Composition and Patient (capped at
     +60). Sections only count once - repeating a section or padding the bundle
-    will not make it richer. Your company score is your best submission, plus a
-    one-time +20 "first pass" bonus for the first company to submit a valid
-    document. Interop testing is not scored.
+    will not make it richer. Your company score is your best patient summary,
+    plus a one-time +20 "first pass" bonus for the first company to submit a
+    valid one, plus +15 for each <a href="#other-documents">other EHDS document
+    type</a> you also get passing. Interop testing is not scored.
   </p>
 </section>
+
+<details class="card" id="other-documents">
+  <summary>Other EHDS documents we also validate<span class="count-badge"
+    id="other-count">4</span></summary>
+    <p class="muted" style="margin:10px 0">This is the patient summary track,
+    and the summary is what the leaderboard ranks. But EHDS
+    (<a href="https://eur-lex.europa.eu/eli/reg/2025/327/oj" target="_blank"
+    rel="noopener">Regulation (EU) 2025/327</a>, Article 14) names six priority
+    categories of health data that EHR systems have to exchange, so if you bring
+    one of the others it is detected from the bundle and validated properly
+    against its own HL7 Europe guide. Each one you pass is worth a flat
+    <strong>+15</strong>.</p>
+    <div class="table-wrap">
+    <table id="doc-table">
+      <thead><tr>
+        <th scope="col">EHDS category</th><th scope="col">Guide</th>
+        <th scope="col">Maturity</th>
+      </tr></thead>
+      <tbody id="doc-body"></tbody>
+    </table>
+    </div>
+</details>
 
 </div>
 
@@ -3021,6 +4107,10 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <input type="text" id="token" placeholder="paste your company token"
       autocomplete="off" spellcheck="false">
     <label for="bundle">FHIR Bundle JSON (paste, or pick a file below)</label>
+    <p class="muted" style="margin:-2px 0 6px">Bringing one of the
+    <a href="#other-documents">other EHDS document types</a> instead? Send it
+    here too - it is recognised from the bundle and checked against its own
+    guide.</p>
     <textarea id="bundle" placeholder='{"resourceType": "Bundle", "type": "document", ...}'
       spellcheck="false"></textarea>
     <div class="file-row">
@@ -3131,9 +4221,11 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   mapping server from <a href="https://ahdis.ch/" target="_blank" rel="noopener">ahdis</a>,
   which runs the official <a href="https://github.com/hapifhir/org.hl7.fhir.core"
   target="_blank" rel="noopener">HL7 FHIR validator</a> underneath.</p>
-  <p>Structure, profiles and cardinality are checked in full. External code
-  systems the guide EPS does not itself carry and that require a license (such as
-  SNOMED CT, LOINC, WHO ATC) are not checked.</p>
+  <p>Structure, profiles and cardinality are checked in full, against the EPS
+  guide - or, for one of the <a href="#other-documents">other EHDS document
+  types</a>, against its own HL7 Europe guide. External code systems those
+  guides do not themselves carry and that require a license (such as SNOMED CT,
+  LOINC, WHO ATC) are not checked.</p>
 </footer>
 <script>
 "use strict";
@@ -3145,9 +4237,95 @@ const fmtWhen = (ts) => new Date(ts).toLocaleString([],
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) =>
   ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+/* ---- FHIR unwrapping ----
+   The service speaks FHIR, so a list arrives as a Parameters resource with the
+   name repeated rather than as a JSON array, and an absent value is simply a
+   part that is not there - FHIR has no null. These three put one back into the
+   plain objects the rest of this page is written against, so every call site
+   below reads the same as it did when the API was bespoke. */
+function paramValue(part) {
+  if (part.part) return partsToObject(part.part);
+  if (part.resource) return part.resource;
+  for (const k in part) if (k.startsWith("value")) return part[k];
+  return null;
+}
+function partsToObject(parts) {
+  /* A repeated name *is* the list - FHIR has no array type - so repeats
+     collect rather than overwrite. Seen once it stays a scalar, which is the
+     same ambiguity any FHIR client resolves from the operation definition;
+     partList below is how this page resolves it. */
+  const out = {};
+  for (const p of parts || []) {
+    const v = paramValue(p);
+    if (p.name in out) {
+      out[p.name] = (Array.isArray(out[p.name]) ? out[p.name] : [out[p.name]]).concat([v]);
+    } else {
+      out[p.name] = v;
+    }
+  }
+  return out;
+}
+/* A part the operation defines as repeating, always as an array. Absent is
+   empty: FHIR has no null, so a company that has passed no other category
+   simply has no such part. */
+function partList(obj, name) {
+  const v = obj[name];
+  if (v === undefined || v === null) return [];
+  return Array.isArray(v) ? v : [v];
+}
+/* Every value of a repeated parameter, in order. */
+function paramEntries(res, name) {
+  return ((res && res.parameter) || [])
+    .filter((p) => p.name === name).map(paramValue);
+}
+function paramOne(res, name) {
+  const all = paramEntries(res, name);
+  return all.length ? all[0] : null;
+}
+/* $submissions, $exchange and $leaderboard name their parts after the FHIR
+   resources they
+   point at. The page was written against the older names and there is nothing
+   to gain from renaming a hundred call sites, so they are mapped back here -
+   one place to look when a part name changes. */
+function submissionRow(e) {
+  return { id: e.id, ts: e.recorded, team: e.organization,
+           team_slug: e.organizationSlug, pass: e.pass, score: e.score,
+           errors: e.errors, warnings: e.warnings, sections: e.sections,
+           resources: e.resources };
+}
+function partnerRow(e) {
+  return { team: e.organization, team_slug: e.organizationSlug,
+           exchange_id: e.id, ts: e.recorded, sections: e.sections,
+           resources: e.resources, renderings: e.renderings };
+}
+/* FHIR has no null, so a company that has never submitted has no bestErrors
+   part at all rather than one set to null. Absent becomes null here, once, so
+   the row template can keep asking `=== null` instead of every reader having
+   to know that. */
+function leaderboardRow(e) {
+  const orNull = (v) => (v === undefined ? null : v);
+  return { rank: e.rank, team: e.organization, team_slug: e.organizationSlug,
+           score: e.score, passed: e.passed, attempts: e.attempts,
+           first_pass: e.firstPass, best_errors: orNull(e.bestErrors),
+           best_sections: orNull(e.bestSections),
+           best_resources: orNull(e.bestResources),
+           secondary: partList(e, "secondaryCategories"),
+           last_submission: orNull(e.lastSubmission) };
+}
+/* FileReader gives a data: URL; the base64 payload is what FHIR's
+   Attachment.data wants, so everything up to the comma comes off. */
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1] || "");
+    reader.onerror = () => reject(reader.error || new Error("Could not read the image"));
+    reader.readAsDataURL(blob);
+  });
+}
+
 /* ---- practice period ---- */
 /* Before the event the board is wiped daily, so say so - a score that will not
-   survive the night should not look like a standing. Set from /api/health once
+   survive the night should not look like a standing. Set from $status once
    on load and re-checked on every leaderboard tick, which is what lets the
    notice clear itself at the final wipe on a page left open overnight. */
 let practiceEnds = null;
@@ -3162,13 +4340,51 @@ function updatePracticeNote() {
   note.hidden = !active;
 }
 
+/* ---- other EHDS document types ---- */
+/* Filled from $documents once at load. The short forms are what fits a
+   leaderboard cell; the long labels come from the server so the two lists
+   cannot drift apart. Seeded rather than left empty so the first leaderboard
+   paint - which can beat the fetch - still renders readable chips. */
+const DOC_SHORT = { eps: "PS", laboratory: "LAB", mpd: "eP/eD",
+                    imaging: "IMG", hdr: "HDR" };
+let DOC_LABELS = { eps: "European Patient Summary", laboratory: "Laboratory Report",
+                   mpd: "Medication Prescription and Dispense",
+                   imaging: "Imaging Report", hdr: "Hospital Discharge Report" };
+const docShort = (id) => DOC_SHORT[id] || id;
+const docLabel = (id) => DOC_LABELS[id] || id;
+
+async function loadDocuments() {
+  let docs;
+  try {
+    const res = await fetch("/fhir/$documents");
+    if (!res.ok) return;
+    docs = paramEntries(await res.json(), "entry");
+  } catch (e) { return; }  /* transient: the card keeps its placeholder */
+  DOC_LABELS = Object.fromEntries(docs.map((d) => [d.id, d.label]));
+  /* The card is about the *other* categories - the patient summary is the
+     whole rest of the page - so the primary one is not a row in it. */
+  const others = docs.filter((d) => !d.primary);
+  $("#other-count").textContent = others.length;
+  /* Category, guide and maturity only. How a bundle is recognised, and whether
+     Matchbox holds each package, are still on $documents for anyone who needs
+     them - they were more detail than this card is for. */
+  $("#doc-body").innerHTML = others.map((d) =>
+    "<tr><td>" + esc(d.ehdsCategory) + "</td>"
+      + '<td><a href="' + esc(d.spec) + '" target="_blank" rel="noopener">'
+      + esc(d.label) + "</a> <span class=\"cat-chip\">" + esc(d.abbreviation)
+      + "</span></td>"
+      + "<td>" + esc(d.maturity) + "</td></tr>"
+  ).join("");
+}
+loadDocuments();
+
 /* ---- leaderboard ---- */
 async function refreshLeaderboard() {
   updatePracticeNote();
   try {
-    const res = await fetch("/api/leaderboard");
+    const res = await fetch("/fhir/$leaderboard");
     if (!res.ok) return;
-    const rows = await res.json();
+    const rows = paramEntries(await res.json(), "entry").map(leaderboardRow);
     $("#lb-empty").style.display = rows.length ? "none" : "block";
     $("#lb").style.display = rows.length ? "table" : "none";
     $("#lb-body").innerHTML = rows.map((r) => `
@@ -3183,6 +4399,10 @@ async function refreshLeaderboard() {
         <td><strong>${r.score}</strong></td>
         <td>${r.passed ? '<span class="badge pass">VALID</span>'
                        : '<span class="badge fail">NOT YET</span>'}</td>
+        <td>${r.secondary.length
+          ? r.secondary.map((c) => '<span class="cat-chip" title="'
+              + esc(docLabel(c)) + '">' + esc(docShort(c)) + "</span>").join(" ")
+          : '<span class="muted">-</span>'}</td>
         <td>${r.best_sections === null ? "-" : r.best_sections}</td>
         <td>${r.best_resources === null ? "-" : r.best_resources}</td>
         <td>${r.best_errors === null ? "-" : r.best_errors}</td>
@@ -3249,6 +4469,17 @@ function applyRoute(scroll) {
   const parts = routeParts();
   const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0] : "leaderboard";
   showTab(tab);
+  /* #other-documents is a deep link into a folded card on the leaderboard tab,
+     not a tab of its own - it falls through to leaderboard above. Open it and
+     scroll it into view, or following the link from the submit page lands on a
+     closed summary and reads as a broken anchor. */
+  if (parts[0] === "other-documents") {
+    const fold = $("#other-documents");
+    if (fold) {
+      fold.open = true;
+      fold.scrollIntoView({ block: "start" });
+    }
+  }
   if (tab !== "clinical") return;
   if (!parts[1]) {
     go("clinical/sample/" + DEFAULT_SAMPLE + "/" + CV_DEFAULT, true);
@@ -3276,10 +4507,12 @@ $("#reg-btn").addEventListener("click", async () => {
   errBox.style.display = "none";
   $("#token-box").style.display = "none";
   try {
-    const res = await fetch("/api/register", {
+    const parts = [{ name: "name", valueString: name }];
+    if (code) parts.push({ name: "code", valueString: code });
+    const res = await fetch("/fhir/$register", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(code ? { team: name, code } : { team: name }),
+      headers: { "Content-Type": "application/fhir+json" },
+      body: JSON.stringify({ resourceType: "Parameters", parameter: parts }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
@@ -3290,9 +4523,9 @@ $("#reg-btn").addEventListener("click", async () => {
       errBox.style.display = "block";
       return;
     }
-    $("#token-value").textContent = data.token;
+    $("#token-value").textContent = paramOne(data, "token");
     $("#token-box").style.display = "block";
-    syncToken(data.token);
+    syncToken(paramOne(data, "token"));
     refreshLeaderboard();
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
@@ -3303,9 +4536,17 @@ $("#reg-btn").addEventListener("click", async () => {
   if (ev.key === "Enter") $("#reg-btn").click();
 }));
 
-/* FastAPI's validation errors arrive as a list, everything else as a string. */
+/* Every error from this service is an OperationOutcome, so the message is the
+   first issue's diagnostics. FastAPI's own `detail` is still read as a
+   fallback: a proxy or a framework error that never reached our handler will
+   still be shaped that way. */
 function detailText(data) {
-  if (!data || data.detail === undefined) return "";
+  if (!data) return "";
+  if (data.resourceType === "OperationOutcome") {
+    const issue = (data.issue || [])[0] || {};
+    return issue.diagnostics || (issue.details && issue.details.text) || "";
+  }
+  if (data.detail === undefined) return "";
   return typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
 }
 
@@ -3677,7 +4918,20 @@ $("#issue-groups").addEventListener("click", (ev) => {
    participant's own browser follows, under their own account, and the bundle
    itself is not in the prompt - only the findings. A team can paste more if
    they want to; that is their call to make. */
-const EXPLAIN_GUIDE = "http://hl7.eu/fhir/eps/";
+/* The guide the last submission was actually scored against, so the prompt
+   handed to an assistant names the right specification - findings from the
+   laboratory guide explained as if they came from the patient summary would
+   send a team looking for the wrong fix. Set from X-Document-Type on every
+   submission; the patient summary is the standing answer before the first
+   one, and the answer for almost every one after it. */
+const EXPLAIN_GUIDES = {
+  eps: ["European Patient Summary", "https://hl7.eu/fhir/eps/"],
+  laboratory: ["Laboratory Report", "https://hl7.eu/fhir/laboratory/"],
+  mpd: ["Medication Prescription and Dispense", "https://hl7.eu/fhir/mpd/"],
+  imaging: ["Imaging Report", "https://hl7.eu/fhir/imaging/"],
+  hdr: ["Hospital Discharge Report", "https://hl7.eu/fhir/hdr/"],
+};
+let explainDoc = "eps";
 
 /* ChatGPT, Claude and Le Chat take the question in the URL and open with it
    already in the composer. Gemini's web app has no such parameter, so it
@@ -3707,8 +4961,9 @@ function explainPrompt(groups, severity, reported) {
       ? "The " + reported + " " + noun + ", merged into " + groups.length
         + " distinct findings"
       : "The " + groups.length + " " + noun;
-  return "I am validating a FHIR European Patient Summary bundle against the HL7 "
-    + "Europe EPS implementation guide (" + EXPLAIN_GUIDE + ") with the official "
+  const guide = EXPLAIN_GUIDES[explainDoc] || EXPLAIN_GUIDES.eps;
+  return "I am validating a FHIR bundle against the HL7 Europe " + guide[0]
+    + " implementation guide (" + guide[1] + ") with the official "
     + "HL7 FHIR validator. Explain what " + (many ? "these " + noun + " mean"
                                                   : "this " + noun + " means")
     + " in plain terms and what to change in the bundle to fix "
@@ -3887,20 +5142,22 @@ let maxNote = 2000;
 async function checkValidator() {
   const note = $("#validator-note");
   try {
-    const res = await fetch("/api/health");
+    const res = await fetch("/fhir/$status");
     if (!res.ok) throw new Error("HTTP " + res.status);
-    const h = await res.json();
-    if (h.max_body_bytes) maxBundleBytes = h.max_body_bytes;
-    if (h.max_note_chars) maxNote = h.max_note_chars;
-    if (h.register_code_required) $("#reg-code-row").hidden = false;
+    const hRaw = await res.json();
+    const h = partsToObject(hRaw.parameter);
+    if (h.maxBundleBytes) maxBundleBytes = h.maxBundleBytes;
+    if (h.maxNoteChars) maxNote = h.maxNoteChars;
+    if (h.registerCodeRequired) $("#reg-code-row").hidden = false;
     /* NaN if the server sends something unparseable, and NaN fails the
        comparison in updatePracticeNote, so a bad value hides the notice
        rather than showing "Invalid Date". */
-    practiceEnds = h.practice_ends ? Date.parse(h.practice_ends) : null;
+    practiceEnds = h.practiceEnds ? Date.parse(h.practiceEnds) : null;
     updatePracticeNote();
     note.textContent = h.matchbox === "up" ? ""
       : h.matchbox === "degraded"
-        ? "The validator is up but has not loaded " + (h.missing_igs || []).join(", ")
+        ? "The validator is up but has not loaded "
+          + paramEntries(hRaw, "missingIg").join(", ")
           + " - tell the organisers before trusting a verdict."
         : "The validator is down right now - submissions will fail until it is back.";
   } catch (e) {
@@ -3950,9 +5207,12 @@ $("#submit-btn").addEventListener("click", async () => {
   $("#submit-btn").disabled = true;
   $("#spinner").classList.add("on");
   try {
-    const res = await fetch("/api/eps", {
+    const res = await fetch("/fhir/Bundle/$validate", {
       method: "POST",
-      headers: { "Content-Type": "application/fhir+json", "X-Team-Token": token },
+      headers: {
+        "Content-Type": "application/fhir+json",
+        "Authorization": "Bearer " + token,
+      },
       body,
     });
     if (!res.ok || !res.headers.has("X-Pass")) {
@@ -3969,29 +5229,65 @@ $("#submit-btn").addEventListener("click", async () => {
     const errors = parseInt(res.headers.get("X-Errors") || "0", 10);
     const sections = parseInt(res.headers.get("X-Sections") || "0", 10);
     const resources = parseInt(res.headers.get("X-Resources") || "0", 10);
+    const docType = res.headers.get("X-Document-Type") || "eps";
+    explainDoc = docType;
+    const mine = parseInt(res.headers.get("X-Submission-Score") || "0", 10);
+    const extras = parseInt(res.headers.get("X-Secondary-Categories") || "0", 10);
+    const bestEps = parseInt(res.headers.get("X-Best-Patient-Summary") || "0", 10);
+    const firstPass = res.headers.get("X-First-Pass") === "true";
+    const isPrimary = docType === "eps";
     const banner = $("#banner");
     banner.className = "banner " + (pass ? "pass" : "fail");
     /* Verdict and number on the banner, arithmetic on hover: the score is
        already spelled out in the badge, and how it was reached only matters
-       when it is not the number the team expected. */
+       when it is not the number the team expected.
+       X-Score is the company standing, which may rest on an earlier and better
+       bundle than this one, so the arithmetic is spelled out from its parts
+       rather than reverse-engineered from the total. */
     let text, why;
-    if (pass) {
-      const base = 50 + Math.min(160, sections * 10) + Math.min(60, resources * 2);
+    /* Name the summary term only when there is one. A company that has sent
+       nothing but other categories would otherwise read "15 = best patient
+       summary + 15" and take it to mean its summary scored zero, when the
+       truth is that it has not entered the track at all - which is the one
+       thing worth telling it here. */
+    const standing = bestEps
+      ? "Company score " + score + " = best patient summary " + bestEps
+        + (firstPass ? " + 20 first valid summary" : "")
+        + (extras ? " + " + extras + " × 15 for " + extras + " other EHDS "
+                  + (extras === 1 ? "document" : "documents") : "")
+        + "."
+      : "Company score " + score + ", all of it bonuses - no patient summary "
+        + "has passed yet, and that is what the leaderboard ranks.";
+    if (pass && isPrimary) {
       text = "✔ VALID";
-      why = "50 valid + " + sections + " distinct section"
+      why = "This summary: 50 valid + " + sections + " distinct section"
         + (sections === 1 ? "" : "s") + " ×10"
         + (sections * 10 > 160 ? " (capped at +160)" : "")
         + " + " + resources + " resource" + (resources === 1 ? "" : "s") + " ×2"
         + (resources * 2 > 60 ? " (capped at +60)" : "")
-        + (score > base ? " + 20 first pass" : "")
-        + " = " + score;
+        + " = " + mine + ". " + standing;
+    } else if (pass) {
+      text = "✔ VALID";
+      /* Say plainly that this one does not earn richness points, or a team
+         that padded a lab report with sections is left guessing why. */
+      why = "A " + docLabel(docType) + " is worth a flat " + mine
+        + " the first time it passes - the patient summary is what earns "
+        + "section and resource points. " + standing;
     } else {
       text = "✖ INVALID - fix the " + errors + " error"
         + (errors === 1 ? "" : "s") + " below first";
-      why = "Any error or fatal issue scores 0, whatever else the bundle carries.";
+      why = "Any error or fatal issue scores 0, whatever else the bundle carries."
+        + (isPrimary ? "" : " Checked against the " + docLabel(docType) + " guide.");
     }
     banner.title = why;
-    banner.innerHTML = esc(text) + '<span class="score">' + score + " pts</span>";
+    /* The category is on the banner whenever it is not the track's own
+       document, not only in the hover text: a team that meant to send a lab
+       report and had it read as a patient summary - or the reverse - needs to
+       see that before it reads a single finding. */
+    banner.innerHTML = esc(text)
+      + (isPrimary ? "" : '<span class="cat-chip" title="Validated against '
+          + esc(docLabel(docType)) + '">' + esc(docShort(docType)) + "</span>")
+      + '<span class="score">' + score + " pts</span>";
     renderIssues(outcome.issue || [], body);
     refreshLeaderboard();
   } catch (e) {
@@ -4006,16 +5302,17 @@ $("#submit-btn").addEventListener("click", async () => {
 /* ---- curl examples ---- */
 const origin = window.location.origin;
 $("#curl-register").textContent =
-  "curl -s -X POST " + origin + "/api/register \\\n" +
-  "  -H 'Content-Type: application/json' \\\n" +
-  "  -d '{\"team\": \"My Company\"}'";
-$("#curl-submit").textContent =
-  "curl -s -D - -X POST " + origin + "/api/eps \\\n" +
+  "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
   "  -H 'Content-Type: application/fhir+json' \\\n" +
-  "  -H 'X-Team-Token: YOUR_TOKEN' \\\n" +
+  "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
+  + "[{\"name\":\"name\",\"valueString\":\"My Company\"}]}'";
+$("#curl-submit").textContent =
+  "curl -s -D - -X POST " + origin + "/fhir/Bundle/\\$validate \\\n" +
+  "  -H 'Content-Type: application/fhir+json' \\\n" +
+  "  -H 'Authorization: Bearer YOUR_TOKEN' \\\n" +
   "  --data-binary @my-eps-bundle.json";
 $("#curl-leaderboard").textContent =
-  "curl -s " + origin + "/api/leaderboard";
+  "curl -s " + origin + "/fhir/\\$leaderboard";
 
 /* ---- clinical view ---- */
 let cvSubsByTeam = new Map();  // slug -> that company's submissions, fetched when picked
@@ -4034,11 +5331,11 @@ const SAMPLE_TEAM = "__samples";
 
 async function initSamples() {
   try {
-    const res = await fetch("/api/samples");
+    const res = await fetch("/fhir/$samples");
     if (!res.ok) return;
     const data = await res.json();
-    cvDisclaimer = data.disclaimer || "";
-    cvSamples = (data.samples || []).filter((s) => s.available);
+    cvDisclaimer = paramOne(data, "disclaimer") || "";
+    cvSamples = paramEntries(data, "entry").filter((s) => s.available);
   } catch (e) { /* the picker says so when the list is empty */ }
 }
 
@@ -4080,10 +5377,18 @@ async function initClinical() {
        submissions is not, once the event gets busy. */
     let teams;
     try {
-      const res = await fetch("/api/leaderboard");
-      if (!res.ok) return;
-      teams = (await res.json()).filter((t) => t.attempts > 0);
-    } catch (e) { return; }
+      const res = await fetch("/fhir/$leaderboard");
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      teams = paramEntries(await res.json(), "entry")
+        .map(leaderboardRow).filter((t) => t.attempts > 0);
+    } catch (e) {
+      /* Say so rather than returning quietly. An empty picker beside no
+         explanation reads as "nobody has submitted", and that is how a broken
+         company list went unnoticed once already. */
+      $("#cv-list").innerHTML = '<p class="muted">Could not load the list of '
+        + "companies (" + esc(e.message) + ").</p>";
+      return;
+    }
     const slugs = new Set(teams.map((t) => t.team_slug));
     const sel = $("#cv-team");
     const current = sel.value;
@@ -4157,10 +5462,10 @@ async function renderCvList() {
   if (!subs) {
     box.innerHTML = '<p class="muted">Loading\u2026</p>';
     try {
-      const res = await fetch("/api/submissions?team=" + encodeURIComponent(slug)
-        + "&limit=" + CV_LIST_LIMIT);
+      const res = await fetch("/fhir/$submissions?organization="
+        + encodeURIComponent(slug) + "&count=" + CV_LIST_LIMIT);
       if (!res.ok) throw new Error("HTTP " + res.status);
-      subs = await res.json();
+      subs = paramEntries(await res.json(), "entry").map(submissionRow);
     } catch (e) {
       box.innerHTML = '<p class="muted">Could not load the submissions ('
         + esc(e.message) + ").</p>";
@@ -4213,9 +5518,11 @@ $("#cv-list").addEventListener("click", (ev) => {
 let cvDocKey = null;
 
 async function showDoc(kind, id, scroll) {
-  const path = kind === "sample" ? "/api/samples/"
-             : kind === "submission" ? "/api/submissions/" : null;
-  if (!path || !id) { hideDoc(); return; }
+  /* The readable view is view data, not FHIR, so it comes from /ui rather
+     than pretending to be a resource. Samples and submissions share one id
+     space, so one path serves both. */
+  if (!kind || !id) { hideDoc(); return; }
+  const path = "/ui/documents/";
   const key = kind + "/" + id;
   if (key === cvDocKey && cvCurrent) { renderClinicalDoc(cvCurrent); return; }
   let data;
@@ -4659,13 +5966,13 @@ function renderClinicalDoc(d) {
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
   html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
     + (d.sample
-        ? ' &middot; <a href="/api/samples/' + esc(d.sample.id)
-          + '/bundle" download>download the FHIR bundle</a>'
+        ? ' &middot; <a href="/fhir/Bundle/' + esc(d.sample.id)
+          + '" download>download the FHIR bundle</a>'
         : " &middot; submitted " + new Date(d.ts).toLocaleString()
           + " &middot; " + (d.pass ? "valid" : "invalid") + ", score " + d.score
           + (d.errors ? ", " + plural(d.errors, "error") : "")
-          + ' &middot; <a href="/api/submissions/' + d.id
-          + '/bundle" download>download the FHIR bundle</a>')
+          + ' &middot; <a href="/fhir/Bundle/' + d.id
+          + '" download>download the FHIR bundle</a>')
     + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
     + "</p>";
   html += (Object.hasOwn(CV_VIEWS, cvMode) ? CV_VIEWS[cvMode] : CV_VIEWS.document).fn(d);
@@ -4687,16 +5994,22 @@ $("#cv-doc").addEventListener("click", (ev) => {
 /* ---- interop testing ---- */
 function interopCurls() {
   $("#curl-exchange").textContent =
-    "curl -s " + origin + "/api/exchange/PARTNER_SLUG -o partner-eps.json\n" +
+    "curl -s " + origin + "/fhir/Organization/PARTNER_SLUG/\\$document"
+      + " -o partner-eps.json\n" +
     "# list every published document first:\n" +
-    "curl -s " + origin + "/api/exchange\n\n" +
-    "# publish a screenshot of how it came out in your system:\n" +
-    "curl -X POST '" + origin + "/api/exchange/PARTNER_SLUG/renderings"
-      + "?note=Allergies+came+through+empty' \\\n" +
-    "     -H 'X-Team-Token: TOKEN' -H 'Content-Type: image/png' \\\n" +
-    "     --data-binary @screenshot.png\n" +
+    "curl -s " + origin + "/fhir/\\$exchange\n\n" +
+    "# publish a screenshot of how it came out in your system - the image goes\n" +
+    "# in the attachment, base64-encoded:\n" +
+    "curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
+    "     -H 'Authorization: Bearer TOKEN' \\\n" +
+    "     -H 'Content-Type: application/fhir+json' -d '{\n" +
+    '       "resourceType": "DocumentReference", "status": "current",\n' +
+    '       "description": "Allergies came through empty",\n' +
+    '       "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
+    '       "content": [{"attachment": {"contentType": "image/png",\n' +
+    '                                   "data": "\'\"$(base64 -w0 shot.png)\"\'"}}]}\'\n' +
     "# every screenshot of one document:\n" +
-    "curl -s '" + origin + "/api/renderings?document=ID'";
+    "curl -s '" + origin + "/fhir/DocumentReference?related=ID'";
 }
 $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
@@ -4710,9 +6023,10 @@ function shotCountLabel(n) {
    confirmation and the open gallery down with it. */
 async function refreshShotCount(slug) {
   try {
-    const res = await fetch("/api/exchange");
+    const res = await fetch("/fhir/$exchange");
     if (!res.ok) return;
-    const p = (await res.json()).find((x) => x.team_slug === slug);
+    const p = paramEntries(await res.json(), "entry").map(partnerRow)
+      .find((x) => x.team_slug === slug);
     const btn = document.querySelector('.io-partner[data-slug="' + slug
       + '"] [data-shots]');
     if (p && btn) btn.textContent = shotCountLabel(p.renderings);
@@ -4722,24 +6036,24 @@ async function refreshShotCount(slug) {
 function partnerCard(p) {
   return '<div class="io-partner" data-slug="' + esc(p.team_slug) + '">'
     + "<strong>" + esc(p.team) + "</strong>"
-    + '<p class="muted" style="margin:6px 0 0"><code>GET /api/exchange/' + esc(p.team_slug)
-    + "</code> \u00b7 Document #" + p.exchange_id
+    + '<p class="muted" style="margin:6px 0 0"><code>GET /fhir/Organization/'
+    + esc(p.team_slug) + "/$document</code> \u00b7 Document #" + p.exchange_id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
-    + ' \u00b7 <a href="/api/submissions/' + p.exchange_id
-    + '/bundle" download>download the FHIR bundle</a></p>'
+    + ' \u00b7 <a href="/fhir/Bundle/' + p.exchange_id
+    + '" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
     + '<button class="ghost" data-shots="' + p.exchange_id + '">'
     + shotCountLabel(p.renderings) + "</button>"
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */
-    + (me && me.team_slug === p.team_slug
+    + (me && me.id === p.team_slug
         ? '<span class="muted">Your document - other companies add the screenshots.</span>'
         : '<button class="ghost" data-add="' + esc(p.team_slug) + '">'
           + "I loaded this - add a screenshot</button>")
     + "</div>"
-    + (me && me.team_slug === p.team_slug ? "" :
+    + (me && me.id === p.team_slug ? "" :
       '<div class="shot-form" hidden data-form="' + esc(p.team_slug) + '">'
     + '<label for="shot-file-' + esc(p.team_slug) + '">Screenshot (PNG, JPEG or WebP)</label>'
     + '<input type="file" accept="image/png,image/jpeg,image/webp" id="shot-file-'
@@ -4784,13 +6098,37 @@ async function whoAmI() {
   const token = $("#token").value.trim();
   if (!token) { me = null; return; }
   try {
-    const res = await fetch("/api/me", { headers: { "X-Team-Token": token } });
+    const res = await fetch("/fhir/Organization/$me", {
+      headers: { "Authorization": "Bearer " + token },
+    });
+    /* An Organization: `id` is the slug, `name` the company name. */
     me = res.ok ? await res.json() : null;
   } catch (e) { me = null; }
 }
 
+/* A DocumentReference, flattened to what the tile draws. author is the company
+   that took the screenshot, custodian the one whose document it is, and the
+   attachment url is the Binary the bytes are served from. */
+function shotFromDocRef(d) {
+  const author = (d.author || [])[0] || {};
+  const custodian = d.custodian || {};
+  const attachment = ((d.content || [])[0] || {}).attachment || {};
+  const refId = (ref) => String(ref || "").split("/").pop();
+  return {
+    id: d.id,
+    document: refId((((d.context || {}).related || [])[0] || {}).reference),
+    producer: custodian.display,
+    producer_slug: refId(custodian.reference),
+    consumer: author.display,
+    consumer_slug: refId(author.reference),
+    ts: d.date,
+    note: d.description || "",
+    image: attachment.url,
+  };
+}
+
 function shotTile(s) {
-  const mine = me && me.team_slug === s.consumer_slug;
+  const mine = me && me.id === s.consumer_slug;
   return '<figure class="shot" data-shot="' + s.id + '">'
     + '<a href="' + s.image + '" target="_blank" rel="noopener">'
     + '<img loading="lazy" src="' + s.image + '" alt="'
@@ -4810,8 +6148,10 @@ async function loadGallery(docId) {
   const box = document.querySelector('[data-gallery="' + docId + '"]');
   if (!box) return;
   try {
-    const res = await fetch("/api/renderings?document=" + docId);
-    const shots = res.ok ? await res.json() : [];
+    const res = await fetch("/fhir/DocumentReference?related=" + docId);
+    const shots = res.ok
+      ? ((await res.json()).entry || []).map((e) => shotFromDocRef(e.resource))
+      : [];
     box.innerHTML = shots.length
       ? shots.map(shotTile).join("")
       : '<p class="muted">Nobody has published a screenshot of this document yet.</p>';
@@ -4839,18 +6179,27 @@ async function uploadShot(slug) {
   shotStatus(form, "Uploading...");
   try {
     const blob = await shrinkImage(file);
-    const res = await fetch("/api/exchange/" + encodeURIComponent(slug)
-      + "/renderings?note=" + encodeURIComponent(note), {
+    const res = await fetch("/fhir/DocumentReference", {
       method: "POST",
-      headers: { "X-Team-Token": token,
-                 "Content-Type": blob.type || "application/octet-stream" },
-      body: blob,
+      headers: { "Authorization": "Bearer " + token,
+                 "Content-Type": "application/fhir+json" },
+      body: JSON.stringify({
+        resourceType: "DocumentReference",
+        status: "current",
+        description: note,
+        custodian: { reference: "Organization/" + slug },
+        content: [{ attachment: {
+          contentType: blob.type || "application/octet-stream",
+          data: await blobToBase64(blob),
+        } }],
+      }),
     });
-    const data = await res.json().catch(() => ({}));
+    const body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      shotStatus(form, detailText(data) || ("Upload failed (" + res.status + ")"), true);
+      shotStatus(form, detailText(body) || ("Upload failed (" + res.status + ")"), true);
       return;
     }
+    const data = shotFromDocRef(body);
     shotStatus(form, "Published - thank you.");
     form.querySelector("input[type=file]").value = "";
     form.querySelector("textarea").value = "";
@@ -4901,11 +6250,13 @@ async function saveShotNote(id) {
   const next = tile.querySelector(".shot-edit textarea").value;
   shotErr(tile, "");
   try {
-    const res = await fetch("/api/renderings/" + id, {
-      method: "PATCH",
-      headers: { "X-Team-Token": $("#token").value.trim(),
-                 "Content-Type": "application/json" },
-      body: JSON.stringify({ note: next }),
+    const res = await fetch("/fhir/DocumentReference/" + id, {
+      method: "PUT",
+      headers: { "Authorization": "Bearer " + $("#token").value.trim(),
+                 "Content-Type": "application/fhir+json" },
+      body: JSON.stringify({
+        resourceType: "DocumentReference", status: "current", description: next,
+      }),
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -4932,9 +6283,9 @@ async function withdrawShot(id, confirmed) {
   const slug = tile.closest(".io-partner").dataset.slug;
   shotErr(tile, "");
   try {
-    const res = await fetch("/api/renderings/" + id, {
+    const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "DELETE",
-      headers: { "X-Team-Token": $("#token").value.trim() },
+      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -4983,9 +6334,9 @@ async function initInterop() {
   const box = $("#io-partners");
   await whoAmI();
   try {
-    const res = await fetch("/api/exchange");
+    const res = await fetch("/fhir/$exchange");
     if (!res.ok) return;
-    const partners = await res.json();
+    const partners = paramEntries(await res.json(), "entry").map(partnerRow);
     hint.textContent = partners.length
       ? "Every published exchange document, free to download and test against."
       : "No company has a valid submission yet - check back soon.";
@@ -5057,34 +6408,28 @@ applyRoute(false);
 # would be a second source of truth that drifts; this patches only the parts
 # the framework cannot see.
 OPENAPI_BODIES = {
-    ("/api/register", "post"): {
+    ("/fhir/$register", "post"): {
         "required": True,
         "content": {
-            "application/json": {
+            FHIR_JSON: {
                 "schema": {
                     "type": "object",
-                    "required": ["team"],
-                    "properties": {
-                        "team": {
-                            "type": "string",
-                            "minLength": 2,
-                            "maxLength": 40,
-                            "description": "Company name, shown on the leaderboard.",
-                        },
-                        "code": {
-                            "type": "string",
-                            "description": "Only when the server sets REGISTER_CODE.",
-                        },
-                    },
+                    "description": "A FHIR Parameters resource.",
                 },
-                "example": {"team": "FHIR Starters"},
-            }
+                "example": {
+                    "resourceType": "Parameters",
+                    "parameter": [
+                        {"name": "name", "valueString": "FHIR Starters"}
+                    ],
+                },
+            },
+            "application/json": {"schema": {"type": "object"}},
         },
     },
-    ("/api/eps", "post"): {
+    ("/fhir/Bundle/$validate", "post"): {
         "required": True,
         "content": {
-            "application/fhir+json": {
+            FHIR_JSON: {
                 "schema": {
                     "type": "object",
                     "description": "A FHIR R4 Bundle of type 'document'.",
@@ -5094,26 +6439,50 @@ OPENAPI_BODIES = {
             "application/json": {"schema": {"type": "object"}},
         },
     },
-    ("/api/exchange/{team_slug}/renderings", "post"): {
-        "required": True,
-        "description": "The raw image bytes - not a multipart form.",
-        "content": {
-            fmt: {"schema": {"type": "string", "format": "binary"}}
-            for fmt in ("image/png", "image/jpeg", "image/webp")
-        },
-    },
-    ("/api/renderings/{rendering_id}", "patch"): {
+    ("/fhir/DocumentReference", "post"): {
         "required": True,
         "content": {
-            "application/json": {
+            FHIR_JSON: {
                 "schema": {
                     "type": "object",
-                    "required": ["note"],
-                    "properties": {"note": {"type": "string",
-                                            "maxLength": MAX_NOTE_CHARS}},
+                    "description": (
+                        "A DocumentReference whose content[0].attachment.data "
+                        "is the PNG, JPEG or WebP bytes, base64-encoded."
+                    ),
                 },
-                "example": {"note": "Allergies section came through empty."},
-            }
+                "example": {
+                    "resourceType": "DocumentReference",
+                    "status": "current",
+                    "description": "Allergies section came through empty.",
+                    "custodian": {"reference": "Organization/partner-slug"},
+                    "content": [
+                        {
+                            "attachment": {
+                                "contentType": "image/png",
+                                "data": "iVBORw0KGgo...",
+                            }
+                        }
+                    ],
+                },
+            },
+            "application/json": {"schema": {"type": "object"}},
+        },
+    },
+    ("/fhir/DocumentReference/{rendering_id}", "put"): {
+        "required": True,
+        "content": {
+            FHIR_JSON: {
+                "schema": {
+                    "type": "object",
+                    "required": ["resourceType", "description"],
+                },
+                "example": {
+                    "resourceType": "DocumentReference",
+                    "status": "current",
+                    "description": "Allergies section came through empty.",
+                },
+            },
+            "application/json": {"schema": {"type": "object"}},
         },
     },
 }
@@ -5122,19 +6491,37 @@ OPENAPI_BODIES = {
 # the OperationOutcome. FastAPI only documents headers it was told about.
 SUBMIT_RESPONSE_HEADERS = {
     "X-Pass": ("true when the bundle had no error or fatal issue", "string"),
-    "X-Score": ("points this submission earned, bonuses included", "integer"),
+    "X-Score": ("the company's leaderboard score after this submission, "
+                "bonuses included", "integer"),
+    "X-Submission-Score": ("what this bundle alone scored, before bonuses",
+                           "integer"),
     "X-Errors": ("count of error and fatal issues", "integer"),
     "X-Sections": ("distinct populated Composition sections", "integer"),
     "X-Resources": ("clinical resources counted for richness", "integer"),
+    "X-Document-Type": (
+        "the document category the bundle was checked as, and so the profile "
+        "the findings came from - one of the ids from $documents", "string"),
+    "X-Document-Profile": ("canonical of the profile it was validated against",
+                           "string"),
+    "X-Secondary-Categories": (
+        "non-patient-summary EHDS categories this company has now passed",
+        "integer"),
+    "X-Best-Patient-Summary": (
+        "the company's best passing patient summary, 0 if it has none yet - "
+        "the rest of X-Score is bonuses", "integer"),
+    "X-First-Pass": (
+        "true when this company holds the one-time first-valid-summary bonus",
+        "string"),
+    "Content-Location": ("where this bundle is now readable", "string"),
 }
 
-# Endpoints that read X-Team-Token. Anything else is open.
+# Endpoints that read the token. Anything else is open.
 TOKEN_REQUIRED = {
-    ("/api/me", "get"),
-    ("/api/eps", "post"),
-    ("/api/exchange/{team_slug}/renderings", "post"),
-    ("/api/renderings/{rendering_id}", "patch"),
-    ("/api/renderings/{rendering_id}", "delete"),
+    ("/fhir/Organization/$me", "get"),
+    ("/fhir/Bundle/$validate", "post"),
+    ("/fhir/DocumentReference", "post"),
+    ("/fhir/DocumentReference/{rendering_id}", "put"),
+    ("/fhir/DocumentReference/{rendering_id}", "delete"),
 }
 
 
@@ -5147,11 +6534,19 @@ def custom_openapi() -> dict:
         version=APP_VERSION,
         summary="Validate and score European Patient Summary bundles.",
         description=(
-            "Register a company, submit FHIR R4 EPS bundles for validation "
-            "against `%s`, and fetch other companies' documents to test "
-            "against.\n\n"
-            "Team endpoints take the token from `POST /api/register`, sent as "
-            "`X-Team-Token: TOKEN` or `Authorization: Bearer TOKEN`."
+            "A FHIR R4 server rooted at `/fhir`. Register a company, submit "
+            "bundles to `Bundle/$validate` for validation against `%s`, and "
+            "fetch other companies' documents to test against.\n\n"
+            "The patient summary is what the event scores. A bundle that is "
+            "one of the other EHDS Article 14 categories is recognised from "
+            "its content and validated against that category's own HL7 Europe "
+            "guide instead, for a flat bonus rather than the summary's "
+            "richness points - `$documents` lists them.\n\n"
+            "Point a FHIR client at `/fhir` and `GET /fhir/metadata` describes "
+            "all of this in FHIR's own terms; this document is the same API "
+            "for readers who would rather have OpenAPI.\n\n"
+            "Writing endpoints take the token from `POST /fhir/$register`, sent "
+            "as `Authorization: Bearer TOKEN` or `X-Team-Token: TOKEN`."
         ) % PROFILE,
         routes=app.routes,
     )
@@ -5161,7 +6556,7 @@ def custom_openapi() -> dict:
             "type": "apiKey",
             "in": "header",
             "name": "X-Team-Token",
-            "description": "The token returned by POST /api/register.",
+            "description": "The token returned by POST /fhir/$register.",
         }
     }
     for path, operations in schema["paths"].items():
@@ -5180,7 +6575,7 @@ def custom_openapi() -> dict:
                 op["security"] = [{"TeamToken": []}]
             if key in OPENAPI_BODIES:
                 op["requestBody"] = OPENAPI_BODIES[key]
-    submit = schema["paths"]["/api/eps"]["post"]["responses"]["200"]
+    submit = schema["paths"]["/fhir/Bundle/$validate"]["post"]["responses"]["200"]
     submit["description"] = "The Matchbox OperationOutcome for this bundle."
     submit["content"] = {"application/fhir+json": {"schema": {"type": "object"}}}
     submit["headers"] = {

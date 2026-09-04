@@ -4,6 +4,8 @@ Service for the [Nordic Hackathon 2026](https://nordichackathon2026.blogs.dsv.su
 
 Gamified FHIR hackathon service: teams register, submit European Patient Summary bundles,
 a local [Matchbox](https://github.com/ahdis/matchbox) validates them against HL7 EU EPS, and a live leaderboard keeps score.
+Four other EHDS [document types](#document-types) are accepted too, validated against
+their own HL7 Europe guide - second-class on purpose: the patient summary is the track.
 
 ## Run
 
@@ -17,7 +19,7 @@ cd ../itb && docker compose -p itb up -d matchbox   # -> http://localhost:8090/m
 Matchbox reads `matchbox/config/application.yaml` once, at boot. After editing it
 (adding an IG, say) recreate the container - `docker compose -p itb up -d
 --force-recreate matchbox` - or the running validator keeps its old package list and
-`/api/health` reports it as `degraded`.
+`/fhir/$status` reports it as `degraded`.
 
 **Docker** (needs `itb_default`, so run the compose command above first - without it
 `docker run` fails with `network itb_default not found`):
@@ -39,22 +41,28 @@ Do not use `uvicorn app:app` - it defaults to localhost only and ignores `PORT`.
 
 Environment: `PORT` (8095), `DATA_DIR` (`/data`), `MATCHBOX_URL`
 (`http://matchbox:8080/matchboxv3/fhir`), `PROFILE`
-(`http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps`), `SAMPLES_DIR`
+(`http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps` - the patient summary
+profile the event scores against; the other document types carry their own),
+`SAMPLES_DIR`
 (`samples/` next to `app.py`), `MAX_BODY_BYTES` (5 MB), `MAX_IMAGE_BYTES` (2 MB - the
 backstop for an interop screenshot; the UI downscales before it uploads, so this is
 not the expected size), `MATCHBOX_TIMEOUT` (60 s - how long a submitting client waits
 on a wedged validator), `REGISTER_CODE` (unset = registration is open; set it to
-require `{"code": "..."}` on `/api/register`).
+require a `code` parameter on `/fhir/$register`).
 `DATA_DIR` must be writable by the user running the service; it holds
 `connectathon.db`, the raw submission audit log and `renderings/` (the uploaded
 screenshots, one directory per uploading company).
 
-`VALIDATION_IGS` (default `hl7se.fhir.base#1.1.0`, comma-separated) names extra
-packages to load into the validation engine. Matchbox scopes an engine to the IG
-that defines `PROFILE`, so a `meta.profile` claim from any other package is
-reported as "has not been checked" rather than validated. The named packages
-must also be listed in `matchbox/config/application.yaml`, or Matchbox has
-nothing to load.
+`VALIDATION_IGS` (comma-separated) is the list of packages `/fhir/$status`
+insists Matchbox has actually loaded, and `deploy.sh` refuses to finish while
+any of them is missing. It defaults to every package named in `EHDS_DOCUMENTS`,
+de-duplicated, so a category whose guide is missing is caught before an event
+rather than silently scored unchecked. It does *not* decide what a given bundle
+is checked against: each document type carries its own package list, and that is
+what the validation engine is scoped to - see [Document
+types](#document-types). Narrow it only to run against a Matchbox holding fewer
+IGs than the registry describes. Whatever is named here must also be listed in
+`matchbox/config/application.yaml`, or Matchbox has nothing to load.
 
 Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest -q test_app.py`
 
@@ -270,10 +278,10 @@ pruning ages them out.
 
 ## Scoring
 
-Any error or fatal validation issue scores the submission **0**. A valid bundle earns
-**50**, plus **+10** per *distinct* populated Composition section (capped at **+160**)
-and **+2** per clinical resource, meaning everything that is not the Composition or the
-Patient (capped at **+60**).
+Any error or fatal validation issue scores the submission **0**. A valid **patient
+summary** earns **50**, plus **+10** per *distinct* populated Composition section
+(capped at **+160**) and **+2** per clinical resource, meaning everything that is not
+the Composition or the Patient (capped at **+60**).
 
 A section is populated when at least one of its `entry` references resolves to a
 clinical resource in the bundle - an `emptyReason`, a display-only entry or a
@@ -282,9 +290,64 @@ falling back to their `title`; sections with neither collapse into one. Repeatin
 section or padding the bundle with sections therefore earns nothing; resources are
 worth +2 each up to the cap, and the cap is what keeps padding pointless there.
 
-A team's score is its best submission. The first company ever to go valid keeps a one-time
-**+20 first pass** bonus. Nothing else scores - interop testing is deliberately unscored,
-so there is nothing to farm. Set `REGISTER_CODE` if you want registration closed as well.
+A team's score is its best **patient summary**, plus a one-time **+20 first pass**
+bonus for the first company ever to pass one, plus **+15** for each of the other
+[document types](#document-types) it also has a passing submission in. Nothing else
+scores - interop testing is deliberately unscored, so there is nothing to farm. Set
+`REGISTER_CODE` if you want registration closed as well.
+
+The +15 is flat and paid once per category however many of that kind you send, and a
+non-summary earns no section or resource points at all: richness is measured against
+what a patient summary is meant to carry, and counting sections on a lab report would
+only reward the wrong shape. Passing all four others is worth 60 - less than a
+middling summary - which is the intent. This is the patient summary track; the rest is
+credit for breadth, not a route around it. A company that only ever submits summaries
+scores exactly what it scored before any of the other categories existed.
+
+## Document types
+
+The event is the European Patient Summary. But EHDS ([Regulation (EU)
+2025/327](https://eur-lex.europa.eu/eli/reg/2025/327/oj), Article 14) names six
+priority categories of health data that EHR systems have to exchange, HL7 Europe
+publishes a FHIR guide for five of them, and a team that brings a lab report should
+get it checked properly rather than scored against the wrong profile. So all five are
+accepted, and the four that are not the summary are deliberately second-class: real
+validation and real findings, a flat bonus, and no place in the page's headline.
+
+| Category (Article 14) | Guide | Maturity | Scores |
+|---|---|---|---|
+| Patient summary | [EPS](https://hl7.eu/fhir/eps/1.0.0-ballot/) | ballot | 50 + sections + resources |
+| Medical test result | [Laboratory Report](https://hl7.eu/fhir/laboratory/) | STU 2.0 | +15 |
+| ePrescription / eDispensation | [MPD](https://hl7.eu/fhir/mpd/) | STU 1.0 | +15 |
+| Medical imaging study and report | [Imaging Report](https://hl7.eu/fhir/imaging/) | ballot | +15 |
+| Discharge report | [HDR](https://hl7.eu/fhir/hdr/) | ballot | +15 |
+
+Medical imaging *studies* are the one Article 14 category with no document guide to
+validate here - the imaging entry is the report.
+
+Nothing is selected by the submitter. The category is read off the bundle, strongest
+signal first: `Bundle.meta.profile` naming a guide's bundle profile; an entry claiming
+an MPD profile (a prescription is a collection, not a document, so MPD defines no
+Bundle profile and its evidence sits one level down); `Composition.type`, which EPS,
+laboratory and HDR each bind to a single LOINC code; an `ImagingStudy` in the bundle
+(imaging binds `Composition.type` to every LOINC descendant of 18726-0, which needs a
+terminology server to decide, so the study stands in for the code check); and finally
+medications in a bundle with no Composition. Anything unrecognised is treated as a
+patient summary - the event's own track - so failing to announce a document can never
+demote a summary out of the scoring.
+
+Claim the profile in `meta.profile`, or pass `?profile=` on the submit call, to settle
+it outright. `curl 'localhost:8095/fhir/$documents'` lists the lot, including whether
+Matchbox has each one's packages loaded.
+
+Each category is validated in its own engine: Matchbox scopes an engine to the
+requested profile's dependency closure, so a lab report checked with the summary's
+packages comes back with its conformance *unchecked* rather than checked and failed -
+a silent pass. The package list per category lives in `EHDS_DOCUMENTS` in `app.py`,
+and every one of them must also be in `matchbox/config/application.yaml`. Adding a
+sixth category is an entry in each. Two of the guides fail their own published
+examples for reasons outside this repository; `matchbox/config/application.yaml`
+records which and why.
 
 ## Swedish base profiles
 
@@ -305,36 +368,97 @@ instead of a "not checked" warning.
 
 ## API
 
-Team endpoints authenticate with `X-Team-Token: TOKEN` (or `Authorization: Bearer TOKEN`).
-A missing or unknown token is **401**. Registration answers **400** if the name is not
-2-40 characters, **403** if `REGISTER_CODE` is set and the code is wrong, **409** if the
-name is already taken (whitespace-normalised; case-insensitive for ASCII letters only).
+This is a FHIR R4 server, not a bespoke API with FHIR-shaped payloads. The base is
+`/fhir`, every response is `application/fhir+json`, and every error - a 404, a wrong
+method, a bad query parameter - is an `OperationOutcome`, so a client that can read a
+validation failure needs no second parser for anything else. Start at the
+CapabilityStatement and the whole surface is discoverable from there:
+
+```
+curl localhost:8095/fhir/metadata
+```
+
+Endpoints that write authenticate with `Authorization: Bearer TOKEN` (or
+`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**.
+
+Anything the server computes rather than stores - a ranking, a health check, a token -
+comes back as a `Parameters` resource. That is FHIR's answer for exactly this, and it
+has two consequences worth knowing before you parse one: a repeated parameter name *is*
+the list (FHIR has no array type), and an absent parameter *is* the null (FHIR has no
+null), so a company that has never submitted simply has no `bestErrors` part rather
+than one set to `null`.
 
 ### Registration
 
 ```
 # one registration per company - keep the token, it is shown once
-curl -X POST localhost:8095/api/register -H 'Content-Type: application/json' -d '{"team":"My Team"}'
+curl -X POST 'localhost:8095/fhir/$register' -H 'Content-Type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [{"name": "name", "valueString": "My Company"}]
+}'
 ```
 
-The response carries the token and the company name as stored. Elsewhere the company is
-addressed by its slug - the lower-cased, ASCII-folded name with runs of anything else
-turned into `-` (`Åland Hälsa` is `aland-halsa`), suffixed `-2`, `-3` if that slug is
-taken. The leaderboard rows carry it as `team_slug`.
+Answers `Parameters` with a `token` and the company as an `Organization`. **400** if the
+name is not 2-40 characters, **403** if `REGISTER_CODE` is set and the `code` parameter
+is wrong or missing, **409** if the name is taken (whitespace-normalised;
+case-insensitive for ASCII letters only).
+
+The `Organization`'s id is the slug - the lower-cased, ASCII-folded name with runs of
+anything else turned into `-` (`Åland Hälsa` is `aland-halsa`), suffixed `-2`, `-3` if
+that slug is taken. It is how the company is addressed everywhere else, and it is what
+`organizationSlug` carries in the operations below.
+
+```
+# every registered company, as a searchset
+curl localhost:8095/fhir/Organization
+curl localhost:8095/fhir/Organization/aland-halsa
+# which company a token belongs to
+curl 'localhost:8095/fhir/Organization/$me' -H 'Authorization: Bearer TOKEN'
+```
 
 ### Submission
 
+`$validate` is FHIR's own operation for this, so the verb a client already knows is the
+verb that scores you:
+
 ```
-# validate + score a bundle; score is in the X-Score response header
-curl -D - -X POST localhost:8095/api/eps -H 'X-Team-Token: TOKEN' \
+# validate + score a bundle; the score is in the X-Score response header
+curl -D - -X POST 'localhost:8095/fhir/Bundle/$validate' -H 'Authorization: Bearer TOKEN' \
      -H 'Content-Type: application/fhir+json' --data-binary @bundle.json
+# ...or say outright which document type it is, rather than letting it be detected
+curl -D - -X POST 'localhost:8095/fhir/Bundle/$validate?profile=http://hl7.eu/fhir/laboratory/StructureDefinition/Bundle-eu-lab' \
+     -H 'Authorization: Bearer TOKEN' \
+     -H 'Content-Type: application/fhir+json' --data-binary @lab-report.json
 ```
 
-Body is the Matchbox `OperationOutcome`. Headers: `X-Pass`, `X-Score`, `X-Errors`,
-`X-Sections`, `X-Resources`. **400** if the body is not a JSON object, **413** if the
-bundle exceeds `MAX_BODY_BYTES`, **502** if Matchbox is unreachable or fails on its
-side (a 5xx from the validator is never scored against the bundle). Only attempts that
-got a verdict are recorded and kept in the audit log.
+Body is the Matchbox `OperationOutcome`. `Content-Location` names the Bundle the server
+stored, so the document you just submitted is readable straight back at that URL.
+Headers: `X-Pass`, `X-Score`, `X-Submission-Score`, `X-Errors`, `X-Sections`,
+`X-Resources`, `X-Document-Type`, `X-Document-Profile`, `X-Secondary-Categories`,
+`X-Best-Patient-Summary`, `X-First-Pass`.
+**400** if the body is not a JSON object or names a `profile` this event does not
+score, **413** if the bundle exceeds `MAX_BODY_BYTES`, **502** if Matchbox is
+unreachable or fails on its side (a 5xx from the validator is never scored against the
+bundle). Only attempts that got a verdict are recorded and kept in the audit log.
+
+`X-Score` is the company's standing *after* this submission and `X-Submission-Score` is
+what this bundle alone earned. The two used to be one number; they part company as soon
+as a second [document type](#document-types) is in play, and reporting only the bundle
+made following a good summary with a lab report look like the score had collapsed.
+
+`X-Best-Patient-Summary`, `X-First-Pass` and `X-Secondary-Categories` are the three
+terms `X-Score` is made of - best summary, plus 20 if the company holds the one-time
+first-pass bonus, plus 15 per other category passed - so a client can show the
+arithmetic instead of a bare total. They have to account for every point of `X-Score`,
+which is what the tests assert. `X-Best-Patient-Summary` is `0` only when no summary has
+passed yet: a summary that passes always earns at least the 50 base, so 0 means "not on
+the track", not "a summary worth nothing", and the submit page says exactly that.
+
+`X-Document-Type` is the category the bundle was read as, and `X-Document-Profile` the
+canonical it was therefore checked against. Worth reading first: a team that meant to
+send a lab report and sees `eps` here has its answer before it reads a single finding -
+the bundle never claimed what it was. `?profile=` settles it, and is rejected with
+**400** for any canonical outside the five.
 
 The web form does more with that same outcome than the API can. A location like
 `Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose[x].value` is a locator, and
@@ -363,93 +487,134 @@ findings, their locations and the profiles that raised them - never the bundle. 
 bundle that passed with warnings gets the same offer for those.
 
 ```
-# submission history (all teams, or one team by its team_slug; limit 1-1000, default 100)
-curl 'localhost:8095/api/submissions?team=my-team&limit=20'
-# one submission: score plus a clinician-readable summary of the bundle
-curl localhost:8095/api/submissions/12
+# submission history: every company, or one by its slug (count 1-1000, default 100)
+curl 'localhost:8095/fhir/$submissions?organization=my-company&count=20'
 # the exact bytes that were submitted
-curl localhost:8095/api/submissions/12/bundle -o submitted.json
+curl localhost:8095/fhir/Bundle/12 -o submitted.json
 ```
+
+Each `entry` carries `id`, `organization`, `organizationSlug`, `recorded`, `pass`,
+`score`, `errors`, `warnings`, `sections`, `resources`, `documentType` and the `bundle`
+URL to fetch it from. `$submissions` is an operation rather than a search because a score is the output
+of validating, not a property of the document - a searchset of Bundles would have
+nowhere honest to put it.
 
 ### Exchange / interop
 
-Every team's best passing submission is published as the shared test corpus. Load a
+Every company's best passing submission is published as the shared test corpus. Load a
 partner's document into your own system and see what breaks. Downloading needs no token
 and nothing here is scored - the output of the track is a defect the producer can go and
 fix, reported to them directly.
 
 ```
 # who has published something
-curl localhost:8095/api/exchange
-# download a partner's document (X-Exchange-Id = submission id, X-Producer = slug)
-curl localhost:8095/api/exchange/TEAM_SLUG -o partner-eps.json
+curl 'localhost:8095/fhir/$exchange'
+# download a partner's document (Content-Location = the Bundle's own URL)
+curl 'localhost:8095/fhir/Organization/COMPANY_SLUG/$document' -o partner-eps.json
 ```
 
-Then show what it looked like. A **rendering** is a screenshot of a partner's document
-as it came out in your system, and it is the only evidence anyone else - another
-implementer, a clinician walking the room - can read without installing your product.
+Then show what it looked like. A screenshot of a partner's document as it came out in
+your system is the only evidence anyone else - another implementer, a clinician walking
+the room - can read without installing your product. It is a `DocumentReference`:
+`custodian` is whose document it is, `author` is taken from your token, and the image
+rides in `content[0].attachment.data` as base64.
 
 ```
-# publish a screenshot of a partner's document (raw image body, not multipart)
-curl -X POST 'localhost:8095/api/exchange/TEAM_SLUG/renderings?note=Allergies+came+through+empty' \
-     -H 'X-Team-Token: TOKEN' -H 'Content-Type: image/png' --data-binary @shot.png
-# every screenshot, or just one document's / one company's
-curl 'localhost:8095/api/renderings?document=12'
-curl 'localhost:8095/api/renderings?producer=TEAM_SLUG&consumer=MY_SLUG'
-curl localhost:8095/api/renderings/3/image -o shot.png
+# publish a screenshot of a partner's document
+jq -n --arg slug COMPANY_SLUG --arg img "$(base64 -w0 shot.png)" '{
+  resourceType: "DocumentReference", status: "current",
+  custodian: {reference: ("Organization/" + $slug)},
+  description: "Allergies came through empty",
+  content: [{attachment: {contentType: "image/png", data: $img}}]
+}' | curl -X POST localhost:8095/fhir/DocumentReference \
+       -H 'Authorization: Bearer TOKEN' \
+       -H 'Content-Type: application/fhir+json' --data-binary @-
+# every screenshot, or just one document's / one company's / one author's
+curl 'localhost:8095/fhir/DocumentReference?related=12'
+curl 'localhost:8095/fhir/DocumentReference?custodian=COMPANY_SLUG&author=MY_SLUG'
+curl localhost:8095/fhir/Binary/3 -o shot.png
 # your own uploads only: correct the note, or withdraw the screenshot entirely
-curl -X PATCH localhost:8095/api/renderings/3 -H 'X-Team-Token: TOKEN' \
-     -H 'Content-Type: application/json' -d '{"note":"Allergies empty, dosage fine"}'
-curl -X DELETE localhost:8095/api/renderings/3 -H 'X-Team-Token: TOKEN'
+curl -X PUT localhost:8095/fhir/DocumentReference/3 -H 'Authorization: Bearer TOKEN' \
+     -H 'Content-Type: application/fhir+json' \
+     -d '{"resourceType":"DocumentReference","description":"Allergies empty, dosage fine"}'
+curl -X DELETE localhost:8095/fhir/DocumentReference/3 -H 'Authorization: Bearer TOKEN'
 ```
 
-PNG, JPEG and WebP only, decided by the bytes and not by `Content-Type` - so a file that
-is really HTML can never be stored and then served back as a page from this origin.
-**400** for anything else and for a screenshot of your own document, **404** if the
-company is unknown or has published nothing yet, **413** over `MAX_IMAGE_BYTES`, **403**
-on editing or deleting somebody else's upload. The optional `note` (query parameter on
-upload, JSON body on `PATCH`) is trimmed to 2000 characters. A rendering pins to the
-submission id, not the company: when a producer beats its own score the exchange
-document moves on and the old screenshots stay with the bytes they were taken from.
-
-```
-# which company a token belongs to
-curl localhost:8095/api/me -H 'X-Team-Token: TOKEN'
-```
+PNG, JPEG and WebP only, decided by the bytes and not by `attachment.contentType` - so a
+file that is really HTML can never be stored and then served back as a page from this
+origin. **400** for anything else and for a screenshot of your own document, **404** if
+the company is unknown or has published nothing yet, **413** over `MAX_IMAGE_BYTES`,
+**403** on editing or deleting somebody else's upload. `description` is trimmed to 2000
+characters, and `PUT` rewrites only that - the image, the companies and the document it
+points at are settled at upload. A screenshot pins to `context.related`, the exact
+Bundle, not the company: when a producer beats its own score the exchange document moves
+on and the old screenshots stay with the bytes they were taken from.
 
 ### Leaderboard
 
 ```
-curl localhost:8095/api/leaderboard
+curl 'localhost:8095/fhir/$leaderboard'
 ```
 
-The whole API is described at `/openapi.json`, browsable at `/docs`.
+One `entry` per registered company, best score first, carrying `rank`, `organization`,
+`organizationSlug`, `score`, `passed`, `attempts`, `firstPass` and - for companies that
+have submitted - `bestErrors`, `bestSections`, `bestResources` and `lastSubmission`.
+`secondaryCategories` repeats once per non-summary [document
+type](#document-types) the company has passed, in registry order, and is absent
+for a company that has passed none. `bestPatientSummary` is the score the
+standing rests on, absent for a company that has not submitted a summary at all -
+`bestSections` and `bestResources` describe that same submission.
+
+The whole API is also described at `/openapi.json`, browsable at `/docs`.
 
 Live UI (leaderboard, submission with inline findings, clinical views, interop
-screenshots, samples) at <http://localhost:8095/>.
+screenshots, samples) at <http://localhost:8095/>. The clinician-readable summary the
+page draws is served from `/ui/documents/{id}`, which is deliberately *not* part of the
+API: it is a rendering, there is no FHIR resource for one, and torturing `Parameters`
+into carrying a patient banner would make the FHIR surface worse than the custom one it
+replaced. It is out of the CapabilityStatement and out of `/openapi.json`; build against
+`/fhir/Bundle/{id}` instead.
 
 ### Samples
 
 Synthetic worked examples of the hackathon scenarios - no real patient data.
 
 ```
-curl localhost:8095/api/samples
-curl localhost:8095/api/samples/andrea-cross-border
-curl localhost:8095/api/samples/andrea-cross-border/bundle -o example-eps.json
+curl 'localhost:8095/fhir/$samples'
+curl localhost:8095/fhir/Bundle/andrea-cross-border -o example-eps.json
 ```
+
+Bundle ids are numeric for submissions and slugs for samples, so the two share one id
+space and can never collide.
+
+### Document types
+
+```
+curl 'localhost:8095/fhir/$documents'
+```
+
+One `entry` per [document type](#document-types), the patient summary first and the
+only one carrying `primary: true`. Each names its `profile`, its `ig` packages
+(repeated), `maturity`, `spec`, what `points` it is worth, and what it is
+`detectedBy...` - so a client can work out why its bundle was read as it was without
+guessing. `ready` says whether Matchbox has that category's packages loaded, and is
+absent when Matchbox could not be asked at all: "we do not know" and "we know it is
+not loaded" send an organiser to two different places.
 
 ### Health
 
 ```
-curl localhost:8095/api/health
-# {"status":"ok","matchbox":"up","missing_igs":[],"max_body_bytes":5242880,
-#  "max_image_bytes":2097152,"max_note_chars":2000,"register_code_required":false,
-#  "practice_ends":null}
+curl 'localhost:8095/fhir/$status'
+# Parameters: matchbox=up, missingIg (repeated, absent when none), maxBundleBytes,
+# maxImageBytes, maxNoteChars, registerCodeRequired, profile, practiceEnds
 ```
+
+Separate from `metadata` on purpose: what the server can do does not change, and whether
+the validator is answering right now does.
 
 `matchbox` is `up`, `degraded` (reachable, but a package named in `VALIDATION_IGS` is
 not loaded - see the restart note under Run) or `down`.
 
-`practice_ends` is `PRACTICE_ENDS` or `null`. The page compares it against the browser's
-own clock rather than being handed a yes/no, so the practice notice clears itself at the
+`practiceEnds` is `PRACTICE_ENDS`, and absent when it is unset. The page compares it
+against the browser's own clock rather than being handed a yes/no, so the practice notice clears itself at the
 final wipe even on a tab nobody has reloaded since the night before.

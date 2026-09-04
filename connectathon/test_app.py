@@ -9,6 +9,7 @@ resource (capped at +60). Team score = max submission score (+20 one-time
 first pass for the first team ever to go valid).
 """
 
+import base64
 import datetime
 import io
 import http.client
@@ -122,20 +123,124 @@ def client(tmp_path, monkeypatch):
 
 
 def set_outcome(monkeypatch, oc):
-    monkeypatch.setattr(app_module, "validate_with_matchbox", lambda body: oc)
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body, doc=None: oc)
+
+
+def as_params(**values):
+    """A Parameters resource body, which is what the operations take."""
+    return {
+        "resourceType": "Parameters",
+        "parameter": [{"name": k, "valueString": v} for k, v in values.items()],
+    }
+
+
+def _part_value(part):
+    if "part" in part:
+        # A repeated name *is* the list - FHIR has no array type - so repeats
+        # collect rather than overwrite. A name seen once stays a scalar, which
+        # is the same ambiguity any FHIR client has to resolve from the
+        # operation's definition; part_list() below is how the tests resolve it.
+        out = {}
+        for p in part["part"]:
+            value = _part_value(p)
+            if p["name"] in out:
+                seen = out[p["name"]]
+                out[p["name"]] = (seen if isinstance(seen, list) else [seen]) + [value]
+            else:
+                out[p["name"]] = value
+        return out
+    if "resource" in part:
+        return part["resource"]
+    for key, value in part.items():
+        if key.startswith("value"):
+            return value
+    return None
+
+
+def part_list(entry, name):
+    """A part the operation defines as repeating, always as a list.
+
+    Absent is the empty list: FHIR has no null and no empty array, so a company
+    that has passed no other category simply has no such part.
+    """
+    value = entry.get(name)
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def param_entries(res, name="entry"):
+    """Every value of a repeated parameter, as plain Python."""
+    body = res.json() if hasattr(res, "json") else res
+    return [_part_value(p) for p in body.get("parameter", []) if p["name"] == name]
+
+
+def param_one(res, name):
+    found = param_entries(res, name)
+    return found[0] if found else None
+
+
+def diagnostics(res):
+    """The message out of an error OperationOutcome."""
+    body = res.json()
+    assert body["resourceType"] == "OperationOutcome", body
+    return body["issue"][0].get("diagnostics", "")
+
+
+def register_res(client, name, code=None):
+    values = {"name": name}
+    if code is not None:
+        values["code"] = code
+    return client.post("/fhir/$register", json=as_params(**values))
 
 
 def register(client, name):
-    res = client.post("/api/register", json={"team": name})
+    res = register_res(client, name)
     assert res.status_code == 200, res.text
-    return res.json()["token"]
+    return param_one(res, "token")
 
 
 def submit(client, token, oc, monkeypatch, body=BUNDLE):
     set_outcome(monkeypatch, oc)
-    return client.post("/api/eps", content=body,
+    return client.post("/fhir/Bundle/$validate", content=body,
                        headers={"X-Team-Token": token,
                                 "Content-Type": "application/fhir+json"})
+
+
+def shots(res):
+    """The DocumentReferences out of a searchset."""
+    body = res.json()
+    assert body["resourceType"] == "Bundle", body
+    return [e["resource"] for e in body.get("entry", [])]
+
+
+def custodian_of(shot):
+    return shot["custodian"]["reference"].split("/", 1)[1]
+
+
+def author_of(shot):
+    return shot["author"][0]["reference"].split("/", 1)[1]
+
+
+def related_bundle(shot):
+    return int(shot["context"]["related"][0]["reference"].split("/", 1)[1])
+
+
+def docref(slug, image, note=None, mime="image/png"):
+    """A DocumentReference carrying a screenshot, the way the UI sends one."""
+    body = {
+        "resourceType": "DocumentReference",
+        "status": "current",
+        "custodian": {"reference": "Organization/%s" % slug},
+        "content": [{"attachment": {
+            "contentType": mime,
+            "data": base64.b64encode(image).decode("ascii"),
+        }}],
+    }
+    if note is not None:
+        body["description"] = note
+    return body
 
 
 def consume_first_pass(client, monkeypatch):
@@ -147,27 +252,31 @@ def consume_first_pass(client, monkeypatch):
 
 # ---------------------------------------------------------------- register
 
-def test_register_returns_hex_token(client):
-    res = client.post("/api/register", json={"team": "  Alpha Team  "})
+def test_register_returns_hex_token_and_an_organization(client):
+    res = register_res(client, "  Alpha Team  ")
     assert res.status_code == 200
-    data = res.json()
-    assert data["team"] == "Alpha Team"  # trimmed
-    assert len(data["token"]) == 16
-    int(data["token"], 16)  # valid hex
+    org = param_one(res, "organization")
+    assert org["resourceType"] == "Organization"
+    assert org["name"] == "Alpha Team"        # trimmed
+    assert org["id"] == "alpha-team"          # the Organization's logical id
+    assert org["identifier"][0]["value"] == "alpha-team"
+    token = param_one(res, "token")
+    assert len(token) == 16
+    int(token, 16)  # valid hex
 
 
 def test_register_duplicate_name_409(client):
     register(client, "Alpha")
-    res = client.post("/api/register", json={"team": "Alpha"})
-    assert res.status_code == 409
+    assert register_res(client, "Alpha").status_code == 409
     # trimmed and case-insensitive duplicates are rejected too
-    assert client.post("/api/register", json={"team": " alpha "}).status_code == 409
+    assert register_res(client, " alpha ").status_code == 409
 
 
 def test_register_name_length_validation(client):
-    assert client.post("/api/register", json={"team": "x"}).status_code == 400
-    assert client.post("/api/register", json={"team": "y" * 41}).status_code == 400
-    assert client.post("/api/register", json={"team": 42}).status_code == 400
+    assert register_res(client, "x").status_code == 400
+    assert register_res(client, "y" * 41).status_code == 400
+    # a Parameters resource with no `name` part at all
+    assert client.post("/fhir/$register", json=as_params()).status_code == 400
 
 
 # ---------------------------------------------------------------- submit auth
@@ -176,20 +285,20 @@ def test_submit_without_token_401(client, monkeypatch):
     # a real team exists, so this pins the credential check rather than an
     # empty table
     token = register(client, "Alpha")
-    assert client.post("/api/eps", content=BUNDLE).status_code == 401
+    assert client.post("/fhir/Bundle/$validate", content=BUNDLE).status_code == 401
     assert submit(client, token, outcome(), monkeypatch).status_code == 200
 
 
 def test_submit_bad_token_401(client, monkeypatch):
     token = register(client, "Alpha")
-    res = client.post("/api/eps", content=BUNDLE,
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE,
                       headers={"X-Team-Token": "deadbeefdeadbeef"})
     assert res.status_code == 401
     # not a prefix or suffix match either
     for wrong in (token[:-1], token + "0", token.upper() if token.islower() else token):
         if wrong == token:
             continue
-        assert client.post("/api/eps", content=BUNDLE,
+        assert client.post("/fhir/Bundle/$validate", content=BUNDLE,
                            headers={"X-Team-Token": wrong}).status_code == 401
     assert submit(client, token, outcome(), monkeypatch).status_code == 200
 
@@ -197,14 +306,14 @@ def test_submit_bad_token_401(client, monkeypatch):
 def test_submit_bearer_token_accepted(client, monkeypatch):
     token = register(client, "Alpha")
     set_outcome(monkeypatch, outcome())
-    res = client.post("/api/eps", content=BUNDLE,
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE,
                       headers={"Authorization": f"Bearer {token}"})
     assert res.status_code == 200
 
 
 def test_submit_invalid_json_400(client):
     token = register(client, "Alpha")
-    res = client.post("/api/eps", content="not json {",
+    res = client.post("/fhir/Bundle/$validate", content="not json {",
                       headers={"X-Team-Token": token})
     assert res.status_code == 400
 
@@ -214,8 +323,8 @@ def test_submit_oversized_body_413(client, monkeypatch):
     monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 1024)
     # Rejected before validation runs: a Matchbox call here would raise.
     monkeypatch.setattr(app_module, "validate_with_matchbox",
-                        lambda body: (_ for _ in ()).throw(AssertionError("validated oversized body")))
-    res = client.post("/api/eps", content=b"x" * 2048,
+                        lambda body, doc=None: (_ for _ in ()).throw(AssertionError("validated oversized body")))
+    res = client.post("/fhir/Bundle/$validate", content=b"x" * 2048,
                       headers={"X-Team-Token": token})
     assert res.status_code == 413
     # Nothing was written to the audit log for the rejected submission.
@@ -292,14 +401,14 @@ def test_warnings_do_not_gate(client, monkeypatch):
 def test_matchbox_down_502_and_attempt_not_counted(client, monkeypatch):
     token = register(client, "Alpha")
 
-    def boom(body):
+    def boom(body, doc=None):
         raise app_module.MatchboxError("connection refused")
 
     monkeypatch.setattr(app_module, "validate_with_matchbox", boom)
-    res = client.post("/api/eps", content=BUNDLE,
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE,
                       headers={"X-Team-Token": token})
     assert res.status_code == 502
-    lb = client.get("/api/leaderboard").json()
+    lb = param_entries(client.get("/fhir/$leaderboard"))
     assert lb[0]["attempts"] == 0
 
 
@@ -329,14 +438,17 @@ def test_first_pass_only_first_valid_team_only_once(client, monkeypatch):
     # Beta goes valid later: no bonus
     res_b = submit(client, tok_b, outcome(), monkeypatch)
     assert res_b.headers["X-Score"] == "50"
-    # Alpha valid again: bonus not re-awarded on the wire
+    # Alpha valid again: the bonus is not re-awarded, but X-Score is Alpha's
+    # standing rather than this bundle's own points, so it still reads 70. The
+    # bundle's own 50 is on X-Submission-Score.
     res_a2 = submit(client, tok_a, outcome(), monkeypatch)
-    assert res_a2.headers["X-Score"] == "50"
+    assert res_a2.headers["X-Score"] == "70"
+    assert res_a2.headers["X-Submission-Score"] == "50"
 
-    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
-    assert lb["Alpha"]["first_pass"] is True
+    lb = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert lb["Alpha"]["firstPass"] is True
     assert lb["Alpha"]["score"] == 70   # max(50, 50) + 20, not stacked
-    assert lb["Beta"]["first_pass"] is False
+    assert lb["Beta"]["firstPass"] is False
     assert lb["Beta"]["score"] == 50
 
 
@@ -352,22 +464,22 @@ def test_team_score_is_max_across_submissions(client, monkeypatch):
     submit(client, token, outcome(errors=4), monkeypatch,
            body=bundle(sections=5, resources=30))                   # 0
 
-    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
+    lb = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
     alpha = lb["Alpha"]
     assert alpha["score"] == 88          # max, not latest and not sum
     assert alpha["attempts"] == 3
     assert alpha["passed"] is True
-    assert alpha["best_sections"] == 3   # from the highest-scoring submission
-    assert alpha["best_resources"] == 4
-    assert alpha["best_errors"] == 0     # fewest errors across submissions
+    assert alpha["bestSections"] == 3   # from the highest-scoring submission
+    assert alpha["bestResources"] == 4
+    assert alpha["bestErrors"] == 0     # fewest errors across submissions
 
 
 def test_best_errors_is_fewest_for_failing_team(client, monkeypatch):
     token = register(client, "Alpha")
     submit(client, token, outcome(errors=7), monkeypatch)
     submit(client, token, outcome(errors=3), monkeypatch)
-    lb = client.get("/api/leaderboard").json()
-    assert lb[0]["best_errors"] == 3
+    lb = param_entries(client.get("/fhir/$leaderboard"))
+    assert lb[0]["bestErrors"] == 3
     assert lb[0]["score"] == 0
     assert lb[0]["passed"] is False
 
@@ -384,8 +496,8 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
     submit(client, tok_b, outcome(), monkeypatch)           # 50
     submit(client, tok_c, outcome(), monkeypatch)           # 50
 
-    lb = client.get("/api/leaderboard").json()
-    names = [r["team"] for r in lb]
+    lb = param_entries(client.get("/fhir/$leaderboard"))
+    names = [r["organization"] for r in lb]
     assert names.index("Alpha") == 0
     # same score (50): whoever reached it first wins (Beta's valid submission
     # landed before Gamma's; Beta's extra failed attempt must not hurt)
@@ -395,18 +507,17 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
     alpha = lb[0]
     assert alpha["score"] == 96          # 50 + 2*10 + 3*2 + 20 first pass
     assert alpha["passed"] is True
-    assert alpha["first_pass"] is True
-    assert alpha["best_sections"] == 2
-    assert alpha["best_resources"] == 3
-    assert alpha["last_submission"]
+    assert alpha["firstPass"] is True
+    assert alpha["bestSections"] == 2
+    assert alpha["bestResources"] == 3
+    assert alpha["lastSubmission"]
 
-    idle = next(r for r in lb if r["team"] == "Idle")
+    idle = next(r for r in lb if r["organization"] == "Idle")
     assert idle["score"] == 0
     assert idle["attempts"] == 0
-    assert idle["best_errors"] is None
-    assert idle["best_sections"] is None
-    assert idle["best_resources"] is None
-    assert idle["last_submission"] is None
+    # FHIR has no null, so the empty columns are absent rather than sent as one
+    for absent in ("bestErrors", "bestSections", "bestResources", "lastSubmission"):
+        assert absent not in idle, absent
 
 
 def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkeypatch):
@@ -418,16 +529,16 @@ def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkey
     # Early tries again afterwards (worse result, more attempts, later
     # last_submission) - none of that may hurt its rank.
     submit(client, tok_a, outcome(errors=3), monkeypatch)  # 0
-    lb = client.get("/api/leaderboard").json()
-    names = [r["team"] for r in lb]
+    lb = param_entries(client.get("/fhir/$leaderboard"))
+    names = [r["organization"] for r in lb]
     assert names.index("Early") < names.index("Late")
 
 
 def test_tiebreak_alphabetical_for_identical_teams(client):
     register(client, "Zeta Squad")   # registered first
     register(client, "Anna Squad")
-    lb = client.get("/api/leaderboard").json()
-    names = [r["team"] for r in lb]
+    lb = param_entries(client.get("/fhir/$leaderboard"))
+    names = [r["organization"] for r in lb]
     # both idle (score 0, no submissions): name decides, registration
     # order does not
     assert names.index("Anna Squad") < names.index("Zeta Squad")
@@ -724,46 +835,50 @@ def test_submissions_list_filter_and_limit(client, monkeypatch):
     tok_b = register(client, "Beta")
     submit(client, tok_a, outcome(), monkeypatch, body=CLINICAL_BODY)
     submit(client, tok_b, outcome(errors=1), monkeypatch)
-    subs = client.get("/api/submissions").json()
+    subs = param_entries(client.get("/fhir/$submissions"))
     assert len(subs) == 2
-    assert subs[0]["team"] == "Beta"    # newest first
+    assert subs[0]["organization"] == "Beta"    # newest first
     assert subs[0]["pass"] is False
-    assert subs[1]["team"] == "Alpha"
-    assert {"id", "team", "team_slug", "ts", "pass", "score", "errors",
-            "warnings", "sections", "resources"} <= set(subs[0])
-    only_a = client.get("/api/submissions", params={"team": "alpha"}).json()
-    assert [s["team"] for s in only_a] == ["Alpha"]
-    limited = client.get("/api/submissions", params={"limit": 1}).json()
-    assert [s["team"] for s in limited] == ["Beta"]
+    assert subs[1]["organization"] == "Alpha"
+    assert {"id", "bundle", "organization", "organizationSlug", "recorded",
+            "pass", "score", "errors", "warnings", "sections",
+            "resources"} <= set(subs[0])
+    # the entry points at the Bundle it was validated from
+    assert subs[0]["bundle"] == "/fhir/Bundle/%d" % subs[0]["id"]
+    only_a = param_entries(
+        client.get("/fhir/$submissions", params={"organization": "alpha"}))
+    assert [s["organization"] for s in only_a] == ["Alpha"]
+    limited = param_entries(client.get("/fhir/$submissions", params={"count": 1}))
+    assert [s["organization"] for s in limited] == ["Beta"]
 
 
 def test_submission_detail_and_raw_bundle(client, monkeypatch):
     token = register(client, "Alpha")
     submit(client, token, outcome(), monkeypatch, body=CLINICAL_BODY)
-    sub_id = client.get("/api/submissions").json()[0]["id"]
-    detail = client.get(f"/api/submissions/{sub_id}").json()
+    sub_id = param_entries(client.get("/fhir/$submissions"))[0]["id"]
+    detail = client.get(f"/ui/documents/{sub_id}").json()
     assert detail["id"] == sub_id
     assert detail["team"] == "Alpha"
     assert detail["pass"] is True
     assert detail["summary"]["patient"]["name"] == "Petra M. Schwartz"
     assert detail["summary"]["sections"][0]["items"]
-    raw = client.get(f"/api/submissions/{sub_id}/bundle")
+    raw = client.get(f"/fhir/Bundle/{sub_id}")
     assert raw.status_code == 200
     assert raw.headers["content-type"].startswith("application/fhir+json")
     assert raw.json()["resourceType"] == "Bundle"
 
 
 def test_submission_404s(client, monkeypatch):
-    assert client.get("/api/submissions/999").status_code == 404
-    assert client.get("/api/submissions/999/bundle").status_code == 404
+    assert client.get("/ui/documents/999").status_code == 404
+    assert client.get("/fhir/Bundle/999").status_code == 404
     token = register(client, "Alpha")
     submit(client, token, outcome(), monkeypatch)
-    sub_id = client.get("/api/submissions").json()[0]["id"]
+    sub_id = param_entries(client.get("/fhir/$submissions"))[0]["id"]
     team_dir = os.path.join(client.data_dir, "submissions", "alpha")
     for name in os.listdir(team_dir):
         os.remove(os.path.join(team_dir, name))
-    assert client.get(f"/api/submissions/{sub_id}").status_code == 404
-    assert client.get(f"/api/submissions/{sub_id}/bundle").status_code == 404
+    assert client.get(f"/ui/documents/{sub_id}").status_code == 404
+    assert client.get(f"/fhir/Bundle/{sub_id}").status_code == 404
 
 
 # ---------------------------------------------------------------- interop
@@ -778,12 +893,12 @@ def interop_setup(client, monkeypatch):
 
 def test_the_exchange_corpus_needs_no_token_at_all(client):
     """Interop testing is unscored, so there is nobody to authenticate."""
-    assert client.get("/api/exchange").status_code == 200
-    assert client.get("/api/exchange/anyone").status_code == 404  # unknown team
+    assert client.get("/fhir/$exchange").status_code == 200
+    assert client.get("/fhir/Organization/anyone/$document").status_code == 404  # unknown team
     # a token is neither required nor rejected - it is simply not read
     register(client, "Alpha")
     for headers in ({"X-Team-Token": "not-a-real-token"}, {}):
-        assert client.get("/api/exchange", headers=headers).status_code == 200
+        assert client.get("/fhir/$exchange", headers=headers).status_code == 200
 
 
 def test_every_reader_sees_every_published_document(client, monkeypatch):
@@ -791,13 +906,13 @@ def test_every_reader_sees_every_published_document(client, monkeypatch):
     submit(client, tok_c, outcome(), monkeypatch, body=CLINICAL_BODY)
     # Nothing is hidden from anyone, including a company's own document: with
     # no points at stake there is no reason to tailor the list per caller.
-    listing = client.get("/api/exchange").json()
-    assert [p["team"] for p in listing] == ["Consumer", "Producer"]
+    listing = param_entries(client.get("/fhir/$exchange"))
+    assert [p["organization"] for p in listing] == ["Consumer", "Producer"]
 
 
 def test_anyone_can_download_a_published_bundle(client, monkeypatch):
     interop_setup(client, monkeypatch)
-    res = client.get("/api/exchange/producer")
+    res = client.get("/fhir/Organization/producer/$document")
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("application/fhir+json")
     assert res.headers["X-Producer"] == "producer"
@@ -808,9 +923,9 @@ def test_bundles_download_under_a_named_file(client, monkeypatch):
     """A browser click must not save every document as a nameless "bundle"."""
     tok_p, _ = interop_setup(client, monkeypatch)
     cases = {
-        "/api/exchange/producer": 'attachment; filename="producer-eps.json"',
-        "/api/submissions/1/bundle": 'attachment; filename="producer-1-eps.json"',
-        "/api/samples/andrea-cross-border/bundle":
+        "/fhir/Organization/producer/$document": 'attachment; filename="producer-eps.json"',
+        "/fhir/Bundle/1": 'attachment; filename="producer-1-eps.json"',
+        "/fhir/Bundle/andrea-cross-border":
             'attachment; filename="andrea-cross-border-example-eps.json"',
     }
     for url, disposition in cases.items():
@@ -823,25 +938,26 @@ def test_exchange_lists_valid_docs_only(client, monkeypatch):
     interop_setup(client, monkeypatch)
     tok_f = register(client, "Failing")
     submit(client, tok_f, outcome(errors=2), monkeypatch)  # invalid -> unpublished
-    listing = client.get("/api/exchange").json()
-    assert [p["team"] for p in listing] == ["Producer"]    # no Failing
+    listing = param_entries(client.get("/fhir/$exchange"))
+    assert [p["organization"] for p in listing] == ["Producer"]    # no Failing
     partner = listing[0]
-    assert partner["team_slug"] == "producer"
-    assert isinstance(partner["exchange_id"], int)
+    assert partner["organizationSlug"] == "producer"
+    assert isinstance(partner["id"], int)
     assert partner["sections"] == 2 and partner["resources"] == 5
 
 
 def test_exchange_fetch_bundle_headers_and_404s(client, monkeypatch):
     interop_setup(client, monkeypatch)
-    res = client.get("/api/exchange/producer")
+    res = client.get("/fhir/Organization/producer/$document")
     assert res.status_code == 200
     assert res.headers["content-type"].startswith("application/fhir+json")
     assert res.headers["X-Producer"] == "producer"
-    assert int(res.headers["X-Exchange-Id"]) > 0
+    assert res.headers["content-location"] == "/fhir/Bundle/%d" % int(
+        res.headers["content-location"].rsplit("/", 1)[1])
     assert res.json()["resourceType"] == "Bundle"
-    assert client.get("/api/exchange/ghost").status_code == 404
+    assert client.get("/fhir/Organization/ghost/$document").status_code == 404
     # registered, but nothing valid to publish
-    assert client.get("/api/exchange/consumer").status_code == 404
+    assert client.get("/fhir/Organization/consumer/$document").status_code == 404
 
 
 def test_the_receipt_endpoints_are_gone(client, monkeypatch):
@@ -849,10 +965,10 @@ def test_the_receipt_endpoints_are_gone(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     receipt = {"partner": "producer", "patient_family": "Schwartz",
                "birth_date": "1950-04-19", "medications": 2, "allergies": 1}
-    gone = client.post("/api/interop/confirm", json=receipt,
+    gone = client.post("/fhir/$confirm", json=receipt,
                        headers={"X-Team-Token": tok_c})
     assert gone.status_code == 404
-    assert client.get("/api/interop/matrix").status_code == 404
+    assert client.get("/fhir/$matrix").status_code == 404
 
 
 def test_the_leaderboard_does_not_score_interop(client, monkeypatch):
@@ -860,7 +976,7 @@ def test_the_leaderboard_does_not_score_interop(client, monkeypatch):
     tok_p = register(client, "Producer2")
     register(client, "Consumer2")            # registered, never submits
     submit(client, tok_p, outcome(), monkeypatch, body=CLINICAL_BODY)
-    lb = {r["team"]: r for r in client.get("/api/leaderboard").json()}
+    lb = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
     assert "interop" not in lb["Producer2"]
     assert lb["Producer2"]["score"] == 80    # the submission, and nothing else
     # a company with no submission has no other way to earn points
@@ -939,7 +1055,7 @@ def test_index_hides_identifier_assigning_authorities(client):
     text = client.get("/").text
     assert "urn:oid" not in text
     assert 'esc(i.system)' not in text
-    detail = client.get("/api/samples/arne-complex-care").json()
+    detail = client.get("/ui/documents/arne-complex-care").json()
     systems = [i.get("system") for i in detail["summary"]["patient"]["identifiers"]]
     assert any(systems), "the API should still expose what the UI omits"
 
@@ -947,11 +1063,11 @@ def test_index_hides_identifier_assigning_authorities(client):
 def test_samples_link_to_their_scenario_briefs(client):
     """Each worked example names the organisers' brief it was written from,
     rather than restating it in copy that would drift."""
-    samples = {s["id"]: s for s in client.get("/api/samples").json()["samples"]}
-    assert samples["andrea-cross-border"]["scenario_name"] == "The Andrea Scenario"
-    assert samples["arne-complex-care"]["scenario_name"] == "The Arne Scenario"
+    samples = {s["id"]: s for s in param_entries(client.get("/fhir/$samples"))}
+    assert samples["andrea-cross-border"]["scenarioName"] == "The Andrea Scenario"
+    assert samples["arne-complex-care"]["scenarioName"] == "The Arne Scenario"
     for sample in samples.values():
-        assert sample["scenario_url"].startswith("https://")
+        assert sample["scenarioUrl"].startswith("https://")
 
 
 def test_index_lists_examples_as_a_company(client):
@@ -965,7 +1081,8 @@ def test_index_lists_examples_as_a_company(client):
 
 def test_index_offers_bundle_downloads_and_anonymous_partner_browsing(client):
     text = client.get("/").text
-    assert '/bundle" download>download the FHIR bundle</a>' in text
+    assert '" download>download the FHIR bundle</a>' in text
+    assert "/fhir/Bundle/" in text
 
 
 def test_index_credits_matchbox_and_the_hl7_validator(client):
@@ -984,7 +1101,11 @@ def test_index_does_not_claim_terminology_is_validated(client):
     "cannot be validated". Saying otherwise would send a team home trusting a
     code nothing checked."""
     text = client.get("/").text
-    assert "that require a license (such as\n  SNOMED CT, LOINC, WHO ATC) are not checked" in text
+    assert ("that require a license (such as SNOMED CT,\n  LOINC, WHO ATC) are not checked"
+            in text)
+    # every guide a submission can be validated against is named on the page
+    for guide in ("eps", "laboratory", "mpd", "imaging", "hdr"):
+        assert "https://hl7.eu/fhir/%s/" % guide in text
 
 
 def test_index_offers_to_explain_the_errors_with_an_assistant(client):
@@ -1009,16 +1130,18 @@ def test_index_offers_to_explain_the_errors_with_an_assistant(client):
 
 
 def test_sample_list_is_labelled_synthetic(client):
-    data = client.get("/api/samples").json()
-    assert "does not come from any real system" in data["disclaimer"]
-    ids = {s["id"] for s in data["samples"]}
-    assert ids == {"andrea-cross-border", "arne-complex-care"}
-    assert all(s["available"] for s in data["samples"])
-    assert all(s["name"] and s["tagline"] and s["scenario"] for s in data["samples"])
+    res = client.get("/fhir/$samples")
+    assert "does not come from any real system" in param_one(res, "disclaimer")
+    entries = param_entries(res)
+    assert {s["id"] for s in entries} == {"andrea-cross-border", "arne-complex-care"}
+    assert all(s["available"] for s in entries)
+    assert all(s["name"] and s["tagline"] and s["scenario"] for s in entries)
+    # each entry carries the URL its document is fetched from
+    assert all(s["bundle"] == "/fhir/Bundle/" + s["id"] for s in entries)
 
 
 def test_sample_detail_matches_submission_shape(client):
-    data = client.get("/api/samples/andrea-cross-border").json()
+    data = client.get("/ui/documents/andrea-cross-border").json()
     # the clinician renderer consumes samples and submissions through one path
     assert set(data) >= {"team", "pass", "summary", "sample"}
     assert data["pass"] is True
@@ -1030,14 +1153,14 @@ def test_sample_detail_matches_submission_shape(client):
 
 
 def test_sample_asserts_nil_known_allergies_rather_than_omitting_them(client):
-    data = client.get("/api/samples/andrea-cross-border").json()
+    data = client.get("/ui/documents/andrea-cross-border").json()
     allergies = next(s for s in data["summary"]["sections"] if s["kind"] == "allergy")
     assert allergies["items"] == []
     assert allergies["empty_reason"]
 
 
 def test_swedish_sample_is_classified_by_loinc_not_title(client):
-    data = client.get("/api/samples/arne-complex-care").json()
+    data = client.get("/ui/documents/arne-complex-care").json()
     sections = {s["kind"]: s for s in data["summary"]["sections"]}
     assert sections["allergy"]["title"] == "Allergier och intoleranser"
     assert sections["medication"]["title"] == "Läkemedelslista"
@@ -1047,7 +1170,7 @@ def test_swedish_sample_is_classified_by_loinc_not_title(client):
 
 
 def test_sample_bundle_downloads_as_fhir(client):
-    res = client.get("/api/samples/arne-complex-care/bundle")
+    res = client.get("/fhir/Bundle/arne-complex-care")
     assert res.headers["content-type"].startswith("application/fhir+json")
     doc = res.json()
     assert doc["type"] == "document"
@@ -1057,14 +1180,13 @@ def test_sample_bundle_downloads_as_fhir(client):
 
 
 def test_unknown_sample_is_404(client):
-    assert client.get("/api/samples/nope").status_code == 404
-    assert client.get("/api/samples/nope/bundle").status_code == 404
+    assert client.get("/ui/documents/nope").status_code == 404
+    assert client.get("/fhir/Bundle/nope").status_code == 404
 
 
 def test_register_returns_company_note(client):
-    data = client.post("/api/register", json={"team": "NoteCo"}).json()
-    assert "note" in data
-    assert "company" in data["note"].lower()
+    note = param_one(register_res(client, "NoteCo"), "note")
+    assert note and "company" in note.lower()
 
 
 # ------------------------------------------------- asserted-empty sections
@@ -1202,10 +1324,10 @@ def test_padding_a_document_cannot_outscore_a_real_one(client, monkeypatch):
 def test_oversized_bundle_is_refused(client, monkeypatch):
     monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 500)
     token = register(client, "Alpha")
-    res = client.post("/api/eps", content="x" * 2000,
+    res = client.post("/fhir/Bundle/$validate", content="x" * 2000,
                       headers={"X-Team-Token": token})
     assert res.status_code == 413
-    assert "limit is 500 bytes" in res.json()["detail"]
+    assert "limit is 500 bytes" in diagnostics(res)
 
 
 def test_an_unauthenticated_oversized_post_is_rejected_on_the_credential(client,
@@ -1213,52 +1335,52 @@ def test_an_unauthenticated_oversized_post_is_rejected_on_the_credential(client,
     """401 must come before the body is read, or anyone can spend our memory."""
     monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 500)
     register(client, "Alpha")
-    assert client.post("/api/eps", content="x" * 2000).status_code == 401
+    assert client.post("/fhir/Bundle/$validate", content="x" * 2000).status_code == 401
 
 
 def test_small_endpoints_have_their_own_tighter_limit(client, monkeypatch):
     monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 200)
-    res = client.post("/api/register", json={"team": "A" * 400})
-    assert res.status_code == 413
+    assert register_res(client, "A" * 400).status_code == 413
     # unchanged limit still admits an ordinary registration
     monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 64 * 1024)
-    assert client.post("/api/register", json={"team": "Alpha"}).status_code == 200
+    assert register_res(client, "Alpha").status_code == 200
 
 
 def test_deeply_nested_json_is_a_client_error_not_a_crash(client):
     token = register(client, "Alpha")
     nested = "[" * 10000 + "]" * 10000
-    res = client.post("/api/eps", content=nested, headers={"X-Team-Token": token})
+    res = client.post("/fhir/Bundle/$validate", content=nested, headers={"X-Team-Token": token})
     assert res.status_code == 400
-    assert res.json()["detail"] == "Body is not valid JSON"
-    res = client.post("/api/register", content=nested,
-                      headers={"Content-Type": "application/json"})
+    assert diagnostics(res) == "Body is not valid JSON"
+    res = client.post("/fhir/$register", content=nested,
+                      headers={"Content-Type": "application/fhir+json"})
     assert res.status_code == 400
 
 
-def test_non_object_json_body_is_rejected(client):
-    res = client.post("/api/register", content="[1, 2, 3]",
-                      headers={"Content-Type": "application/json"})
-    assert res.status_code == 400
-    assert res.json()["detail"] == "Body must be a JSON object"
+def test_a_body_that_is_not_parameters_is_rejected(client):
+    for body in ("[1, 2, 3]", '{"resourceType": "Patient"}', "{}"):
+        res = client.post("/fhir/$register", content=body,
+                          headers={"Content-Type": "application/fhir+json"})
+        assert res.status_code == 400, body
+        assert diagnostics(res) == "Body must be a FHIR Parameters resource"
 
 
 # ------------------------------------------------------------ registration code
 
 def test_registration_is_open_by_default(client):
     assert app_module.REGISTER_CODE == ""
-    assert client.post("/api/register", json={"team": "Alpha"}).status_code == 200
+    assert register_res(client, "Alpha").status_code == 200
 
 
 def test_registration_code_gates_when_set(client, monkeypatch):
     monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
-    assert client.post("/api/register", json={"team": "Alpha"}).status_code == 403
-    assert client.post("/api/register",
-                       json={"team": "Alpha", "code": "wrong"}).status_code == 403
-    assert client.post("/api/register",
-                       json={"team": "Alpha", "code": 1234}).status_code == 403
-    res = client.post("/api/register", json={"team": "Alpha", "code": "s3cret"})
-    assert res.status_code == 200
+    assert register_res(client, "Alpha").status_code == 403
+    assert register_res(client, "Alpha", "wrong").status_code == 403
+    # a non-string code must be refused, not compared
+    assert client.post("/fhir/$register", json={"resourceType": "Parameters",
+        "parameter": [{"name": "name", "valueString": "Alpha"},
+                      {"name": "code", "valueInteger": 1234}]}).status_code == 403
+    assert register_res(client, "Alpha", "s3cret").status_code == 200
 
 
 # --------------------------------------------------------- unreadable document
@@ -1266,13 +1388,14 @@ def test_registration_code_gates_when_set(client, monkeypatch):
 def test_a_document_that_no_longer_parses_says_so(client, monkeypatch):
     token = register(client, "Alpha")
     submit(client, token, outcome(), monkeypatch, body=CLINICAL_BODY)
-    sub = client.get("/api/submissions", params={"team": "alpha"}).json()[0]
-    assert client.get("/api/submissions/%d" % sub["id"]).json()["bundle_readable"]
+    sub = param_entries(client.get("/fhir/$submissions",
+                                   params={"organization": "alpha"}))[0]
+    assert client.get("/ui/documents/%d" % sub["id"]).json()["bundle_readable"]
     team_dir = os.path.join(client.data_dir, "submissions", "alpha")
     stored = os.path.join(team_dir, os.listdir(team_dir)[0])
     with open(stored, "wb") as fh:
         fh.write(b"{ this is not json")
-    data = client.get("/api/submissions/%d" % sub["id"]).json()
+    data = client.get("/ui/documents/%d" % sub["id"]).json()
     # the recorded verdict stands, but the summary is explicitly not evidence
     assert data["pass"] is True
     assert data["bundle_readable"] is False
@@ -1328,17 +1451,52 @@ def test_validate_asks_matchbox_for_the_extra_packages(monkeypatch):
     """Without igs, a Swedish profile claim comes back "not checked"."""
     captured = []
     fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
-    monkeypatch.setattr(app_module, "VALIDATION_IGS", ["hl7se.fhir.base#1.1.0"])
     app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}')
     assert "igs=hl7se.fhir.base%231.1.0" in captured[0][0].full_url
 
 
-def test_validate_omits_igs_when_none_are_configured(monkeypatch):
-    captured = []
-    fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
-    monkeypatch.setattr(app_module, "VALIDATION_IGS", [])
-    app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}')
-    assert "igs=" not in captured[0][0].full_url
+def test_each_category_is_validated_in_its_own_engine(monkeypatch):
+    """The packages are the category's, not one pile shared by all of them.
+
+    Matchbox scopes an engine to the requested profile's dependency closure, so
+    a lab report checked by an EPS-shaped engine comes back with its
+    conformance unchecked rather than checked and failed - a silent pass.
+    """
+    for doc in app_module.EHDS_DOCUMENTS:
+        captured = []
+        fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
+        app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}', doc)
+        url = captured[0][0].full_url
+        assert doc["profile"].replace(":", "%3A").replace("/", "%2F") in url, doc["id"]
+        for ig in doc["igs"]:
+            assert "igs=" + ig.replace("#", "%23") in url, (doc["id"], ig)
+        # and nothing from a category this bundle is not
+        for other in app_module.EHDS_DOCUMENTS:
+            for ig in other["igs"]:
+                if ig not in doc["igs"]:
+                    assert "igs=" + ig.replace("#", "%23") not in url, (doc["id"], ig)
+
+
+def test_the_swedish_base_rides_on_the_patient_summary_only(monkeypatch):
+    """It is a Swedish event and teams claim SEBasePatient - but those profiles
+    have nothing to say about a lab report or an imaging study, and every extra
+    package in an engine is load time on the first submission of that kind."""
+    assert "hl7se.fhir.base#1.1.0" in app_module.PRIMARY_DOCUMENT["igs"]
+    for doc in app_module.SECONDARY_DOCUMENTS:
+        assert "hl7se.fhir.base#1.1.0" not in doc["igs"], doc["id"]
+
+
+def test_the_health_check_covers_every_category(monkeypatch):
+    """VALIDATION_IGS is what $status insists Matchbox loaded and what the
+    deploy gates on. A category missing from it is one whose profile claims
+    come back "not checked", scoring real submissions wrong."""
+    for doc in app_module.EHDS_DOCUMENTS:
+        for ig in doc["igs"]:
+            assert ig in app_module.DEFAULT_VALIDATION_IGS, (doc["id"], ig)
+    # de-duplicated, and the patient summary's packages come first
+    assert len(app_module.DEFAULT_VALIDATION_IGS) == len(
+        set(app_module.DEFAULT_VALIDATION_IGS))
+    assert app_module.DEFAULT_VALIDATION_IGS[:2] == app_module.PRIMARY_DOCUMENT["igs"]
 
 
 def test_validate_keeps_the_outcome_from_an_http_error(monkeypatch):
@@ -1382,12 +1540,12 @@ def test_validate_raises_on_a_200_that_is_not_an_outcome(monkeypatch):
 
 def test_a_matchbox_failure_surfaces_as_502(client, monkeypatch):
     token = register(client, "Alpha")
-    def boom(body):
+    def boom(body, doc=None):
         raise app_module.MatchboxError("Matchbox unreachable: nope")
     monkeypatch.setattr(app_module, "validate_with_matchbox", boom)
-    res = client.post("/api/eps", content=BUNDLE, headers={"X-Team-Token": token})
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE, headers={"X-Team-Token": token})
     assert res.status_code == 502
-    assert "unreachable" in res.json()["detail"]
+    assert "unreachable" in diagnostics(res)
 
 
 def test_matchbox_health_url_drops_the_fhir_suffix(monkeypatch):
@@ -1430,21 +1588,21 @@ def matchbox_alive(monkeypatch, ig_list):
 def test_health_reports_matchbox_up_and_down(client, monkeypatch):
     matchbox_alive(monkeypatch, FakeResponse(
         ig_bundle(*app_module.VALIDATION_IGS, "hl7.fhir.eu.eps#1.0.0-ballot")))
-    body = client.get("/api/health").json()
-    assert body["status"] == "ok"
-    assert body["matchbox"] == "up"
-    assert body["missing_igs"] == []
+    res = client.get("/fhir/$status")
+    assert param_one(res, "matchbox") == "up"
+    assert param_entries(res, "missingIg") == []
     # the UI reads these to warn before a doomed request
-    assert body["max_body_bytes"] == 5 * 1024 * 1024
-    assert body["max_image_bytes"] == 2 * 1024 * 1024
-    assert body["max_note_chars"] == app_module.MAX_NOTE_CHARS
-    assert body["register_code_required"] is False
+    assert param_one(res, "maxBundleBytes") == 5 * 1024 * 1024
+    assert param_one(res, "maxImageBytes") == 2 * 1024 * 1024
+    assert param_one(res, "maxNoteChars") == app_module.MAX_NOTE_CHARS
+    assert param_one(res, "registerCodeRequired") is False
     fake_urlopen(monkeypatch, FakeResponse(b"{}", status=503))
-    assert client.get("/api/health").json()["matchbox"] == "down"
+    assert param_one(client.get("/fhir/$status"), "matchbox") == "down"
     fake_urlopen(monkeypatch, urllib.error.URLError("refused"))
-    body = client.get("/api/health").json()
-    # the service itself is still ok - only the validator is down
-    assert (body["status"], body["matchbox"]) == ("ok", "down")
+    res = client.get("/fhir/$status")
+    # the service itself is still answering - only the validator is down
+    assert res.status_code == 200
+    assert param_one(res, "matchbox") == "down"
 
 
 def test_health_is_degraded_when_a_validation_ig_is_not_loaded(client, monkeypatch):
@@ -1452,9 +1610,9 @@ def test_health_is_degraded_when_a_validation_ig_is_not_loaded(client, monkeypat
     silently absent and every claim from it goes unchecked. That is a state
     worth a name of its own, not "up"."""
     matchbox_alive(monkeypatch, FakeResponse(ig_bundle("hl7.fhir.eu.eps#1.0.0-ballot")))
-    body = client.get("/api/health").json()
-    assert body["matchbox"] == "degraded"
-    assert body["missing_igs"] == list(app_module.VALIDATION_IGS)
+    res = client.get("/fhir/$status")
+    assert param_one(res, "matchbox") == "degraded"
+    assert param_entries(res, "missingIg") == list(app_module.VALIDATION_IGS)
 
 
 def test_health_is_degraded_when_matchbox_loaded_nothing(client, monkeypatch):
@@ -1463,13 +1621,13 @@ def test_health_is_degraded_when_matchbox_loaded_nothing(client, monkeypatch):
     not an unreadable reply to shrug at."""
     matchbox_alive(monkeypatch, FakeResponse(json.dumps(
         {"resourceType": "Bundle", "type": "searchset", "total": 0}).encode()))
-    body = client.get("/api/health").json()
-    assert body["matchbox"] == "degraded"
-    assert body["missing_igs"] == list(app_module.VALIDATION_IGS)
+    res = client.get("/fhir/$status")
+    assert param_one(res, "matchbox") == "degraded"
+    assert param_entries(res, "missingIg") == list(app_module.VALIDATION_IGS)
     # a reply that is not a Bundle at all is still "unknown", so stays "up"
     matchbox_alive(monkeypatch, FakeResponse(json.dumps(
         {"resourceType": "OperationOutcome", "issue": []}).encode()))
-    assert client.get("/api/health").json()["matchbox"] == "up"
+    assert param_one(client.get("/fhir/$status"), "matchbox") == "up"
 
 
 def test_health_accepts_a_package_listed_without_a_version(client, monkeypatch):
@@ -1480,50 +1638,157 @@ def test_health_accepts_a_package_listed_without_a_version(client, monkeypatch):
                                 "packageId": package}}]}).encode()))
     # a versionless listing cannot be checked, so it is trusted rather than
     # reported missing
-    assert client.get("/api/health").json()["missing_igs"] == []
+    assert param_entries(client.get("/fhir/$status"), "missingIg") == []
 
 
 def test_health_stays_up_when_the_ig_list_is_unreadable(client, monkeypatch):
     matchbox_alive(monkeypatch, FakeResponse(b"not json"))
-    assert client.get("/api/health").json()["matchbox"] == "up"
+    assert param_one(client.get("/fhir/$status"), "matchbox") == "up"
     matchbox_alive(monkeypatch, urllib.error.URLError("search timed out"))
-    assert client.get("/api/health").json()["matchbox"] == "up"
+    assert param_one(client.get("/fhir/$status"), "matchbox") == "up"
     matchbox_alive(monkeypatch, FakeResponse(b"[1, 2]"))
-    assert client.get("/api/health").json()["matchbox"] == "up"
+    assert param_one(client.get("/fhir/$status"), "matchbox") == "up"
 
 
 def test_health_reports_a_register_code_requirement(client, monkeypatch):
     monkeypatch.setattr(app_module, "REGISTER_CODE", "sesame")
     fake_urlopen(monkeypatch, urllib.error.URLError("refused"))
-    assert client.get("/api/health").json()["register_code_required"] is True
+    assert param_one(client.get("/fhir/$status"), "registerCodeRequired") is True
 
 
 def test_health_survives_a_half_open_connection(client, monkeypatch):
     fake_urlopen(monkeypatch, http.client.RemoteDisconnected("gone mid-handshake"))
-    assert client.get("/api/health").json()["matchbox"] == "down"
+    assert param_one(client.get("/fhir/$status"), "matchbox") == "down"
+
+
+# ------------------------------------------------------------ FHIR surface
+
+def test_metadata_describes_the_whole_api(client):
+    """A client pointed at the base URL discovers the API from here, so what
+    the CapabilityStatement lists has to be what the server actually serves."""
+    res = client.get("/fhir/metadata")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("application/fhir+json")
+    cs = res.json()
+    assert cs["resourceType"] == "CapabilityStatement"
+    assert cs["fhirVersion"] == "4.0.1"
+    rest = cs["rest"][0]
+    assert {r["type"] for r in rest["resource"]} == {
+        "Bundle", "Organization", "DocumentReference", "Binary"}
+    assert {op["name"] for op in rest["operation"]} == {
+        "register", "leaderboard", "submissions", "samples", "exchange",
+        "documents", "status"}
+    # every server-level operation it advertises is really there
+    for op in rest["operation"]:
+        assert client.get("/fhir/$" + op["name"]).status_code in (200, 405), op
+    # the Bundle it validates is pinned to the profile teams are scored against,
+    # and the secondary categories ride along as supportedProfile - the
+    # conformance resource's own way of saying "this one is what we are about"
+    bundles = next(r for r in rest["resource"] if r["type"] == "Bundle")
+    assert bundles["profile"] == app_module.PROFILE
+    assert bundles["profile"] == app_module.PRIMARY_DOCUMENT["profile"]
+    assert bundles["supportedProfile"] == [
+        d["profile"] for d in app_module.SECONDARY_DOCUMENTS]
+    assert app_module.PROFILE not in bundles["supportedProfile"]
+    assert [o["name"] for o in bundles["operation"]] == ["validate"]
+
+
+def test_every_error_is_an_operation_outcome(client, monkeypatch):
+    """FHIR has one way to say what went wrong, and a client that can read a
+    validation failure must not need a second parser for a 404."""
+    cases = [
+        client.get("/fhir/Bundle/999"),                       # 404
+        client.get("/fhir/Organization/$me"),                 # 401
+        client.get("/fhir/Organization/ghost/$document"),     # 404
+        client.post("/fhir/$register", json={"resourceType": "Patient"}),  # 400
+        client.get("/fhir/nonsense"),                         # unrouted
+        client.request("DELETE", "/fhir/Bundle/1"),           # 405
+        client.get("/fhir/$submissions?count=ten"),           # 422, bad query
+    ]
+    for res in cases:
+        assert res.status_code >= 400
+        assert res.headers["content-type"].startswith("application/fhir+json")
+        body = res.json()
+        assert body["resourceType"] == "OperationOutcome"
+        assert body["issue"][0]["severity"] == "error"
+        assert body["issue"][0]["code"]
+        assert body["issue"][0]["diagnostics"]
+
+
+def test_validate_points_at_the_bundle_it_stored(client, monkeypatch):
+    """$validate answers with an OperationOutcome, so the thing it validated
+    is named in Content-Location rather than in a body field."""
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch)
+    assert res.status_code == 200
+    assert res.json()["resourceType"] == "OperationOutcome"
+    stored = res.headers["content-location"]
+    assert stored.startswith("/fhir/Bundle/")
+    assert client.get(stored).json()["resourceType"] == "Bundle"
+
+
+def test_one_id_space_for_submissions_and_samples(client, monkeypatch):
+    """Bundle ids are numeric for submissions and slugs for samples, so the
+    two cannot collide and one read serves both."""
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch)
+    numeric = param_entries(client.get("/fhir/$submissions"))[0]["id"]
+    assert client.get("/fhir/Bundle/%d" % numeric).json()["resourceType"] == "Bundle"
+    assert client.get("/fhir/Bundle/arne-complex-care").json()["resourceType"] \
+        == "Bundle"
+
+
+def test_organizations_are_searchable(client):
+    register(client, "Beta")
+    register(client, "Alpha")
+    body = client.get("/fhir/Organization").json()
+    assert body["resourceType"] == "Bundle" and body["type"] == "searchset"
+    assert body["total"] == 2
+    orgs = [e["resource"] for e in body["entry"]]
+    assert [o["name"] for o in orgs] == ["Alpha", "Beta"]      # by name
+    # and each one reads back at its own id
+    assert client.get("/fhir/Organization/alpha").json()["name"] == "Alpha"
+    assert client.get("/fhir/Organization/ghost").status_code == 404
+
+
+def test_a_bearer_token_authenticates_as_well_as_the_header(client, monkeypatch):
+    """The UI sends Bearer; the README's curl lines send X-Team-Token. Both
+    are the same credential and both have to work."""
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, outcome())
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE,
+                      headers={"Authorization": "Bearer " + token,
+                               "Content-Type": "application/fhir+json"})
+    assert res.status_code == 200
+    assert client.get("/fhir/Organization/$me",
+                      headers={"Authorization": "Bearer " + token}).status_code == 200
+    assert client.get("/fhir/Organization/$me",
+                      headers={"Authorization": "Bearer nope"}).status_code == 401
 
 
 # ---------------------------------------------------------------- OpenAPI
 
 def test_openapi_describes_the_bodies_fastapi_cannot_see(client):
-    """Two endpoints read the request body by hand, so FastAPI has no model
+    """Several endpoints read the request body by hand, so FastAPI has no model
     to introspect and would publish them as taking nothing at all."""
     spec = client.get("/openapi.json").json()
-    register_body = spec["paths"]["/api/register"]["post"]["requestBody"]
-    props = register_body["content"]["application/json"]["schema"]["properties"]
-    assert set(props) == {"team", "code"}
-    eps_body = spec["paths"]["/api/eps"]["post"]["requestBody"]
-    assert "application/fhir+json" in eps_body["content"]
-    assert "/api/interop/confirm" not in spec["paths"]
+    for path in ("/fhir/$register", "/fhir/Bundle/$validate",
+                 "/fhir/DocumentReference"):
+        body = spec["paths"][path]["post"]["requestBody"]
+        assert "application/fhir+json" in body["content"], path
+    assert "/fhir/$confirm" not in spec["paths"]
 
 
 def test_openapi_documents_the_score_headers(client):
     """The verdict rides on headers, so a generated client that only sees the
     body would have no way to read the score."""
-    ok = client.get("/openapi.json").json()["paths"]["/api/eps"]["post"]
+    ok = client.get("/openapi.json").json()["paths"]["/fhir/Bundle/$validate"]["post"]
     headers = ok["responses"]["200"]["headers"]
-    assert set(headers) == {"X-Pass", "X-Score", "X-Errors", "X-Sections",
-                            "X-Resources"}
+    assert set(headers) == {"X-Pass", "X-Score", "X-Submission-Score", "X-Errors",
+                            "X-Sections", "X-Resources", "X-Document-Type",
+                            "X-Document-Profile", "X-Secondary-Categories",
+                            "X-Best-Patient-Summary", "X-First-Pass",
+                            "Content-Location"}
 
 
 def test_openapi_declares_the_team_token_as_a_security_scheme(client):
@@ -1532,18 +1797,20 @@ def test_openapi_declares_the_team_token_as_a_security_scheme(client):
     assert scheme["in"] == "header" and scheme["name"] == "X-Team-Token"
     # submitting is the only endpoint that authenticates; the exchange corpus
     # is open, so it carries no security requirement at all
-    assert spec["paths"]["/api/eps"]["post"]["security"] == [{"TeamToken": []}]
-    assert "security" not in spec["paths"]["/api/exchange"]["get"]
+    assert spec["paths"]["/fhir/Bundle/$validate"]["post"]["security"] == [{"TeamToken": []}]
+    assert "security" not in spec["paths"]["/fhir/$exchange"]["get"]
     # ...and the raw header parameters are not listed anywhere either
     names = [p["name"].lower()
-             for p in spec["paths"]["/api/exchange"]["get"].get("parameters", [])]
+             for p in spec["paths"]["/fhir/$exchange"]["get"].get("parameters", [])]
     assert "x-team-token" not in names and "authorization" not in names
 
 
 def test_openapi_leaves_the_ui_out(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert "/" not in paths and "/favicon.svg" not in paths
-    assert all(p.startswith("/api/") for p in paths)
+    assert all(p.startswith("/fhir/") for p in paths)
+    # the clinician view model is a rendering, not API - it stays out too
+    assert not any(p.startswith("/ui/") for p in paths)
 
 
 def test_index_links_the_machine_readable_api(client):
@@ -1556,11 +1823,41 @@ def test_index_links_the_machine_readable_api(client):
 def test_leaderboard_carries_the_slug_its_rows_link_with(client, monkeypatch):
     tok = register(client, "Alpha Team")
     submit(client, tok, outcome(), monkeypatch)
-    row = client.get("/api/leaderboard").json()[0]
-    assert row["team_slug"] == "alpha-team"
-    # the slug is what /api/submissions groups by, so the link lands somewhere
-    subs = client.get("/api/submissions").json()
-    assert subs[0]["team_slug"] == row["team_slug"]
+    row = param_entries(client.get("/fhir/$leaderboard"))[0]
+    assert row["organizationSlug"] == "alpha-team"
+    # the slug is what $submissions groups by, so the link lands somewhere
+    subs = param_entries(client.get("/fhir/$submissions"))
+    assert subs[0]["organizationSlug"] == row["organizationSlug"]
+
+
+def test_index_renders_an_idle_company_without_undefineds(client):
+    """FHIR omits an empty element rather than sending null, so a company that
+    has never submitted arrives with no bestSections part at all. Read straight
+    into the row template that becomes the string "undefined" on the board."""
+    text = client.get("/").text
+    assert "function leaderboardRow(" in text
+    assert "v === undefined ? null : v" in text
+    # and the template still asks the question the normaliser answers
+    assert "r.best_sections === null" in text
+
+
+def test_index_builds_the_company_picker_from_a_parameters_body(client):
+    """$leaderboard is a Parameters resource, not the JSON array the page was
+    written against, so the company picker has to unwrap it the same way the
+    board does. Calling .filter on the resource threw, the throw was caught,
+    and the Clinical view offered no companies at all."""
+    text = client.get("/").text
+    assert ('teams = paramEntries(await res.json(), "entry")\n'
+            "        .map(leaderboardRow).filter((t) => t.attempts > 0);") in text
+    # and the option list still reads the names the normaliser produces
+    assert '\'<option value="\' + esc(t.team_slug) + \'">\' + esc(t.team)' in text
+
+
+def test_index_says_so_when_the_company_list_cannot_be_loaded(client):
+    """An empty picker with no message reads as "nobody has submitted", which
+    is how the bug above stayed invisible."""
+    text = client.get("/").text
+    assert "Could not load the list of " in text
 
 
 def test_index_links_leaderboard_companies_to_their_documents(client):
@@ -1599,7 +1896,7 @@ def test_index_drops_the_example_banner_but_keeps_the_bundle(client):
     text = client.get("/").text
     assert "sample-banner" not in text
     assert "Example document." not in text
-    assert "'/bundle\" download>download the FHIR bundle</a>'" in text
+    assert '\'" download>download the FHIR bundle</a>\'' in text
 
 
 # ---------------------------------------------------------------- QA pass additions
@@ -1664,13 +1961,13 @@ def test_validate_honours_the_timeout_and_asks_for_fhir_json(monkeypatch):
 def test_502_leaves_no_trace(client, monkeypatch):
     tok = register(client, "Unlucky")
     monkeypatch.setattr(app_module, "validate_with_matchbox",
-                        lambda body: (_ for _ in ()).throw(app_module.MatchboxError("down")))
-    res = client.post("/api/eps", content=BUNDLE, headers={"X-Team-Token": tok})
+                        lambda body, doc=None: (_ for _ in ()).throw(app_module.MatchboxError("down")))
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE, headers={"X-Team-Token": tok})
     assert res.status_code == 502
     audit_root = os.path.join(client.data_dir, "submissions")
     assert [f for _, _, files in os.walk(audit_root) for f in files] == []
-    assert client.get("/api/submissions").json() == []
-    (row,) = client.get("/api/leaderboard").json()
+    assert param_entries(client.get("/fhir/$submissions")) == []
+    (row,) = param_entries(client.get("/fhir/$leaderboard"))
     assert row["attempts"] == 0
 
 
@@ -1680,11 +1977,11 @@ def test_non_object_json_body_is_rejected_before_validation(client, monkeypatch)
     monkeypatch.setattr(app_module, "validate_with_matchbox",
                         lambda body: called.append(body) or outcome())
     for body in (b"[1, 2, 3]", b'"a bundle"', b"42", b"null"):
-        res = client.post("/api/eps", content=body, headers={"X-Team-Token": tok})
+        res = client.post("/fhir/Bundle/$validate", content=body, headers={"X-Team-Token": tok})
         assert res.status_code == 400, body
-        assert "object" in res.json()["detail"]
+        assert "object" in diagnostics(res)
     assert called == []
-    assert client.get("/api/leaderboard").json()[0]["attempts"] == 0
+    assert param_entries(client.get("/fhir/$leaderboard"))[0]["attempts"] == 0
 
 
 def test_outcome_without_issues_is_a_clean_pass(client, monkeypatch):
@@ -1710,30 +2007,38 @@ def test_malformed_issues_do_not_crash_scoring(client, monkeypatch):
 
 
 def test_register_collapses_whitespace_and_dedupes_on_it(client):
-    res = client.post("/api/register", json={"team": "  Alpha \t Team  "})
+    res = register_res(client, "  Alpha \t Team  ")
     assert res.status_code == 200
-    assert res.json()["team"] == "Alpha Team"
+    assert param_one(res, "organization")["name"] == "Alpha Team"
     for clash in ("alpha team", "ALPHA   TEAM", " Alpha Team"):
-        assert client.post("/api/register", json={"team": clash}).status_code == 409, clash
+        assert register_res(client, clash).status_code == 409, clash
 
 
 def test_register_rejects_non_string_and_missing_names(client):
-    for payload in ({"team": 42}, {"team": None}, {"team": ["x"]}, {}, {"name": "x"}):
-        res = client.post("/api/register", json=payload)
-        assert res.status_code == 400, payload
+    bodies = [
+        {"resourceType": "Parameters",
+         "parameter": [{"name": "name", "valueInteger": 42}]},
+        {"resourceType": "Parameters",
+         "parameter": [{"name": "name"}]},           # a part with no value[x]
+        {"resourceType": "Parameters", "parameter": []},
+        {"resourceType": "Parameters"},
+        {"resourceType": "Parameters",              # the wrong part name
+         "parameter": [{"name": "team", "valueString": "x"}]},
+    ]
+    for body in bodies:
+        assert client.post("/fhir/$register", json=body).status_code == 400, body
 
 
 def test_register_code_gate(client, monkeypatch):
     monkeypatch.setattr(app_module, "REGISTER_CODE", "sesame")
-    assert client.post("/api/register", json={"team": "Gated"}).status_code == 403
-    assert client.post("/api/register",
-                       json={"team": "Gated", "code": "wrong"}).status_code == 403
-    assert client.post("/api/register",
-                       json={"team": "Gated", "code": 123}).status_code == 403
-    assert client.post("/api/register",
-                       json={"team": "Gated", "code": "sesame"}).status_code == 200
+    assert register_res(client, "Gated").status_code == 403
+    assert register_res(client, "Gated", "wrong").status_code == 403
+    assert client.post("/fhir/$register", json={"resourceType": "Parameters",
+        "parameter": [{"name": "name", "valueString": "Gated"},
+                      {"name": "code", "valueInteger": 123}]}).status_code == 403
+    assert register_res(client, "Gated", "sesame").status_code == 200
     # the wrong-code attempts did not reserve the name
-    assert client.get("/api/leaderboard").json()[0]["team"] == "Gated"
+    assert param_entries(client.get("/fhir/$leaderboard"))[0]["organization"] == "Gated"
 
 
 def test_slugify_folds_nordic_letters_and_never_returns_empty():
@@ -1750,8 +2055,9 @@ def test_slugify_folds_nordic_letters_and_never_returns_empty():
 
 def test_colliding_slugs_stay_unique(client):
     for name in ("Åland Hälsa", "Aland Halsa", "aland  halsa!", "北京", "上海"):
-        assert client.post("/api/register", json={"team": name}).status_code == 200, name
-    slugs = [r["team_slug"] for r in client.get("/api/leaderboard").json()]
+        assert register_res(client, name).status_code == 200, name
+    slugs = [r["organizationSlug"]
+             for r in param_entries(client.get("/fhir/$leaderboard"))]
     assert len(slugs) == len(set(slugs))
     assert sorted(slugs) == ["aland-halsa", "aland-halsa-2", "aland-halsa-3",
                              "team", "team-2"]
@@ -1779,13 +2085,16 @@ def test_exchange_publishes_the_best_document_not_the_latest(client, monkeypatch
     rich = submit(client, tok, outcome(), monkeypatch, body=bundle(sections=2, resources=2))
     assert rich.headers["X-Score"] == "74"
     plain = submit(client, tok, outcome(), monkeypatch, body=bundle())
-    assert plain.headers["X-Score"] == "50"
-    rich_id = client.get("/api/submissions?team=best-foot").json()[-1]["id"]
-    (entry,) = [e for e in client.get("/api/exchange").json() if e["team"] == "Best Foot"]
-    assert entry["exchange_id"] == rich_id
-    res = client.get("/api/exchange/best-foot")
+    # The standing still stands on the richer bundle; this one scored 50.
+    assert plain.headers["X-Score"] == "74"
+    assert plain.headers["X-Submission-Score"] == "50"
+    rich_id = param_entries(
+        client.get("/fhir/$submissions?organization=best-foot"))[-1]["id"]
+    (entry,) = [e for e in param_entries(client.get("/fhir/$exchange")) if e["organization"] == "Best Foot"]
+    assert entry["id"] == rich_id
+    res = client.get("/fhir/Organization/best-foot/$document")
     assert res.status_code == 200
-    assert res.headers["X-Exchange-Id"] == str(rich_id)
+    assert res.headers["content-location"] == "/fhir/Bundle/%d" % rich_id
     assert res.headers["X-Producer"] == "best-foot"
     assert json.loads(res.content) == json.loads(bundle(sections=2, resources=2))
 
@@ -1794,24 +2103,27 @@ def test_submissions_limit_bounds(client, monkeypatch):
     tok = register(client, "Bounded")
     for _ in range(3):
         submit(client, tok, outcome(), monkeypatch)
-    assert len(client.get("/api/submissions?limit=2").json()) == 2
-    assert len(client.get("/api/submissions?limit=1000").json()) == 3
-    # out-of-range limits are clamped to 1..1000, as the README says
-    assert len(client.get("/api/submissions?limit=0").json()) == 1
-    assert len(client.get("/api/submissions?limit=-5").json()) == 1
-    assert len(client.get("/api/submissions?limit=1001").json()) == 3
-    assert client.get("/api/submissions?limit=ten").status_code == 422
-    assert client.get("/api/submissions?team=nobody").json() == []
+    def n(query):
+        return len(param_entries(client.get("/fhir/$submissions?" + query)))
+
+    assert n("count=2") == 2
+    assert n("count=1000") == 3
+    # out-of-range counts are clamped to 1..1000, as the README says
+    assert n("count=0") == 1
+    assert n("count=-5") == 1
+    assert n("count=1001") == 3
+    assert client.get("/fhir/$submissions?count=ten").status_code == 422
+    assert param_entries(client.get("/fhir/$submissions?organization=nobody")) == []
 
 
 def test_missing_samples_dir_degrades_to_unavailable(client, monkeypatch, tmp_path):
     monkeypatch.setattr(app_module, "SAMPLES_DIR", str(tmp_path / "nowhere"))
-    listing = client.get("/api/samples").json()
-    assert listing["samples"], "the catalogue itself is static"
-    assert all(s["available"] is False for s in listing["samples"])
-    sample_id = listing["samples"][0]["id"]
-    assert client.get(f"/api/samples/{sample_id}").status_code == 404
-    assert client.get(f"/api/samples/{sample_id}/bundle").status_code == 404
+    listing = param_entries(client.get("/fhir/$samples"))
+    assert listing, "the catalogue itself is static"
+    assert all(s["available"] is False for s in listing)
+    sample_id = listing[0]["id"]
+    assert client.get(f"/ui/documents/{sample_id}").status_code == 404
+    assert client.get(f"/fhir/Bundle/{sample_id}").status_code == 404
 
 
 def test_sample_ids_cannot_escape_the_samples_dir(client):
@@ -1819,14 +2131,14 @@ def test_sample_ids_cannot_escape_the_samples_dir(client):
     assert app_module.read_sample_bytes("..") is None
     assert app_module.read_sample_bytes("") is None
     for bad in ("..%2Fapp", "%2e%2e", "..%2F..%2Fapp.py"):
-        assert client.get(f"/api/samples/{bad}").status_code == 404, bad
-        assert client.get(f"/api/samples/{bad}/bundle").status_code == 404, bad
+        assert client.get(f"/ui/documents/{bad}").status_code == 404, bad
+        assert client.get(f"/fhir/Bundle/{bad}").status_code == 404, bad
 
 
 def test_summariser_crash_does_not_take_the_detail_endpoint_down(client, monkeypatch):
     tok = register(client, "Fragile")
     assert submit(client, tok, outcome(), monkeypatch).status_code == 200
-    sub_id = client.get("/api/submissions").json()[0]["id"]
+    sub_id = param_entries(client.get("/fhir/$submissions"))[0]["id"]
     real = app_module.summarize_bundle
 
     def boom(bundle):
@@ -1835,10 +2147,10 @@ def test_summariser_crash_does_not_take_the_detail_endpoint_down(client, monkeyp
         raise RuntimeError("unexpected shape")
 
     monkeypatch.setattr(app_module, "summarize_bundle", boom)
-    res = client.get(f"/api/submissions/{sub_id}")
+    res = client.get(f"/ui/documents/{sub_id}")
     assert res.status_code == 200
     assert res.json()["summary"] == real(None)
-    res = client.get("/api/samples/andrea-cross-border")
+    res = client.get("/ui/documents/andrea-cross-border")
     assert res.status_code == 200
     assert res.json()["summary"] == real(None)
 
@@ -1853,7 +2165,7 @@ def test_favicon_is_an_svg(client):
 def test_care_plan_shows_the_activity_not_the_plan(client):
     """Andrea's plan is active but its one visit was cancelled and never
     rebooked - the cancellation and the note are what a clinician needs."""
-    summary = client.get("/api/samples/andrea-cross-border").json()["summary"]
+    summary = client.get("/ui/documents/andrea-cross-border").json()["summary"]
     items = [i for sec in summary["sections"] for i in sec.get("items", [])]
     plans = [i for i in items if (i.get("detail") or "").startswith("scheduled ")]
     assert plans, [i.get("label") for i in items]
@@ -1864,7 +2176,7 @@ def test_care_plan_shows_the_activity_not_the_plan(client):
 
 
 def test_device_use_shows_when_the_device_went_in(client):
-    summary = client.get("/api/samples/arne-complex-care").json()["summary"]
+    summary = client.get("/ui/documents/arne-complex-care").json()["summary"]
     items = [i for sec in summary["sections"] for i in sec.get("items", [])]
     devices = [i for i in items if (i.get("detail") or "").startswith("in use since ")]
     assert devices, [i.get("detail") for i in items]
@@ -1938,9 +2250,9 @@ def test_notes_are_surfaced_and_normalised():
 
 def test_index_reads_health_and_links_rows(client):
     text = client.get("/").text
-    assert "/api/health" in text
-    assert "/api/leaderboard" in text
-    assert "/api/submissions?limit=200" not in text  # the picker no longer truncates
+    assert "/fhir/$status" in text
+    assert "/fhir/$leaderboard" in text
+    assert "/fhir/$submissions?count=200" not in text  # the picker no longer truncates
     assert 'aria-current="page"' in text
     assert 'role="alert"' in text
     assert "Object.hasOwn(CV_VIEWS" in text
@@ -1976,16 +2288,15 @@ def png_bytes(w=8, h=8, rgb=(200, 60, 60)):
             + chunk(b"IEND", b""))
 
 
+_MISSING = object()   # "the element is absent", which is not the same as None
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
 WEBP = b"RIFF" + b"\x00\x00\x00\x00" + b"WEBP" + b"\x00" * 64
 
 
 def add_shot(client, token, slug, image=None, note=None):
-    url = "/api/exchange/%s/renderings" % slug
-    if note is not None:
-        url += "?note=" + urllib.parse.quote(note)
-    return client.post(url, content=png_bytes() if image is None else image,
-                       headers={"X-Team-Token": token, "Content-Type": "image/png"})
+    body = docref(slug, png_bytes() if image is None else image, note)
+    return client.post("/fhir/DocumentReference", json=body,
+                       headers={"X-Team-Token": token})
 
 
 def test_a_rendering_records_who_saw_whose_document(client, monkeypatch):
@@ -1993,12 +2304,18 @@ def test_a_rendering_records_who_saw_whose_document(client, monkeypatch):
     res = add_shot(client, tok_c, "producer", note="  Allergies came through empty.  ")
     assert res.status_code == 201
     shot = res.json()
-    assert shot["producer"] == "Producer" and shot["producer_slug"] == "producer"
-    assert shot["consumer"] == "Consumer" and shot["consumer_slug"] == "consumer"
-    assert shot["note"] == "Allergies came through empty."   # stripped
-    assert shot["image"] == "/api/renderings/%d/image" % shot["id"]
+    assert shot["resourceType"] == "DocumentReference"
+    # custodian owns the document, author took the picture
+    assert shot["custodian"]["reference"] == "Organization/producer"
+    assert shot["custodian"]["display"] == "Producer"
+    assert shot["author"][0]["reference"] == "Organization/consumer"
+    assert shot["author"][0]["display"] == "Consumer"
+    assert shot["description"] == "Allergies came through empty."   # stripped
+    assert shot["content"][0]["attachment"]["url"] == "/fhir/Binary/%s" % shot["id"]
+    # the Location header points at the resource that was just created
+    assert res.headers["location"] == "/fhir/DocumentReference/%s" % shot["id"]
     # the document is the producer's published submission, not just its slug
-    assert shot["document"] == client.get("/api/exchange").json()[0]["exchange_id"]
+    assert related_bundle(shot) == param_entries(client.get("/fhir/$exchange"))[0]["id"]
     # and the bytes are on disk under the uploader
     saved = os.listdir(os.path.join(client.data_dir, "renderings", "consumer"))
     assert len(saved) == 1 and saved[0].endswith(".png")
@@ -2017,19 +2334,51 @@ def test_a_file_that_is_not_an_image_is_refused(client, monkeypatch):
     """The declared Content-Type is not evidence: HTML must never land here and
     be served back as a page from the same origin as everyone's token."""
     tok_p, tok_c = interop_setup(client, monkeypatch)
-    res = client.post("/api/exchange/producer/renderings",
-                      content=b"<html><script>alert(1)</script></html>",
-                      headers={"X-Team-Token": tok_c, "Content-Type": "image/png"})
+    res = add_shot(client, tok_c, "producer",
+                   image=b"<html><script>alert(1)</script></html>")
     assert res.status_code == 400
-    assert "PNG, JPEG or WebP" in res.json()["detail"]
+    assert "PNG, JPEG or WebP" in diagnostics(res)
     assert not os.path.exists(os.path.join(client.data_dir, "renderings"))
+
+
+def test_an_attachment_that_is_not_base64_is_refused(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    body = docref("producer", png_bytes())
+    body["content"][0]["attachment"]["data"] = "not base64 at all!!"
+    res = client.post("/fhir/DocumentReference", json=body,
+                      headers={"X-Team-Token": tok_c})
+    assert res.status_code == 400
+    assert "base64" in diagnostics(res)
+    # and so is a DocumentReference with no attachment to decode
+    body["content"] = [{"attachment": {"contentType": "image/png"}}]
+    res = client.post("/fhir/DocumentReference", json=body,
+                      headers={"X-Team-Token": tok_c})
+    assert res.status_code == 400
+
+
+def test_a_body_that_is_not_a_documentreference_is_refused(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = client.post("/fhir/DocumentReference", json={"resourceType": "Media"},
+                      headers={"X-Team-Token": tok_c})
+    assert res.status_code == 400
+    assert diagnostics(res) == "Body must be a FHIR DocumentReference"
+
+
+def test_a_screenshot_must_name_the_company_it_belongs_to(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    body = docref("producer", png_bytes())
+    del body["custodian"]
+    res = client.post("/fhir/DocumentReference", json=body,
+                      headers={"X-Team-Token": tok_c})
+    assert res.status_code == 400
+    assert "custodian" in diagnostics(res)
 
 
 def test_you_cannot_render_your_own_document(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     res = add_shot(client, tok_p, "producer")
     assert res.status_code == 400
-    assert "your own document" in res.json()["detail"]
+    assert "your own document" in diagnostics(res)
 
 
 def test_rendering_a_document_that_does_not_exist(client, monkeypatch):
@@ -2042,8 +2391,8 @@ def test_rendering_a_document_that_does_not_exist(client, monkeypatch):
 
 def test_uploading_a_rendering_needs_a_token(client, monkeypatch):
     interop_setup(client, monkeypatch)
-    res = client.post("/api/exchange/producer/renderings", content=png_bytes(),
-                      headers={"Content-Type": "image/png"})
+    res = client.post("/fhir/DocumentReference",
+                      json=docref("producer", png_bytes()))
     assert res.status_code == 401
 
 
@@ -2052,14 +2401,14 @@ def test_an_oversized_screenshot_is_refused_before_it_is_resident(client, monkey
     monkeypatch.setattr(app_module, "MAX_IMAGE_BYTES", 1024)
     res = add_shot(client, tok_c, "producer", image=png_bytes() + b"\x00" * 4096)
     assert res.status_code == 413
-    assert "limit is 1024 bytes" in res.json()["detail"]
+    assert "limit is 1024 bytes" in diagnostics(res)
 
 
 def test_a_runaway_note_is_truncated_not_refused(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     res = add_shot(client, tok_c, "producer", note="x" * (app_module.MAX_NOTE_CHARS + 500))
     assert res.status_code == 201
-    assert len(res.json()["note"]) == app_module.MAX_NOTE_CHARS
+    assert len(res.json()["description"]) == app_module.MAX_NOTE_CHARS
 
 
 def test_renderings_list_filters_by_document_producer_and_consumer(client, monkeypatch):
@@ -2067,30 +2416,32 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
     tok_d = register(client, "Third")
     add_shot(client, tok_c, "producer", note="from consumer")
     add_shot(client, tok_d, "producer", note="from third")
-    doc = client.get("/api/exchange").json()[0]["exchange_id"]
+    doc = param_entries(client.get("/fhir/$exchange"))[0]["id"]
 
-    everything = client.get("/api/renderings").json()
+    everything = shots(client.get("/fhir/DocumentReference"))
     assert len(everything) == 2
-    assert everything[0]["ts"] >= everything[1]["ts"]          # newest first
-    assert len(client.get("/api/renderings?document=%d" % doc).json()) == 2
-    assert len(client.get("/api/renderings?producer=producer").json()) == 2
-    assert [s["note"] for s in client.get("/api/renderings?consumer=third").json()] \
+    assert everything[0]["date"] >= everything[1]["date"]      # newest first
+    assert client.get("/fhir/DocumentReference").json()["total"] == 2
+    assert len(shots(client.get("/fhir/DocumentReference?related=%d" % doc))) == 2
+    assert len(shots(client.get("/fhir/DocumentReference?custodian=producer"))) == 2
+    assert [d["description"]
+            for d in shots(client.get("/fhir/DocumentReference?author=third"))] \
         == ["from third"]
-    assert client.get("/api/renderings?producer=nobody").json() == []
-    assert client.get("/api/renderings?document=99999").json() == []
+    assert shots(client.get("/fhir/DocumentReference?custodian=nobody")) == []
+    assert shots(client.get("/fhir/DocumentReference?related=99999")) == []
 
 
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
-    assert client.get("/api/exchange").json()[0]["renderings"] == 0
+    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 0
     add_shot(client, tok_c, "producer")
-    assert client.get("/api/exchange").json()[0]["renderings"] == 1
+    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 1
 
 
 def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     sid = add_shot(client, tok_c, "producer", image=JPEG).json()["id"]
-    res = client.get("/api/renderings/%d/image" % sid)
+    res = client.get("/fhir/Binary/%s" % sid)
     assert res.status_code == 200
     assert res.content == JPEG
     assert res.headers["content-type"] == "image/jpeg"       # not the declared image/png
@@ -2098,23 +2449,24 @@ def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monk
     assert "default-src 'none'" in res.headers["content-security-policy"]
     # already compressed: gzipping it again would be CPU for nothing
     assert res.headers["content-encoding"] == "identity"
-    assert client.get("/api/renderings/99999/image").status_code == 404
+    assert client.get("/fhir/Binary/99999").status_code == 404
 
 
 def test_a_rendering_stays_pinned_to_the_document_it_was_taken_from(client, monkeypatch):
     """A team's exchange document moves the moment it beats its own score. A
     screenshot has to keep pointing at the bytes somebody actually opened."""
     tok_p, tok_c = interop_setup(client, monkeypatch)
-    first_doc = client.get("/api/exchange").json()[0]["exchange_id"]
+    first_doc = param_entries(client.get("/fhir/$exchange"))[0]["id"]
     sid = add_shot(client, tok_c, "producer").json()["id"]
     # the producer publishes something better; the exchange document changes
     submit(client, tok_p, outcome(), monkeypatch,
            body=bundle(sections=4, resources=10))
-    second_doc = client.get("/api/exchange").json()[0]["exchange_id"]
+    second_doc = param_entries(client.get("/fhir/$exchange"))[0]["id"]
     assert second_doc != first_doc
-    shot = [s for s in client.get("/api/renderings").json() if s["id"] == sid][0]
-    assert shot["document"] == first_doc
-    assert client.get("/api/exchange").json()[0]["renderings"] == 0   # of the new one
+    shot = [d for d in shots(client.get("/fhir/DocumentReference"))
+            if d["id"] == sid][0]
+    assert related_bundle(shot) == first_doc
+    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 0   # of the new one
 
 
 def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
@@ -2122,19 +2474,26 @@ def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
     tok_d = register(client, "Third")
     sid = add_shot(client, tok_c, "producer", note="first take").json()["id"]
 
-    def patch(token, payload):
-        return client.patch("/api/renderings/%d" % sid, json=payload,
-                            headers={"X-Team-Token": token})
+    def put(token, note):
+        body = {"resourceType": "DocumentReference", "status": "current"}
+        if note is not _MISSING:
+            body["description"] = note
+        return client.put("/fhir/DocumentReference/%s" % sid, json=body,
+                          headers={"X-Team-Token": token})
 
-    assert patch(tok_c, {"note": "  clearer take  "}).json()["note"] == "clearer take"
-    assert patch(tok_d, {"note": "hijack"}).status_code == 403
-    assert patch(tok_c, {}).status_code == 400
-    assert patch(tok_c, {"note": 7}).status_code == 400
-    assert client.patch("/api/renderings/%d" % sid, json={"note": "x"}).status_code == 401
-    assert client.patch("/api/renderings/99999", json={"note": "x"},
-                        headers={"X-Team-Token": tok_c}).status_code == 404
+    assert put(tok_c, "  clearer take  ").json()["description"] == "clearer take"
+    assert put(tok_d, "hijack").status_code == 403
+    assert put(tok_c, _MISSING).status_code == 400
+    assert put(tok_c, 7).status_code == 400
+    assert client.put("/fhir/DocumentReference/%s" % sid,
+                      json={"resourceType": "DocumentReference",
+                            "description": "x"}).status_code == 401
+    assert client.put("/fhir/DocumentReference/99999",
+                      json={"resourceType": "DocumentReference", "description": "x"},
+                      headers={"X-Team-Token": tok_c}).status_code == 404
     # the last accepted write is what everyone reads
-    assert client.get("/api/renderings").json()[0]["note"] == "clearer take"
+    assert shots(client.get("/fhir/DocumentReference"))[0]["description"] \
+        == "clearer take"
 
 
 def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
@@ -2144,17 +2503,18 @@ def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
     shot_dir = os.path.join(client.data_dir, "renderings", "consumer")
     assert len(os.listdir(shot_dir)) == 1
 
-    assert client.delete("/api/renderings/%d" % sid,
+    assert client.delete("/fhir/DocumentReference/%s" % sid,
                          headers={"X-Team-Token": tok_d}).status_code == 403
-    assert client.delete("/api/renderings/%d" % sid).status_code == 401
+    assert client.delete("/fhir/DocumentReference/%s" % sid).status_code == 401
     assert len(os.listdir(shot_dir)) == 1          # nothing removed by a refused call
 
-    res = client.delete("/api/renderings/%d" % sid, headers={"X-Team-Token": tok_c})
-    assert res.status_code == 200 and res.json() == {"deleted": sid}
+    res = client.delete("/fhir/DocumentReference/%s" % sid,
+                        headers={"X-Team-Token": tok_c})
+    assert res.status_code == 204 and res.content == b""
     assert os.listdir(shot_dir) == []              # a withdrawn screenshot is gone
-    assert client.get("/api/renderings").json() == []
-    assert client.get("/api/renderings/%d/image" % sid).status_code == 404
-    assert client.delete("/api/renderings/%d" % sid,
+    assert shots(client.get("/fhir/DocumentReference")) == []
+    assert client.get("/fhir/Binary/%s" % sid).status_code == 404
+    assert client.delete("/fhir/DocumentReference/%s" % sid,
                          headers={"X-Team-Token": tok_c}).status_code == 404
 
 
@@ -2163,8 +2523,8 @@ def test_renderings_are_readable_without_a_token(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     sid = add_shot(client, tok_c, "producer").json()["id"]
     for headers in ({}, {"X-Team-Token": "not-a-real-token"}):
-        assert client.get("/api/renderings", headers=headers).status_code == 200
-        assert client.get("/api/renderings/%d/image" % sid,
+        assert client.get("/fhir/DocumentReference", headers=headers).status_code == 200
+        assert client.get("/fhir/Binary/%s" % sid,
                           headers=headers).status_code == 200
 
 
@@ -2174,21 +2534,25 @@ def test_screenshots_earn_nothing(client, monkeypatch):
     tok_p = register(client, "Producer2")
     tok_c = register(client, "Consumer2")
     submit(client, tok_p, outcome(), monkeypatch, body=CLINICAL_BODY)
-    before = {r["team"]: r["score"] for r in client.get("/api/leaderboard").json()}
+    before = {r["organization"]: r["score"] for r in param_entries(client.get("/fhir/$leaderboard"))}
     for _ in range(5):
         assert add_shot(client, tok_c, "producer2").status_code == 201
-    after = {r["team"]: r["score"] for r in client.get("/api/leaderboard").json()}
+    after = {r["organization"]: r["score"] for r in param_entries(client.get("/fhir/$leaderboard"))}
     assert after == before
     assert after["Consumer2"] == 0
 
 
 def test_whoami_names_the_company_behind_a_token(client):
     tok = register(client, "  Alpha Team  ")
-    res = client.get("/api/me", headers={"X-Team-Token": tok})
+    res = client.get("/fhir/Organization/$me", headers={"X-Team-Token": tok})
     assert res.status_code == 200
-    assert res.json() == {"team": "Alpha Team", "team_slug": "alpha-team"}
-    assert client.get("/api/me").status_code == 401
-    assert client.get("/api/me", headers={"X-Team-Token": "nope"}).status_code == 401
+    org = res.json()
+    assert org["resourceType"] == "Organization"
+    assert org["name"] == "Alpha Team"
+    assert org["id"] == "alpha-team"
+    assert org["active"] is True
+    assert client.get("/fhir/Organization/$me").status_code == 401
+    assert client.get("/fhir/Organization/$me", headers={"X-Team-Token": "nope"}).status_code == 401
 
 
 def test_the_interop_tab_offers_screenshots(client):
@@ -2197,7 +2561,7 @@ def test_the_interop_tab_offers_screenshots(client):
     assert "async function shrinkImage(file)" in text          # browser-side downscale
     assert 'loading="lazy"' in text                            # a gallery on venue wifi
     assert "Your document - other companies add the screenshots." in text
-    assert "/api/renderings?document=" in text
+    assert "/fhir/DocumentReference?related=" in text
     # the note is edited in place, and a withdraw asks once first
     assert 'box.className = "shot-edit"' in text
     assert "prompt(" not in text
@@ -2334,9 +2698,16 @@ def run_explain(client, groups, severity, reported):
     """Build the explain-with-an-assistant prompt with the page's own code."""
     js = page_script(client)
     parts = []
-    for name in ("EXPLAIN_GUIDE", "EXPLAIN_PROVIDERS"):
+    for name in ("EXPLAIN_GUIDES", "EXPLAIN_PROVIDERS"):
         start = js.index("const %s = " % name)
-        parts.append(js[start:js.index(";\n", start) + 2])
+        # One is an object literal and the other an array, and both carry ";\n"
+        # inside their string values - so close on whichever bracket terminator
+        # comes first, not on the first semicolon.
+        end = min(e for e in (js.find("};\n", start), js.find("];\n", start))
+                  if e != -1)
+        parts.append(js[start:end + 3])
+    # explainPrompt reads it; the page sets it from X-Document-Type per submission.
+    parts.append('let explainDoc = "eps";\n')
     for name in ("explainPrompt", "explainUrl"):
         start = js.index("function %s(" % name)
         parts.append(js[start:js.index("\n}", start) + 2])
@@ -2367,9 +2738,9 @@ def test_the_explain_prompt_carries_every_error_with_its_location_and_profiles(c
     than leaving the assistant to wonder where the other two went."""
     got = run_explain(client, EXPLAIN_GROUPS, "error", 4)
     prompt = got["prompt"]
-    assert prompt.startswith("I am validating a FHIR European Patient Summary bundle "
-                             "against the HL7 Europe EPS implementation guide "
-                             "(http://hl7.eu/fhir/eps/)")
+    assert prompt.startswith("I am validating a FHIR bundle against the HL7 Europe "
+                             "European Patient Summary implementation guide "
+                             "(https://hl7.eu/fhir/eps/)")
     assert "Explain what these errors mean" in prompt
     assert "starting with whichever change clears the most of them" in prompt
     assert "The 4 errors, merged into 2 distinct findings:\n\n1. Slice" in prompt
@@ -2815,9 +3186,10 @@ def test_stored_counts_match_the_findings_that_are_shown(client, monkeypatch):
     token = register(client, "Counted Warnings AB")
     res = submit(client, token, oc, monkeypatch)
     assert len(res.json()["issue"]) == 1
-    slug = client.get("/api/leaderboard").json()
-    row = [r for r in slug if r["team"] == "Counted Warnings AB"][0]
-    history = client.get("/api/submissions?team=%s" % row["team_slug"]).json()
+    slug = param_entries(client.get("/fhir/$leaderboard"))
+    row = [r for r in slug if r["organization"] == "Counted Warnings AB"][0]
+    history = param_entries(client.get(
+        "/fhir/$submissions?organization=%s" % row["organizationSlug"]))
     assert history[0]["warnings"] == 1
 
 
@@ -3001,9 +3373,456 @@ def test_wipes_repeat_daily_at_the_practice_ends_time_of_day():
 
 def test_health_advertises_the_practice_period(client, monkeypatch):
     monkeypatch.setattr(app_module, "PRACTICE_ENDS", "2026-11-18T03:00:00Z")
-    assert client.get("/api/health").json()["practice_ends"] == "2026-11-18T03:00:00Z"
+    assert param_one(client.get("/fhir/$status"), "practiceEnds") == "2026-11-18T03:00:00Z"
 
 
 def test_health_reports_no_practice_period_when_unset(client, monkeypatch):
     monkeypatch.setattr(app_module, "PRACTICE_ENDS", "")
-    assert client.get("/api/health").json()["practice_ends"] is None
+    assert param_one(client.get("/fhir/$status"), "practiceEnds") is None
+
+
+# ------------------------------------------------------ EHDS document types
+
+
+def doc_bundle(profile=None, comp_type=None, resources=(), btype="document"):
+    """A bundle shaped just enough for detect_document to have to decide."""
+    entries = [{"resource": {"resourceType": rt, "id": "r%d" % i}}
+               for i, rt in enumerate(resources)]
+    if comp_type is not None:
+        entries.insert(0, {"resource": {
+            "resourceType": "Composition", "status": "final",
+            "type": {"coding": [{"system": "http://loinc.org", "code": comp_type}]},
+        }})
+    body = {"resourceType": "Bundle", "type": btype, "entry": entries}
+    if profile:
+        body["meta"] = {"profile": [profile]}
+    return body
+
+
+def doc_body(*args, **kwargs):
+    return json.dumps(doc_bundle(*args, **kwargs))
+
+
+def secondary_bundle(doc_id):
+    """A bundle that detects as the given non-EPS category."""
+    return doc_body(app_module.DOCUMENTS_BY_ID[doc_id]["bundles"][0])
+
+
+# ------------------------------------------------------------ detection
+
+@pytest.mark.parametrize("doc_id", ["eps", "laboratory", "imaging", "hdr"])
+def test_a_bundle_is_detected_from_the_profile_it_claims(doc_id):
+    """The claim is the submitter saying what they built, and it outranks every
+    other signal - it is the only one that can tell the two imaging bundle
+    shapes apart from anything else."""
+    doc = app_module.DOCUMENTS_BY_ID[doc_id]
+    for canonical in doc["bundles"]:
+        assert app_module.detect_document(doc_bundle(canonical))["id"] == doc_id
+        # A team that pins the version means the same profile.
+        versioned = doc_bundle(canonical + "|9.9.9")
+        assert app_module.detect_document(versioned)["id"] == doc_id
+
+
+def test_an_mpd_bundle_is_detected_from_what_its_entries_claim():
+    """A prescription has no bundle-level profile to claim - MPD profiles
+    MedicationRequest and MedicationDispense and defines no Bundle at all - so
+    its evidence sits one level down."""
+    body = {"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "MedicationRequest", "meta": {"profile": [
+            "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd"]}}},
+    ]}
+    assert app_module.detect_document(body)["id"] == "mpd"
+
+
+@pytest.mark.parametrize("code,doc_id", [("60591-5", "eps"), ("11502-2", "laboratory"),
+                                         ("34105-7", "hdr")])
+def test_a_document_claiming_nothing_is_detected_from_its_composition_type(code, doc_id):
+    assert app_module.detect_document(doc_bundle(comp_type=code))["id"] == doc_id
+
+
+def test_an_imaging_report_that_claims_nothing_is_found_by_its_imaging_study():
+    """Imaging binds Composition.type to every LOINC descendant of 18726-0,
+    which needs a terminology server to decide - its own examples use 24802-1
+    and even a CPT code. So the ImagingStudy stands in for the code check."""
+    body = doc_bundle(comp_type="24802-1", resources=("ImagingStudy",))
+    assert app_module.detect_document(body)["id"] == "imaging"
+
+
+def test_a_patient_summary_is_not_mistaken_for_a_prescription():
+    """A summary carries a medication section. Reading one as a prescription
+    would check it against base Bundle and let a broken summary pass."""
+    body = doc_bundle(comp_type="60591-5",
+                      resources=("MedicationStatement", "MedicationRequest"))
+    assert app_module.detect_document(body)["id"] == "eps"
+
+
+def test_an_unrecognisable_bundle_falls_back_to_the_events_own_track():
+    """Rejecting it would be worse: the patient summary is what the hackathon
+    is about, and an unlabelled bundle is scored exactly as it was before any
+    of the other categories existed. It also means not claiming a category can
+    never accidentally demote a summary out of the scoring."""
+    for body in ({}, {"resourceType": "Bundle"}, doc_bundle(), "not a bundle", None):
+        assert app_module.detect_document(body)["id"] == "eps"
+        assert app_module.detect_document(body)["primary"] is True
+
+
+# ---------------------------------------------------- validation and storage
+
+def test_each_category_is_validated_against_its_own_profile(client, monkeypatch):
+    """Matchbox scopes the engine to the requested profile's closure, so
+    submitting a lab report with the summary's packages would come back with
+    its conformance unchecked rather than checked."""
+    seen = {}
+
+    def capture(body, doc=None):
+        seen["doc"] = doc
+        return outcome()
+
+    monkeypatch.setattr(app_module, "validate_with_matchbox", capture)
+    token = register(client, "Alpha")
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]
+    res = client.post("/fhir/Bundle/$validate", content=doc_body(lab["bundles"][0]),
+                      headers={"X-Team-Token": token})
+    assert res.status_code == 200
+    assert seen["doc"]["id"] == "laboratory"
+    assert res.headers["X-Document-Type"] == "laboratory"
+    assert res.headers["X-Document-Profile"] == lab["profile"]
+
+
+def test_naming_a_profile_settles_the_category(client, monkeypatch):
+    """The escape hatch for a document detect_document reads wrongly: $validate
+    already takes a profile, so the explicit answer goes where FHIR puts it."""
+    hdr = app_module.DOCUMENTS_BY_ID["hdr"]
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, outcome())
+    # A bundle that would otherwise fall back to the patient summary.
+    res = client.post("/fhir/Bundle/$validate?profile=" + hdr["profile"],
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 200
+    assert res.headers["X-Document-Type"] == "hdr"
+
+
+def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):
+    """Honouring an arbitrary profile would let a team pick one their bundle
+    already satisfies and score full marks on it."""
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, outcome())
+    res = client.post(
+        "/fhir/Bundle/$validate?profile=http://example.org/easy",
+        content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 400
+    assert app_module.PROFILE in diagnostics(res)
+
+
+def test_the_stored_category_is_the_one_the_bundle_was_scored_as(client, monkeypatch):
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("hdr"))
+    row = param_entries(client.get("/fhir/$submissions"))[0]
+    assert row["documentType"] == "hdr"
+    # The download is named for what it is, not for what the event started as.
+    dl = client.get("/fhir/Bundle/%d" % row["id"])
+    assert "-hdr.json" in dl.headers["content-disposition"]
+
+
+def test_an_old_database_gains_the_category_column_as_a_patient_summary(tmp_path,
+                                                                       monkeypatch):
+    """Every submission taken before this existed was scored against the
+    patient summary, so that is what it has to backfill as."""
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    os.makedirs(os.path.join(str(tmp_path), "submissions"), exist_ok=True)
+    with sqlite3.connect(os.path.join(str(tmp_path), "connectathon.db")) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT, slug TEXT,
+                token TEXT, first_pass INTEGER DEFAULT 0, created_at TEXT);
+            CREATE TABLE submissions (id INTEGER PRIMARY KEY, team_id INTEGER,
+                ts TEXT, pass INTEGER, errors INTEGER, warnings INTEGER,
+                infos INTEGER, score INTEGER, sections INTEGER, resources INTEGER,
+                filename TEXT);
+            INSERT INTO teams VALUES (1, 'Old', 'old', 'tok', 0, '2026-01-01');
+            INSERT INTO submissions VALUES
+                (1, 1, '2026-01-01', 1, 0, 0, 0, 60, 1, 5, 'a.json');
+            """
+        )
+    app_module.init_db()
+    with app_module.connect() as conn:
+        assert conn.execute(
+            "SELECT doc_type FROM submissions WHERE id = 1").fetchone()[0] == "eps"
+
+
+# ------------------------------------------------- EPS is the primary citizen
+
+def test_a_company_that_only_sends_summaries_scores_what_it_always_did(client,
+                                                                      monkeypatch):
+    """The whole point of the demotion: adding four categories to the service
+    cannot move a single score that existed before them."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch,
+                 body=bundle_with_section(
+                     {"title": "Allergies",
+                      "entry": [{"reference": "urn:uuid:res-0"}]}, resources=3))
+    assert res.headers["X-Score"] == str(50 + 10 + 3 * 2)
+    assert res.headers["X-Secondary-Categories"] == "0"
+
+
+def test_a_secondary_category_earns_a_flat_bonus_not_richness(client, monkeypatch):
+    """Richness is measured against what a patient summary is meant to carry;
+    counting sections on a lab report would only reward the wrong shape."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]["bundles"][0]
+    # A deliberately rich lab bundle: sections and resources buy it nothing.
+    body = doc_bundle(lab, comp_type="11502-2",
+                      resources=("Observation",) * 20)
+    res = submit(client, token, outcome(), monkeypatch, body=json.dumps(body))
+    assert res.headers["X-Document-Type"] == "laboratory"
+    assert res.headers["X-Submission-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+    assert res.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+
+def test_a_stack_of_other_categories_cannot_out_score_one_good_summary(client,
+                                                                      monkeypatch):
+    """This is the patient summary track. Passing every other category is worth
+    less than a single well-built summary, and that has to stay true."""
+    consume_first_pass(client, monkeypatch)
+    breadth = register(client, "Breadth")
+    for doc_id in ("laboratory", "mpd", "imaging", "hdr"):
+        doc = app_module.DOCUMENTS_BY_ID[doc_id]
+        body = (doc_body(doc["bundles"][0]) if doc["bundles"]
+                else json.dumps({"resourceType": "Bundle", "type": "collection",
+                                 "entry": [{"resource": {
+                                     "resourceType": "MedicationRequest",
+                                     "meta": {"profile": [doc["entry_profiles"][0]]}}}]}))
+        res = submit(client, breadth, outcome(), monkeypatch, body=body)
+        assert res.headers["X-Document-Type"] == doc_id, res.headers
+
+    depth = register(client, "Depth")
+    res = submit(client, depth, outcome(), monkeypatch,
+                 body=bundle(sections=2, resources=2))
+
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Breadth"]["score"] == 4 * app_module.SECONDARY_CATEGORY_POINTS
+    assert board["Depth"]["score"] > board["Breadth"]["score"]
+    assert board["Depth"]["rank"] < board["Breadth"]["rank"]
+    # And the breadth company is honestly described: it has passed things, but
+    # it has no patient summary at all.
+    assert board["Breadth"]["passed"] is True
+    assert "bestPatientSummary" not in board["Breadth"]
+    assert board["Depth"]["bestPatientSummary"] == 74
+
+
+def test_the_first_pass_bonus_belongs_to_the_patient_summary(client, monkeypatch):
+    """It is the track's own prize. Handing it to whoever happened to bring the
+    easiest other category would make it the opposite of what it is for."""
+    lab_only = register(client, "Lab Only")
+    res = submit(client, lab_only, outcome(), monkeypatch,
+                 body=secondary_bundle("laboratory"))
+    assert res.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+    summariser = register(client, "Summariser")
+    res = submit(client, summariser, outcome(), monkeypatch)
+    assert res.headers["X-Score"] == "70"  # the bonus was still there to win
+
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Lab Only"]["firstPass"] is False
+    assert board["Summariser"]["firstPass"] is True
+
+
+def test_a_second_category_adds_its_bonus_once(client, monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    eps = submit(client, token, outcome(), monkeypatch, body=bundle(sections=1, resources=1))
+    base = int(eps.headers["X-Score"])
+    assert eps.headers["X-Secondary-Categories"] == "0"
+
+    first_lab = submit(client, token, outcome(), monkeypatch,
+                       body=secondary_bundle("laboratory"))
+    assert first_lab.headers["X-Secondary-Categories"] == "1"
+    assert int(first_lab.headers["X-Score"]) == base + app_module.SECONDARY_CATEGORY_POINTS
+
+    # Same category again: nothing more to earn.
+    again = submit(client, token, outcome(), monkeypatch,
+                   body=secondary_bundle("laboratory"))
+    assert again.headers["X-Secondary-Categories"] == "1"
+    assert int(again.headers["X-Score"]) == base + app_module.SECONDARY_CATEGORY_POINTS
+
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "alpha")
+    assert part_list(row, "secondaryCategories") == ["laboratory"]
+    assert row["score"] == base + app_module.SECONDARY_CATEGORY_POINTS
+
+
+def test_the_richness_columns_stay_empty_without_a_summary(client, monkeypatch):
+    """They mean "how rich is your patient summary". Filling them from a lab
+    report makes the number incomparable with the row above it, and the status
+    and category chips already show the company did submit."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Lab Only")
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "lab-only")
+    assert row["passed"] is True
+    assert part_list(row, "secondaryCategories") == ["laboratory"]
+    assert "bestSections" not in row
+    assert "bestResources" not in row
+    # Still reported: it is a progress signal across every category, not a
+    # term of the score.
+    assert row["bestErrors"] == 0
+
+    # Once a summary lands, the columns describe it.
+    submit(client, token, outcome(), monkeypatch, body=bundle(sections=3, resources=4))
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "lab-only")
+    assert row["bestSections"] == 3
+    assert row["bestResources"] == 4
+
+
+def test_a_company_with_no_summary_is_told_its_summary_is_missing(client, monkeypatch):
+    """X-Score alone cannot tell "no summary yet" from "a summary worth 0", and
+    the banner has to say which. A summary that passes always scores at least
+    VALID_BASE, so 0 here can only mean there is none."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Lab Only")
+    lab = submit(client, token, outcome(), monkeypatch,
+                 body=secondary_bundle("laboratory"))
+    assert lab.headers["X-Best-Patient-Summary"] == "0"
+    assert lab.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+    eps = submit(client, token, outcome(), monkeypatch,
+                 body=bundle(sections=2, resources=3))
+    assert eps.headers["X-Best-Patient-Summary"] == eps.headers["X-Submission-Score"]
+    assert int(eps.headers["X-Best-Patient-Summary"]) >= app_module.VALID_BASE
+
+
+def test_the_standing_headers_account_for_every_point_of_the_score(client, monkeypatch):
+    """The banner spells the standing out from these parts rather than from
+    X-Score, so any point they do not name is a point that goes missing on
+    screen. That is exactly how the first-pass bonus was lost once."""
+    token = register(client, "Alpha")
+    eps = submit(client, token, outcome(), monkeypatch, body=bundle(sections=6, resources=25))
+    lab = submit(client, token, outcome(), monkeypatch,
+                 body=secondary_bundle("laboratory"))
+    img = submit(client, token, outcome(), monkeypatch,
+                 body=secondary_bundle("imaging"))
+
+    for res in (eps, lab, img):
+        best = int(res.headers["X-Best-Patient-Summary"])
+        extras = int(res.headers["X-Secondary-Categories"])
+        bonus = app_module.FIRST_PASS_BONUS if res.headers["X-First-Pass"] == "true" else 0
+        parts = best + bonus + app_module.SECONDARY_CATEGORY_POINTS * extras
+        assert parts == int(res.headers["X-Score"]), res.headers["X-Document-Type"]
+
+    assert img.headers["X-First-Pass"] == "true"
+    assert img.headers["X-Secondary-Categories"] == "2"
+
+
+def test_a_company_without_the_first_pass_bonus_is_not_told_it_has_one(client, monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Latecomer")
+    res = submit(client, token, outcome(), monkeypatch, body=bundle(sections=2, resources=2))
+    assert res.headers["X-First-Pass"] == "false"
+    assert res.headers["X-Score"] == res.headers["X-Best-Patient-Summary"]
+
+
+def test_the_summary_header_holds_the_best_summary_not_the_last_one(client, monkeypatch):
+    """It is the standing's summary term, so a later, worse summary must not
+    move it - the banner would otherwise show arithmetic that does not add up."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    rich = submit(client, token, outcome(), monkeypatch,
+                  body=bundle(sections=4, resources=6))
+    best = int(rich.headers["X-Submission-Score"])
+    thin = submit(client, token, outcome(), monkeypatch,
+                  body=bundle(sections=1, resources=1))
+    assert int(thin.headers["X-Submission-Score"]) < best
+    assert thin.headers["X-Best-Patient-Summary"] == str(best)
+
+
+def test_a_category_only_counts_once_it_actually_passes(client, monkeypatch):
+    """Otherwise a team could bank the bonus by posting a broken bundle of
+    every kind, which is the opposite of what it is for."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch)
+    failed = submit(client, token, outcome(errors=2), monkeypatch,
+                    body=secondary_bundle("laboratory"))
+    assert failed.headers["X-Secondary-Categories"] == "0"
+    assert failed.headers["X-Submission-Score"] == "0"
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "alpha")
+    assert part_list(row, "secondaryCategories") == []
+    assert row["score"] == 50
+
+
+def test_the_secondary_categories_are_listed_in_registry_order(client, monkeypatch):
+    """So the column reads the same for every team however they got there."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    for doc_id in ("hdr", "imaging", "laboratory"):
+        submit(client, token, outcome(), monkeypatch, body=secondary_bundle(doc_id))
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "alpha")
+    assert part_list(row, "secondaryCategories") == ["laboratory", "imaging", "hdr"]
+
+
+def test_the_richness_columns_describe_the_summary_not_the_last_lab_report(client,
+                                                                          monkeypatch):
+    """The standing rests on the best patient summary, so that is what the
+    Sections and Resources columns have to be describing."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=bundle(sections=2, resources=2))
+    # A lab report carrying more of everything must not take over the columns.
+    submit(client, token, outcome(), monkeypatch,
+           body=json.dumps(doc_bundle(
+               app_module.DOCUMENTS_BY_ID["laboratory"]["bundles"][0],
+               resources=("Observation",) * 9)))
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "alpha")
+    assert row["bestSections"] == 2
+    assert row["bestResources"] == 2
+    assert row["bestPatientSummary"] == 74
+
+
+# ------------------------------------------------------------- $documents
+
+def test_documents_lists_every_category_and_whether_it_is_loaded(client, monkeypatch):
+    monkeypatch.setattr(app_module, "loaded_ig_packages",
+                        lambda: {"hl7.fhir.eu.eps#1.0.0-ballot",
+                                 "hl7se.fhir.base#1.1.0"})
+    docs = param_entries(client.get("/fhir/$documents"))
+    assert [d["id"] for d in docs] == [d["id"] for d in app_module.EHDS_DOCUMENTS]
+    by_id = {d["id"]: d for d in docs}
+    assert by_id["eps"]["ready"] is True
+    assert by_id["laboratory"]["ready"] is False
+    assert by_id["eps"]["ehdsCategory"] == "Patient summary"
+    assert by_id["mpd"]["ehdsCategory"] == "ePrescription / eDispensation"
+
+
+def test_documents_puts_the_patient_summary_first_and_flags_it(client):
+    """A client reading this has to be able to tell which one the event is
+    about without knowing the event."""
+    docs = param_entries(client.get("/fhir/$documents"))
+    assert docs[0]["id"] == "eps"
+    assert docs[0]["primary"] is True
+    assert all(d["primary"] is False for d in docs[1:])
+    assert str(app_module.SECONDARY_CATEGORY_POINTS) in docs[1]["points"]
+
+
+def test_documents_says_unknown_rather_than_missing_when_matchbox_is_unreachable(
+        client, monkeypatch):
+    """"We could not ask" and "the packages are not there" send an organiser to
+    two different places."""
+    monkeypatch.setattr(app_module, "loaded_ig_packages", lambda: None)
+    docs = param_entries(client.get("/fhir/$documents"))
+    assert all("ready" not in d for d in docs)
+
+
+def test_the_laboratory_guide_keeps_the_base_ballot_that_holds_its_missing_profile():
+    """DiagnosticReport-eu-lab points at patient-animal-eu-core, which eu.base
+    2.0.0 dropped and only 2.0.0-ballot still defines. Without the ballot in
+    scope every lab bundle - the IG's own examples included - fails to resolve
+    it and scores 0."""
+    igs = app_module.DOCUMENTS_BY_ID["laboratory"]["igs"]
+    assert "hl7.fhir.eu.base#2.0.0-ballot" in igs

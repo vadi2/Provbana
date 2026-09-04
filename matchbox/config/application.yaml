@@ -4,13 +4,59 @@ server:
 hapi:
   fhir:
     implementationguides:
+      # One package per EHDS Article 14 priority category that HL7 Europe has a
+      # FHIR guide for. app.py's EHDS_DOCUMENTS decides which of these a given
+      # submission is checked against; this list is only what the validator
+      # holds. The two have to agree: a package named there and missing here
+      # loads no profiles, so bundles of that category validate against nothing
+      # and score as if they had passed. /fhir/$status reports that as
+      # `degraded` and deploy.sh refuses to finish on it.
+      #
+      # eps is the one the event scores; the other four are the EHDS categories
+      # the service also accepts, and a missing package there costs a bonus
+      # rather than the track, but wrongly - so all five are gated the same.
+      #
+      # Loading all of them together was verified, not assumed - the guides pin
+      # three different versions of hl7.fhir.eu.base (0.1.0-ballot for hdr,
+      # 2.0.0-ballot for imaging, 2.0.0 for eps and laboratory) and Matchbox
+      # loads all three side by side without complaint. Cold boot with the lot
+      # is about 160s and roughly 40 packages once the dependencies are
+      # resolved, against ~30s for eps alone.
       eps:
         name: hl7.fhir.eu.eps
         version: 1.0.0-ballot
+      lab:
+        name: hl7.fhir.eu.laboratory
+        version: 2.0.0
+      mpd:
+        name: hl7.fhir.eu.mpd
+        version: 1.0.0
+      imaging:
+        name: hl7.fhir.eu.imaging
+        version: 1.0.0-ballot
+      hdr:
+        name: hl7.fhir.eu.hdr
+        version: 0.1.0-ballot
       sebase:
         name: hl7se.fhir.base
         version: 1.1.0
 
+# Two of these guides fail their own published examples here, which is worth
+# knowing before anyone reads a score as a verdict on a participant's bundle:
+#
+#   * hl7.fhir.eu.hdr 0.1.0-ballot binds Encounter.status to a value set that
+#     enumerates the R4 codes, but the R5 CodeSystem for
+#     http://hl7.org/fhir/encounter-status - shipped by hl7.fhir.uv.xver-r5.r4,
+#     which the guide's own dependencies pull in - shadows it. R5 renamed
+#     `finished` to `completed`, so a discharge report saying `finished` gets a
+#     hard error and drags two spurious "a matching slice is required" errors
+#     with it. Not fixable from here; it needs the guide or the xver package to
+#     change. Every HDR example in the package hits it.
+#   * hl7.fhir.eu.imaging 1.0.0-ballot: both example bundles put
+#     event-basedOn on the Composition, which CompositionEuImaging does not
+#     allow. The profile is fine - deleting that one extension makes the
+#     example validate clean - so a correctly built imaging report does pass.
+#
 # Terminology is deliberately left off (Matchbox's packaged default is
 # `txServer: n/a`). With it off, a code from a code system the IGs do not carry
 # - ATC, SNOMED CT, LOINC - produces "the code cannot be validated" as a

@@ -17,6 +17,7 @@ script rather than being real grabs of anyone's product.
 """
 
 import argparse
+import base64
 import json
 import os
 import random
@@ -24,7 +25,6 @@ import shutil
 import struct
 import sys
 import urllib.error
-import urllib.parse
 import urllib.request
 import zlib
 
@@ -40,6 +40,14 @@ BUNDLES = {
     "minor": os.path.join(EXAMPLES, "minor-example.json"),
     "official": os.path.join(EXAMPLES, "official-example.json"),
     "broken": os.path.join(EXAMPLES, "broken-example.json"),
+    # The other EHDS categories, so the leaderboard's "Also" column and the
+    # chips on it are populated in a preview rather than being dead UI that
+    # only ever appears at the event. These two are the guides' own published
+    # examples and pass as shipped; the imaging and discharge guides' examples
+    # both fail their own profiles (see matchbox/config/application.yaml), so
+    # seeding those would put a red herring on the demo board.
+    "lab": os.path.join(EXAMPLES, "lab-example.json"),
+    "mpd": os.path.join(EXAMPLES, "mpd-example.json"),
 }
 
 # (team name, [bundles to submit in order]) - order matters: the first team to
@@ -50,8 +58,11 @@ PLAN = [
     ("Fabrikam Digital", ["arne"]),
     ("Litware EHR", ["andrea"]),
     # Two attempts: a failure followed by a fix, so the attempts column and
-    # "best submission wins" behaviour are both visible on one row.
-    ("Northwind Journal AS", ["broken", "official"]),
+    # "best submission wins" behaviour are both visible on one row. Then two
+    # other categories, which is what fills the "Also" column and its chips.
+    # They sit on a mid-table row on purpose: +30 has to be visible without
+    # deciding the lead, or the demo board argues the opposite of the scoring.
+    ("Northwind Journal AS", ["broken", "official", "lab", "mpd"]),
     ("Proseware Health Tech", ["official"]),
     # Same bundle as Proseware -> identical score, which exercises the rank
     # tiebreak (earliest best submission, then name).
@@ -61,6 +72,11 @@ PLAN = [
     ("Trey Research Halsodata", ["minor"]),
     # Never gets past the validator: NOT YET status with a real error count.
     ("Woodgrove MedTech", ["broken", "broken"]),
+    # Nothing but other categories: scores the bonuses and no more, sits near
+    # the bottom, and its richness columns stay "-" because it has no summary
+    # to describe. The state the scoring is meant to make unattractive, so it
+    # should be visible on the demo board rather than only argued about.
+    ("Adatum Labdata", ["lab"]),
     # Registered, never submitted: every richness column falls back to "-".
     ("Lamna HealthOS", []),
     ("VanArsdel Vardsystem", []),
@@ -134,7 +150,7 @@ def lower(headers):
     return {k.lower(): v for k, v in headers.items()}
 
 
-def call(url, method="GET", body=None, token=None, ctype="application/json"):
+def call(url, method="GET", body=None, token=None, ctype="application/fhir+json"):
     """Returns (status, parsed-or-raw body, headers). Errors come back as
     values rather than exceptions so the caller can report and carry on."""
     req = urllib.request.Request(url, data=body, method=method)
@@ -148,11 +164,58 @@ def call(url, method="GET", body=None, token=None, ctype="application/json"):
     except urllib.error.HTTPError as exc:
         raw, status, headers = exc.read(), exc.code, lower(exc.headers)
     except urllib.error.URLError as exc:
-        return 0, {"detail": str(exc.reason)}, {}
+        return 0, outcome_body(str(exc.reason)), {}
     try:
         return status, json.loads(raw), headers
     except ValueError:
         return status, raw, headers
+
+
+def outcome_body(message):
+    """An OperationOutcome shaped like the server's, for errors that never
+    reached it."""
+    return {"resourceType": "OperationOutcome",
+            "issue": [{"severity": "error", "code": "exception",
+                       "diagnostics": message}]}
+
+
+def why(body, status):
+    """The message out of an OperationOutcome, for a one-line report."""
+    if isinstance(body, dict) and body.get("resourceType") == "OperationOutcome":
+        issues = body.get("issue") or [{}]
+        return issues[0].get("diagnostics", status)
+    return status
+
+
+def part_value(part):
+    if "part" in part:
+        return {p["name"]: part_value(p) for p in part["part"]}
+    if "resource" in part:
+        return part["resource"]
+    for key, value in part.items():
+        if key.startswith("value"):
+            return value
+    return None
+
+
+def params(body, name="entry"):
+    """Every value of a repeated parameter in a Parameters resource."""
+    if not isinstance(body, dict):
+        return []
+    return [part_value(p) for p in body.get("parameter", []) if p["name"] == name]
+
+
+def param(body, name):
+    found = params(body, name)
+    return found[0] if found else None
+
+
+def parameters(**values):
+    """A Parameters resource body, which is what the operations take."""
+    return json.dumps({
+        "resourceType": "Parameters",
+        "parameter": [{"name": k, "valueString": v} for k, v in values.items()],
+    }).encode()
 
 
 def main():
@@ -179,21 +242,22 @@ def main():
             print("%s does not exist, nothing to reset" % args.data_dir)
         return 0
 
-    status, health, _ = call(base + "/api/health")
+    status, health, _ = call(base + "/fhir/$status")
     if status != 200:
         print("cannot reach %s - is the service running?" % base, file=sys.stderr)
         return 1
-    if health.get("matchbox") == "degraded":
+    matchbox = param(health, "matchbox")
+    if matchbox == "degraded":
         print("matchbox is up but has not loaded %s - the demo scores would be "
               "wrong; recreate it with `cd ../itb && docker compose -p itb up -d "
               "--force-recreate matchbox` and wait for it to load its IGs"
-              % ", ".join(health.get("missing_igs") or ["a required package"]),
+              % ", ".join(params(health, "missingIg") or ["a required package"]),
               file=sys.stderr)
         return 1
-    if health.get("matchbox") != "up":
+    if matchbox != "up":
         print("matchbox is %s - submissions would fail; start it with "
               "`cd ../itb && docker compose -p itb up -d matchbox` and wait for "
-              "it to load its IGs" % health.get("matchbox"), file=sys.stderr)
+              "it to load its IGs" % matchbox, file=sys.stderr)
         return 1
 
     bundles = {}
@@ -204,20 +268,17 @@ def main():
     tokens = {}
     for name, submissions in PLAN:
         status, body, _ = call(
-            base + "/api/register",
-            "POST",
-            json.dumps({"team": name}).encode(),
+            base + "/fhir/$register", "POST", parameters(name=name),
         )
         if status != 200:
-            detail = body.get("detail", status) if isinstance(body, dict) else status
-            print("  register %-26s SKIP (%s)" % (name, detail))
+            print("  register %-26s SKIP (%s)" % (name, why(body, status)))
             continue
-        tokens[name] = body["token"]
+        tokens[name] = param(body, "token")
         print("register %-26s ok" % name)
 
         for key in submissions:
             status, _, headers = call(
-                base + "/api/eps",
+                base + "/fhir/Bundle/$validate",
                 "POST",
                 bundles[key],
                 tokens[name],
@@ -232,27 +293,37 @@ def main():
 
     # Screenshots come last: a document has to be published before anyone can
     # say what it looked like, and the slug is the service's to decide.
-    status, published, _ = call(base + "/api/exchange")
-    slugs = {p["team"]: p["team_slug"] for p in published} if status == 200 else {}
+    status, published, _ = call(base + "/fhir/$exchange")
+    slugs = ({p["organization"]: p["organizationSlug"] for p in params(published)}
+             if status == 200 else {})
     for consumer, producer, note in RENDERINGS:
         token, slug = tokens.get(consumer), slugs.get(producer)
         if not token or not slug:
             print("screenshot %-26s SKIP (nothing published)" % producer)
             continue
-        status, body, _ = call(
-            "%s/api/exchange/%s/renderings?note=%s"
-            % (base, slug, urllib.parse.quote(note)),
-            "POST", mock_screenshot(consumer + producer), token, "image/png")
-        detail = body.get("detail", status) if isinstance(body, dict) else status
+        image = mock_screenshot(consumer + producer)
+        docref = json.dumps({
+            "resourceType": "DocumentReference",
+            "status": "current",
+            "custodian": {"reference": "Organization/%s" % slug},
+            "description": note,
+            "content": [{"attachment": {
+                "contentType": "image/png",
+                "data": base64.b64encode(image).decode("ascii"),
+            }}],
+        }).encode()
+        status, body, _ = call(base + "/fhir/DocumentReference", "POST",
+                               docref, token)
         print("screenshot %-26s %s"
-              % (producer, "by " + consumer if status == 201 else "FAILED (%s)" % detail))
+              % (producer, "by " + consumer if status == 201
+                 else "FAILED (%s)" % why(body, status)))
 
-    status, rows, _ = call(base + "/api/leaderboard")
+    status, board, _ = call(base + "/fhir/$leaderboard")
     if status == 200:
-        print("\n%-4s %-26s %-6s %s" % ("#", "team", "score", "status"))
-        for row in rows:
+        print("\n%-4s %-26s %-6s %s" % ("#", "company", "score", "status"))
+        for row in params(board):
             print("%-4s %-26s %-6s %s"
-                  % (row["rank"], row["team"], row["score"],
+                  % (row["rank"], row["organization"], row["score"],
                      "VALID" if row["passed"] else "not yet"))
     print("\nopen %s/ to preview" % base)
     return 0
