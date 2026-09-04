@@ -16,6 +16,10 @@ COPY app.py .
 COPY backup.py .
 # Likewise the practice-period reset daemon, which opens the same database.
 COPY reset.py .
+# And the keep-warm daemon, which opens nothing - it imports app.py only so
+# that the categories it keeps compiled are the categories the service accepts,
+# and sends the sample below at the validator on a timer.
+COPY warm.py .
 # Only the bundles: generate.py is the authoring tool, not part of the service.
 COPY samples/*.json ./samples/
 

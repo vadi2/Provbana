@@ -276,6 +276,48 @@ pruning ages them out.
 | `--yes` | off | Required to wipe once, now; without it nothing is touched |
 | `--data-dir` | `$DATA_DIR`, else `data/` beside `app.py` | Which data directory to clear |
 
+## Keeping the validator warm
+
+Matchbox does not validate against a profile so much as against a *validation engine* -
+the expanded snapshots of one guide's entire dependency closure - and it builds that
+engine the first time something asks for it. On the event box that first call takes
+between 26 and 135 seconds depending on the guide, against a `MATCHBOX_TIMEOUT` of 60.
+A participant who is first to send a document of some kind would get a 502 and no
+stored submission, and everyone after them would get an answer in under a second.
+
+`deploy/deploy.sh` pays that cost at deploy time, once per category, so nobody at the
+event does. The catch is that it does not stay paid: Matchbox does not hold the engines
+hard, and they are dropped again after some tens of minutes without use - no restart, no
+log line, nothing in `$status` to see. Measured locally at about 75 minutes of idle on a
+JVM near its heap ceiling. So a deploy on the Monday leaves the box cold by the Tuesday.
+
+`warm.py --loop` is the answer: every 20 minutes it validates one bundle against every
+category, which is five sub-second calls and nothing else. It runs as its own container
+in `docker-compose.prod.yml` for the same reason `backup.py` and `reset.py` do - a thing
+that must keep happening on a schedule should not be sharing a process with the thing
+that serves participants.
+
+```
+python warm.py --loop        # every WARM_INTERVAL seconds (how it runs in compose)
+python warm.py --once        # one pass; exits non-zero if any category is still cold
+```
+
+It logs only the calls that took five seconds or more. In the steady state that means it
+logs nothing, and a line appearing after the first pass is the useful signal: it says an
+engine had been dropped and had to be rebuilt, so `WARM_INTERVAL` is too long.
+
+The bundle it sends is the event's own patient summary sample, which is not a document
+of most of these kinds and comes back invalid for four of the five. That is fine and the
+verdict is thrown away - building the snapshots is the entire point, and Matchbox does
+that before it can decide anything about the content.
+
+The likely mechanism is soft references: HotSpot clears those in proportion to free heap
+(`-XX:SoftRefLRUPolicyMSPerMB`, 1000ms per free MB by default), which explains both the
+rough timing and why the same engines survive far longer on a roomy heap - hence
+`MATCHBOX_HEAP` in `.env.example` being set well above the validator's working set. That
+reading is inferred from the behaviour rather than read out of Matchbox's source, which
+is why the fix does not depend on it being right.
+
 ## Scoring
 
 Any error or fatal validation issue scores the submission **0**. A valid **patient

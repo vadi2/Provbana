@@ -123,7 +123,9 @@ echo "==> Warming the validator"
 # box, against a 60s MATCHBOX_TIMEOUT. Left alone, the first team to submit at
 # the event eats a 502 and every submission after theirs takes under a second.
 # So spend that minute here instead, with a timeout long enough to absorb it.
-# Re-run this if you ever restart the matchbox container mid-event.
+# Keeping it warm afterwards is the warm container's job - Matchbox drops the
+# engines again after tens of minutes idle, so this alone would have worn off
+# long before the doors open. See connectathon/warm.py.
 #
 # Every category gets its own engine, so every category pays that cost once.
 # The patient summary is warmed first and is the one that has to succeed - it

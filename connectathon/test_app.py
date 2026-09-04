@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 import app as app_module
 import backup
 import reset
+import warm
 
 
 def bundle(sections=0, resources=0, empty_sections=0):
@@ -3318,6 +3319,58 @@ def test_reset_leaves_the_database_usable(tmp_path):
     conn.commit()
     assert conn.execute("SELECT name FROM teams").fetchall() == [("after",)]
     conn.close()
+
+
+def test_warm_touches_every_document_type(monkeypatch):
+    """The set it keeps warm is the set the service accepts.
+
+    Both come off EHDS_DOCUMENTS, which is the point of warm.py importing app
+    rather than listing the guides itself: adding a sixth category cannot leave
+    the sidecar warming five."""
+    seen = []
+    monkeypatch.setattr(app_module, "MATCHBOX_TIMEOUT", 60)
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body, doc: seen.append(doc["id"]))
+    assert warm.warm_once(b"{}") == len(app_module.EHDS_DOCUMENTS)
+    assert sorted(seen) == sorted(d["id"] for d in app_module.EHDS_DOCUMENTS)
+    # The patient summary first: it is the one the event scores, so it is the
+    # one to have compiled if the pass is cut short.
+    assert seen[0] == app_module.PRIMARY_DOCUMENT["id"]
+
+
+def test_warm_carries_on_past_a_guide_that_will_not_compile(monkeypatch):
+    """One guide failing costs a slow first submission of that kind. Letting it
+    end the pass would cost every kind."""
+    seen = []
+
+    def validate(body, doc):
+        seen.append(doc["id"])
+        if doc["id"] == "imaging":
+            raise app_module.MatchboxError("no")
+
+    monkeypatch.setattr(app_module, "MATCHBOX_TIMEOUT", 60)
+    monkeypatch.setattr(app_module, "validate_with_matchbox", validate)
+    assert warm.warm_once(b"{}") == len(app_module.EHDS_DOCUMENTS) - 1
+    assert sorted(seen) == sorted(d["id"] for d in app_module.EHDS_DOCUMENTS)
+
+
+def test_warm_gives_itself_longer_than_a_submission_gets(monkeypatch):
+    """A cold engine takes minutes to compile; the service's budget is short on
+    purpose, so that a participant is never left hanging. Warming has to be
+    allowed to outlast it or it can never fix the thing it exists to fix."""
+    budgets = []
+    monkeypatch.setattr(app_module, "MATCHBOX_TIMEOUT", 60)
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body, doc: budgets.append(app_module.MATCHBOX_TIMEOUT))
+    warm.warm_once(b"{}")
+    assert budgets and all(b >= 300 for b in budgets)
+
+
+def test_warm_runs_well_inside_the_measured_eviction_window():
+    """Engines were measured surviving about 75 minutes of disuse, on one JVM
+    at one heap size. The interval has to leave room for that number being
+    optimistic somewhere else."""
+    assert warm.INTERVAL <= 1800
 
 
 def test_practice_ends_parses_utc_forms():

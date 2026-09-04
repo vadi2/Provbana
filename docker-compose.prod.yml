@@ -24,7 +24,7 @@ name: hackathon2026
 # This box is up from September to November; matchbox alone is chatty enough to
 # matter, and a full disk during the event is unrecoverable in the time
 # available. Anchored here rather than on a service so that removing a service
-# cannot take the other four services' caps with it.
+# cannot take the rest of them back to unbounded with it.
 x-logging: &logging
   driver: json-file
   options: {max-size: "10m", max-file: "3"}
@@ -90,7 +90,7 @@ services:
       - state:/srv
     depends_on:
       - matchbox
-    # Small next to the validator's 10g, and that is the point: whatever a
+    # Small next to the validator's, and that is the point: whatever a
     # submission does to this process must not be able to take the box, and the
     # validator with it, down. Baseline is around 100 MB.
     mem_limit: 2g
@@ -133,6 +133,36 @@ services:
       - state:/srv
     depends_on:
       - app
+    mem_limit: 512m
+    logging: *logging
+
+  warm:
+    # The service's image again, but for a different reason than backup and
+    # reset: this one touches no state at all. It imports app.py purely to
+    # reuse the document registry and the $validate call, so that the set of
+    # categories it keeps warm cannot drift from the set the service accepts.
+    #
+    # What it is for: Matchbox compiles a validation engine per guide on first
+    # use - 26 to 135 seconds each on this box, against a 60s MATCHBOX_TIMEOUT
+    # - and then lets them go again after some tens of minutes idle, with no
+    # restart and nothing in the log. deploy/deploy.sh warms them once at
+    # deploy time; without this container that wears off long before the event
+    # starts, and the first team to submit an imaging report eats a 502.
+    # warm.py's docstring has the measurements.
+    build: ./connectathon
+    restart: unless-stopped
+    command: ["python", "warm.py", "--loop"]
+    environment:
+      MATCHBOX_URL: http://matchbox:8080/matchboxv3/fhir
+      # Not MATCHBOX_TIMEOUT: the service's budget is short so that a
+      # participant is never left hanging, and a warm pass that has to compile
+      # from cold needs minutes. warm.py overrides it per call.
+      WARM_INTERVAL: ${WARM_INTERVAL:-1200}
+      WARM_TIMEOUT: ${WARM_TIMEOUT:-300}
+    depends_on:
+      - matchbox
+    # Five HTTP calls every twenty minutes. The work is all on the validator's
+    # side; this process holds one bundle in memory.
     mem_limit: 512m
     logging: *logging
 
