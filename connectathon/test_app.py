@@ -1105,7 +1105,7 @@ def test_index_does_not_claim_terminology_is_validated(client):
     assert ("that require a license (such as SNOMED CT,\n  LOINC, WHO ATC) are not checked"
             in text)
     # every guide a submission can be validated against is named on the page
-    for guide in ("eps", "laboratory", "mpd", "imaging", "hdr"):
+    for guide in ("eps", "laboratory", "mpd", "imaging"):
         assert "https://hl7.eu/fhir/%s/" % guide in text
 
 
@@ -1498,6 +1498,53 @@ def test_the_health_check_covers_every_category(monkeypatch):
     assert len(app_module.DEFAULT_VALIDATION_IGS) == len(
         set(app_module.DEFAULT_VALIDATION_IGS))
     assert app_module.DEFAULT_VALIDATION_IGS[:2] == app_module.PRIMARY_DOCUMENT["igs"]
+
+
+def test_every_category_the_registry_names_is_a_package_the_validator_loads():
+    """The one invariant adding or removing a category has to satisfy by hand.
+
+    EHDS_DOCUMENTS and matchbox/config/application.yaml are edited separately,
+    and a category named in the registry with no package in the yaml validates
+    against nothing and scores as if it had passed - the silent failure the
+    yaml's own comment warns about. Until now only /fhir/$status caught it,
+    which needs a live Matchbox and a ~160s cold boot, so the answer arrived at
+    deploy time rather than here.
+
+    Asserted directionally, not as set equality, because one legitimate
+    asymmetry exists: hl7.fhir.eu.base#2.0.0-ballot is in laboratory's igs and
+    has no yaml entry of its own - it arrives transitively through imaging.
+    """
+    yaml_path = os.path.join(os.path.dirname(os.path.abspath(app_module.__file__)),
+                             os.pardir, "matchbox", "config", "application.yaml")
+    with open(yaml_path, encoding="utf-8") as fh:
+        # Deliberately not a YAML parse: the file is a fixed two-line-per-entry
+        # shape and the suite has no yaml dependency.
+        body = [ln.split("#")[0].strip() for ln in fh]
+    packages = set()
+    name = None
+    for line in body:
+        if line.startswith("name:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("version:") and name:
+            packages.add("%s#%s" % (name, line.split(":", 1)[1].strip()))
+            name = None
+    assert packages, "parsed no packages out of application.yaml"
+
+    # Every package the validator loads is one the service knows about, so a
+    # package added to the yaml and forgotten in the registry is caught.
+    for package in packages:
+        assert package in app_module.DEFAULT_VALIDATION_IGS, package
+    # And every category's own guide has a package, which is the reverse - a
+    # category added to the registry and forgotten in the yaml.
+    for doc in app_module.EHDS_DOCUMENTS:
+        assert doc["igs"][0] in packages, doc["id"]
+
+
+def test_no_two_categories_claim_the_same_profile():
+    """detect_document and the ?profile= override both resolve by scanning the
+    registry for a profile match, so a duplicate would silently shadow."""
+    profiles = [doc["profile"] for doc in app_module.EHDS_DOCUMENTS]
+    assert len(profiles) == len(set(profiles)), profiles
 
 
 def test_validate_keeps_the_outcome_from_an_http_error(monkeypatch):
@@ -3325,8 +3372,8 @@ def test_warm_touches_every_document_type(monkeypatch):
     """The set it keeps warm is the set the service accepts.
 
     Both come off EHDS_DOCUMENTS, which is the point of warm.py importing app
-    rather than listing the guides itself: adding a sixth category cannot leave
-    the sidecar warming five."""
+    rather than listing the guides itself: adding a fifth category cannot leave
+    the sidecar warming four."""
     seen = []
     monkeypatch.setattr(app_module, "MATCHBOX_TIMEOUT", 60)
     monkeypatch.setattr(app_module, "validate_with_matchbox",
@@ -3457,13 +3504,24 @@ def doc_body(*args, **kwargs):
 
 
 def secondary_bundle(doc_id):
-    """A bundle that detects as the given non-EPS category."""
-    return doc_body(app_module.DOCUMENTS_BY_ID[doc_id]["bundles"][0])
+    """A bundle that detects as the given non-EPS category.
+
+    MPD defines no Bundle profile at all, so it has nothing in `bundles` to
+    claim and its evidence has to sit one level down, on an entry. Handling
+    that here rather than at the call sites is what lets a test cover all
+    three secondary categories instead of only the two that are documents.
+    """
+    doc = app_module.DOCUMENTS_BY_ID[doc_id]
+    if doc["bundles"]:
+        return doc_body(doc["bundles"][0])
+    return json.dumps({"resourceType": "Bundle", "type": "collection", "entry": [
+        {"resource": {"resourceType": "MedicationRequest",
+                      "meta": {"profile": [doc["entry_profiles"][0]]}}}]})
 
 
 # ------------------------------------------------------------ detection
 
-@pytest.mark.parametrize("doc_id", ["eps", "laboratory", "imaging", "hdr"])
+@pytest.mark.parametrize("doc_id", ["eps", "laboratory", "imaging"])
 def test_a_bundle_is_detected_from_the_profile_it_claims(doc_id):
     """The claim is the submitter saying what they built, and it outranks every
     other signal - it is the only one that can tell the two imaging bundle
@@ -3487,8 +3545,8 @@ def test_an_mpd_bundle_is_detected_from_what_its_entries_claim():
     assert app_module.detect_document(body)["id"] == "mpd"
 
 
-@pytest.mark.parametrize("code,doc_id", [("60591-5", "eps"), ("11502-2", "laboratory"),
-                                         ("34105-7", "hdr")])
+@pytest.mark.parametrize("code,doc_id", [("60591-5", "eps"),
+                                         ("11502-2", "laboratory")])
 def test_a_document_claiming_nothing_is_detected_from_its_composition_type(code, doc_id):
     assert app_module.detect_document(doc_bundle(comp_type=code))["id"] == doc_id
 
@@ -3545,14 +3603,19 @@ def test_each_category_is_validated_against_its_own_profile(client, monkeypatch)
 def test_naming_a_profile_settles_the_category(client, monkeypatch):
     """The escape hatch for a document detect_document reads wrongly: $validate
     already takes a profile, so the explicit answer goes where FHIR puts it."""
-    hdr = app_module.DOCUMENTS_BY_ID["hdr"]
+    imaging = app_module.DOCUMENTS_BY_ID["imaging"]
     token = register(client, "Alpha")
     set_outcome(monkeypatch, outcome())
-    # A bundle that would otherwise fall back to the patient summary.
-    res = client.post("/fhir/Bundle/$validate?profile=" + hdr["profile"],
+    # The premise, asserted rather than assumed: without the override this
+    # bundle is a patient summary. Imaging is the one category detect_document
+    # can reach from a hard-coded branch (an ImagingStudy in the bundle), so
+    # loosening that branch could otherwise make this pass while the override
+    # itself was broken.
+    assert app_module.detect_document(json.loads(BUNDLE))["id"] == "eps"
+    res = client.post("/fhir/Bundle/$validate?profile=" + imaging["profile"],
                       content=BUNDLE, headers={"X-Team-Token": token})
     assert res.status_code == 200
-    assert res.headers["X-Document-Type"] == "hdr"
+    assert res.headers["X-Document-Type"] == "imaging"
 
 
 def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):
@@ -3569,12 +3632,12 @@ def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatc
 
 def test_the_stored_category_is_the_one_the_bundle_was_scored_as(client, monkeypatch):
     token = register(client, "Alpha")
-    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("hdr"))
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("imaging"))
     row = param_entries(client.get("/fhir/$submissions"))[0]
-    assert row["documentType"] == "hdr"
+    assert row["documentType"] == "imaging"
     # The download is named for what it is, not for what the event started as.
     dl = client.get("/fhir/Bundle/%d" % row["id"])
-    assert "-hdr.json" in dl.headers["content-disposition"]
+    assert "-imaging.json" in dl.headers["content-disposition"]
 
 
 def test_an_old_database_gains_the_category_column_as_a_patient_summary(tmp_path,
@@ -3603,11 +3666,63 @@ def test_an_old_database_gains_the_category_column_as_a_patient_summary(tmp_path
             "SELECT doc_type FROM submissions WHERE id = 1").fetchone()[0] == "eps"
 
 
+def test_a_retired_category_still_in_the_database_scores_nothing(client, monkeypatch):
+    """A category can be dropped from the registry while its rows survive.
+
+    The discharge report was removed after teams had already practised against
+    it, and reset.py only wipes daily until PRACTICE_ENDS while backup.py
+    restores whatever it snapshotted - so a passing `hdr` row can outlive the
+    category itself. The submit header and the leaderboard count the bonus by
+    different means, and they have to agree on what a retired doc_type is
+    worth: nothing. Counting it in one place and not the other put a 15-point
+    contradiction between a team's banner and the board next to it.
+    """
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    with app_module.connect() as conn:
+        team_id = conn.execute(
+            "SELECT id FROM teams WHERE slug = 'alpha'").fetchone()[0]
+        conn.execute(
+            "INSERT INTO submissions (team_id, ts, pass, errors, warnings, infos, "
+            "score, sections, resources, doc_type, filename) "
+            "VALUES (?, '2026-01-01', 1, 0, 0, 0, 0, 0, 0, 'hdr', 'old.json')",
+            (team_id,))
+    assert "hdr" not in {d["id"] for d in app_module.EHDS_DOCUMENTS}
+
+    res = submit(client, token, outcome(), monkeypatch)
+    assert res.headers["X-Secondary-Categories"] == "0"
+    row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
+               if r["organizationSlug"] == "alpha")
+    assert part_list(row, "secondaryCategories") == []
+    # The two ways of counting agree, which is the actual invariant.
+    assert int(res.headers["X-Score"]) == row["score"]
+
+
+def test_the_page_names_every_category_it_can_be_asked_about(client):
+    """Three lists in the page script mirror the registry by hand.
+
+    DOC_LABELS is refreshed from $documents so it self-heals, but DOC_SHORT and
+    EXPLAIN_GUIDES are const and never refreshed - and both fail soft, to the
+    raw id and to the summary's guide respectively. A category added to the
+    registry and forgotten here sends a team to the wrong specification with
+    nothing to show for it, which is precisely the drift the guide link exists
+    to prevent.
+    """
+    js = page_script(client)
+    ids = {d["id"] for d in app_module.EHDS_DOCUMENTS}
+    for name in ("DOC_SHORT", "EXPLAIN_GUIDES"):
+        start = js.index("const %s = " % name)
+        # Anchored on the separator, so a key is only a key where one can
+        # start - "https:" inside a guide URL is not one.
+        listed = set(re.findall(r"[{,]\s*(\w+):", js[start:js.index("};", start)]))
+        assert listed == ids, (name, listed ^ ids)
+
+
 # ------------------------------------------------- EPS is the primary citizen
 
 def test_a_company_that_only_sends_summaries_scores_what_it_always_did(client,
                                                                       monkeypatch):
-    """The whole point of the demotion: adding four categories to the service
+    """The whole point of the demotion: adding three categories to the service
     cannot move a single score that existed before them."""
     consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
@@ -3640,7 +3755,7 @@ def test_a_stack_of_other_categories_cannot_out_score_one_good_summary(client,
     less than a single well-built summary, and that has to stay true."""
     consume_first_pass(client, monkeypatch)
     breadth = register(client, "Breadth")
-    for doc_id in ("laboratory", "mpd", "imaging", "hdr"):
+    for doc_id in ("laboratory", "mpd", "imaging"):
         doc = app_module.DOCUMENTS_BY_ID[doc_id]
         body = (doc_body(doc["bundles"][0]) if doc["bundles"]
                 else json.dumps({"resourceType": "Bundle", "type": "collection",
@@ -3655,7 +3770,8 @@ def test_a_stack_of_other_categories_cannot_out_score_one_good_summary(client,
                  body=bundle(sections=2, resources=2))
 
     board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
-    assert board["Breadth"]["score"] == 4 * app_module.SECONDARY_CATEGORY_POINTS
+    assert board["Breadth"]["score"] == (
+        len(app_module.SECONDARY_DOCUMENTS) * app_module.SECONDARY_CATEGORY_POINTS)
     assert board["Depth"]["score"] > board["Breadth"]["score"]
     assert board["Depth"]["rank"] < board["Breadth"]["rank"]
     # And the breadth company is honestly described: it has passed things, but
@@ -3812,11 +3928,14 @@ def test_the_secondary_categories_are_listed_in_registry_order(client, monkeypat
     """So the column reads the same for every team however they got there."""
     consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
-    for doc_id in ("hdr", "imaging", "laboratory"):
+    # Submitted in an order that is neither registry order, nor its reverse,
+    # nor alphabetical either way - so no accumulation that merely echoes the
+    # submissions can produce the expected list by accident.
+    for doc_id in ("imaging", "laboratory", "mpd"):
         submit(client, token, outcome(), monkeypatch, body=secondary_bundle(doc_id))
     row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
                if r["organizationSlug"] == "alpha")
-    assert part_list(row, "secondaryCategories") == ["laboratory", "imaging", "hdr"]
+    assert part_list(row, "secondaryCategories") == ["laboratory", "mpd", "imaging"]
 
 
 def test_the_richness_columns_describe_the_summary_not_the_last_lab_report(client,

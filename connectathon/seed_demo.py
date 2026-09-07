@@ -43,9 +43,9 @@ BUNDLES = {
     # The other EHDS categories, so the leaderboard's "Also" column and the
     # chips on it are populated in a preview rather than being dead UI that
     # only ever appears at the event. These two are the guides' own published
-    # examples and pass as shipped; the imaging and discharge guides' examples
-    # both fail their own profiles (see matchbox/config/application.yaml), so
-    # seeding those would put a red herring on the demo board.
+    # examples and pass as shipped; the imaging guide's examples fail its own
+    # profile (see matchbox/config/application.yaml), so seeding that would put
+    # a red herring on the demo board.
     "lab": os.path.join(EXAMPLES, "lab-example.json"),
     "mpd": os.path.join(EXAMPLES, "mpd-example.json"),
 }
