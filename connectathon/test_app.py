@@ -1813,6 +1813,68 @@ def test_organizations_are_searchable(client):
     assert client.get("/fhir/Organization/ghost").status_code == 404
 
 
+def test_organizations_are_searchable_by_name(client):
+    register(client, "Åland Hälsa")
+    register(client, "Nordic Health")
+
+    def names(query):
+        body = client.get("/fhir/Organization?" + query).json()
+        assert body["total"] == len(body["entry"])
+        return [e["resource"]["name"] for e in body["entry"]]
+
+    assert names("name=aland") == ["Åland Hälsa"]          # case and accents
+    assert names("name=health") == []                      # start of the name
+    assert names("name:contains=HEAL") == ["Nordic Health"]
+    assert names("name:contains=h") == ["Nordic Health", "Åland Hälsa"]
+    assert names("name:exact=Nordic Health") == ["Nordic Health"]
+    assert names("name:exact=nordic health") == []
+    assert names("name=nobody") == []
+    assert names("name=") == ["Nordic Health", "Åland Hälsa"]   # same as not asking
+    # repeats are ANDed, commas are ORed, and \\, is a comma in the name
+    assert names("name=nordic,aland") == ["Nordic Health", "Åland Hälsa"]
+    assert names("name=nordic&name=aland") == []
+    assert names("name=n&name:contains=heal") == ["Nordic Health"]
+    assert names("name:exact=Nobody,Nordic Health") == ["Nordic Health"]
+
+
+def test_a_name_search_in_another_script_does_not_match_everyone(client):
+    """Folding to ASCII turned such a term into nothing, and nothing is the
+    start of every name."""
+    register(client, "Nordic Health")
+    register(client, "日本ヘルス")
+    register(client, "Acme, Inc")
+
+    def names(query):
+        body = client.get("/fhir/Organization", params=query).json()
+        return [e["resource"]["name"] for e in body["entry"]]
+
+    assert names({"name": "日本"}) == ["日本ヘルス"]
+    assert names({"name": "中国"}) == []
+    assert names({"name:contains": "ヘルス"}) == ["日本ヘルス"]
+    assert names({"name:exact": "Acme\\, Inc"}) == ["Acme, Inc"]
+    assert names({"name": "acme\\, inc,nordic"}) == ["Acme, Inc", "Nordic Health"]
+
+
+def test_exchange_filters_by_company_name(client, monkeypatch):
+    interop_setup(client, monkeypatch)
+    submit(client, register(client, "Åland Hälsa"), outcome(), monkeypatch)
+
+    def listed(query):
+        return [p["organizationSlug"]
+                for p in param_entries(client.get("/fhir/$exchange" + query))]
+
+    assert listed("") == ["producer", "aland-halsa"]
+    assert listed("?name=halsa") == ["aland-halsa"]        # anywhere in the name
+    assert listed("?name=PROD") == ["producer"]
+    assert listed("?name=nobody") == []
+    assert listed("?name=") == ["producer", "aland-halsa"]
+    assert listed("?name=aland-halsa") == ["aland-halsa"]  # the slug works too
+    assert listed("?name:contains=halsa") == ["aland-halsa"]
+    assert listed("?name=prod,halsa") == ["producer", "aland-halsa"]
+    assert listed("?name=prod&name=halsa") == []
+    assert listed("?name=%E6%97%A5%E6%9C%AC") == []        # not "everything"
+
+
 def test_a_bearer_token_authenticates_as_well_as_the_header(client, monkeypatch):
     """The UI sends Bearer; the README's curl lines send X-Team-Token. Both
     are the same credential and both have to work."""

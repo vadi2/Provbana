@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import anyio.to_thread
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 # The router raises Starlette's HTTPException, not FastAPI's subclass, so an
 # unrouted path and a wrong method arrive as the base class. Handling that one
@@ -377,6 +377,55 @@ def slugify(name: str) -> str:
     ascii_only = folded.encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_only).strip("-")
     return slug or "team"
+
+
+def fold_name(name: str) -> str:
+    """A name as search compares it: FHIR string search ignores case and
+    accents, so "aland" has to find "Åland Hälsa".
+
+    Only the accents go. Unlike a slug this keeps letters ASCII has no answer
+    for, or a search for a name in another script would fold to nothing and
+    match every company there is.
+    """
+    folded = unicodedata.normalize("NFKD", name.casefold()).translate(
+        SLUG_TRANSLITERATIONS
+    )
+    return " ".join(
+        "".join(c for c in folded if not unicodedata.combining(c)).split()
+    )
+
+
+def search_terms(values: list[str] | None, fold: bool = True) -> list[list[str]]:
+    """One search parameter as FHIR reads it: repeats are ANDed, the commas
+    inside one are ORed, and `\\,` is a comma that is part of the name.
+
+    A blank alternative is dropped and so is a repeat left with none, which
+    makes `name=` the same as not asking.
+    """
+    terms = []
+    for value in values or []:
+        ors = [o.replace("\\,", ",") for o in re.split(r"(?<!\\),", value)]
+        ors = [fold_name(o) if fold else o for o in ors]
+        ors = [o for o in ors if o.strip()]
+        if ors:
+            terms.append(ors)
+    return terms
+
+
+def name_matches(name: str, starts: list[str] | None = None,
+                 contains: list[str] | None = None,
+                 exact: list[str] | None = None) -> bool:
+    """FHIR's `name`, `name:contains` and `name:exact`, all of which must hold.
+
+    Done here rather than in SQL because SQLite's LIKE only folds ASCII, and
+    there are never more companies than fit in a room.
+    """
+    folded = fold_name(name)
+    return (
+        all(any(folded.startswith(o) for o in ors) for ors in search_terms(starts))
+        and all(any(o in folded for o in ors) for ors in search_terms(contains))
+        and all(name in ors for ors in search_terms(exact, fold=False))
+    )
 
 
 def unique_slug(conn: sqlite3.Connection, name: str) -> str:
@@ -2104,14 +2153,32 @@ def register(params: dict = Depends(parameters_body)) -> Response:
 @app.get("/fhir/Organization",
     tags=["Companies"],
     summary="Every registered company",
-    description="A searchset Bundle of Organizations, by name.",
+    description=(
+        "A searchset Bundle of Organizations, by name. This is where a "
+        "company's slug comes from: it is the Organization's `id`. `name` "
+        "narrows it the way FHIR string search does - the start of the name, "
+        "ignoring case and accents - with `name:contains` to match anywhere "
+        "and `name:exact` to match the whole name as written."
+    ),
 )
-def search_organizations() -> Response:
+def search_organizations(
+    name: list[str] | None = Query(None),
+    name_contains: list[str] | None = Query(None, alias="name:contains"),
+    name_exact: list[str] | None = Query(None, alias="name:exact"),
+) -> Response:
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
         ).fetchall()
-    return fhir_response(searchset([organization_resource(r) for r in rows]))
+    return fhir_response(
+        searchset(
+            [
+                organization_resource(r)
+                for r in rows
+                if name_matches(r["name"], name, name_contains, name_exact)
+            ]
+        )
+    )
 
 
 @app.get("/fhir/Organization/$me",
@@ -2695,16 +2762,31 @@ def read_bundle(bundle_id: str) -> Response:
     summary="Documents published for exchange",
     description=(
         "Each company's best valid submission is published automatically. The "
-        "list is open - the documents are the event's shared test corpus."
+        "list is open - the documents are the event's shared test corpus. "
+        "`name` keeps the companies with that anywhere in their name or their "
+        "slug, ignoring case and accents - `name:contains` is the same thing, "
+        "for anyone arriving from the Organization search. Each entry's "
+        "`organizationSlug` is what Organization/{slug}/$document takes."
     ),
 )
-def exchange_list() -> Response:
+def exchange_list(
+    name: list[str] | None = Query(None),
+    name_contains: list[str] | None = Query(None, alias="name:contains"),
+) -> Response:
+    wanted = (name or []) + (name_contains or [])
     entries = []
     with connect() as conn:
         teams = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
         ).fetchall()
         for team in teams:
+            # The slug is matched as well as the name: it is what every other
+            # URL here is built from, so it is what people have on hand.
+            if not (
+                name_matches(team["name"], contains=wanted)
+                or name_matches(team["slug"], contains=wanted)
+            ):
+                continue
             best = best_valid_submission(conn, team["id"])
             if best is None:
                 continue
@@ -3254,6 +3336,12 @@ def metadata() -> Response:
                             "type": "Organization",
                             "interaction": [
                                 {"code": "read"}, {"code": "search-type"}
+                            ],
+                            "searchParam": [
+                                {"name": "name", "type": "string",
+                                 "documentation":
+                                     "The company's name; :contains and "
+                                     ":exact are supported"},
                             ],
                             "operation": [
                                 {
@@ -6032,10 +6120,14 @@ $("#cv-doc").addEventListener("click", (ev) => {
 /* ---- interop testing ---- */
 function interopCurls() {
   $("#curl-exchange").textContent =
+    "# every published document - organizationSlug is the PARTNER_SLUG below,\n" +
+    "# and it is in the GET line on each card above:\n" +
+    "curl -s " + origin + "/fhir/\\$exchange\n" +
+    "# or only the companies with this in their name - quoted for the ?, and\n" +
+    "# a $ inside single quotes needs no backslash:\n" +
+    "curl -s '" + origin + "/fhir/$exchange?name=acme'\n" +
     "curl -s " + origin + "/fhir/Organization/PARTNER_SLUG/\\$document"
-      + " -o partner-eps.json\n" +
-    "# list every published document first:\n" +
-    "curl -s " + origin + "/fhir/\\$exchange\n\n" +
+      + " -o partner-eps.json\n\n" +
     "# publish a screenshot of how it came out in your system - the image goes\n" +
     "# in the attachment, base64-encoded:\n" +
     "curl -X POST " + origin + "/fhir/DocumentReference \\\n" +

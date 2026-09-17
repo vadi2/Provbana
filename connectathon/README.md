@@ -466,6 +466,10 @@ that slug is taken. It is how the company is addressed everywhere else, and it i
 ```
 # every registered company, as a searchset
 curl localhost:8095/fhir/Organization
+# by name: the start of it, ignoring case and accents; name:contains matches
+# anywhere and name:exact the whole name as written. Commas are ORed
+# (name=aland,nordic), repeats are ANDed, and \, is a comma in the name
+curl 'localhost:8095/fhir/Organization?name=aland'
 curl localhost:8095/fhir/Organization/aland-halsa
 # which company a token belongs to
 curl 'localhost:8095/fhir/Organization/$me' -H 'Authorization: Bearer TOKEN'
@@ -562,8 +566,11 @@ and nothing here is scored - the output of the track is a defect the producer ca
 fix, reported to them directly.
 
 ```
-# who has published something
+# who has published something - organizationSlug is the COMPANY_SLUG below
 curl 'localhost:8095/fhir/$exchange'
+# only the companies with this anywhere in their name or slug, ignoring case
+# and accents
+curl 'localhost:8095/fhir/$exchange?name=aland'
 # download a partner's document (Content-Location = the Bundle's own URL)
 curl 'localhost:8095/fhir/Organization/COMPANY_SLUG/$document' -o partner-eps.json
 ```
