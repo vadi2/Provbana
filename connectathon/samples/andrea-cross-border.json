@@ -301,7 +301,7 @@
         "identifier": [
           {
             "system": "http://electronichealth.se/identifier/personnummer",
-            "value": "200203170006"
+            "value": "200207252388"
           }
         ],
         "name": [
@@ -325,7 +325,7 @@
           }
         ],
         "gender": "female",
-        "birthDate": "2002-03-17",
+        "birthDate": "2002-07-25",
         "address": [
           {
             "use": "home",
@@ -369,7 +369,7 @@
         "id": "0d5ab87d-331e-5d01-94d6-17b3cf70d4ea",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Name</th><td>Andrea Lindqvist</td></tr><tr><th>Gender</th><td>female</td></tr><tr><th>Date of birth</th><td>2002-03-17</td></tr><tr><th>Identifier</th><td>200203170006</td></tr><tr><th>Preferred language</th><td>Swedish</td></tr><tr><th>Address</th><td>Lärkstigen 12, Uppsala, SE</td></tr><tr><th>Temporary address</th><td>Résidence Les Tilleuls, 8 rue Camille Vasseur, Paris, FR</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Name</th><td>Andrea Lindqvist</td></tr><tr><th>Gender</th><td>female</td></tr><tr><th>Date of birth</th><td>2002-07-25</td></tr><tr><th>Identifier</th><td>200207252388</td></tr><tr><th>Preferred language</th><td>Swedish</td></tr><tr><th>Address</th><td>Lärkstigen 12, Uppsala, SE</td></tr><tr><th>Temporary address</th><td>Résidence Les Tilleuls, 8 rue Camille Vasseur, Paris, FR</td></tr></table></div>"
         }
       }
     },

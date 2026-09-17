@@ -11,9 +11,10 @@ validate against bundle-eu-eps with zero errors.
 
 The people and places also claim the HL7 Sweden base profiles (hl7se.fhir.base),
 so the Swedish shape of the data - personnummer namespace, HSA-id, organisation
-number - is checked rather than merely asserted. Those identifier values are
-placeholders in the real national namespaces, in the same way the personnummer
-and phone numbers here are.
+number - is checked rather than merely asserted. The personnummer are taken
+from Skatteverket's published test personnummer, which are never issued to a
+person; the other identifier values and the phone numbers are placeholders in
+the real national namespaces.
 
     python3 samples/generate.py
 """
@@ -459,7 +460,7 @@ def build_andrea():
                                  SEBASE + "SEBasePatient"]},
             "identifier": [{
                 "system": SE_PERSONNUMMER,
-                "value": "200203170006",
+                "value": "200207252388",
             }],
             "name": [{"text": "Andrea Lindqvist", "family": "Lindqvist",
                       "given": ["Andrea"]}],
@@ -467,7 +468,7 @@ def build_andrea():
                          "use": "mobile"},
                         {"system": "email", "value": "andrea.lindqvist@example.org"}],
             "gender": "female",
-            "birthDate": "2002-03-17",
+            "birthDate": "2002-07-25",
             "address": [
                 {"use": "home", "type": "physical", "line": ["Lärkstigen 12"],
                  "city": "Uppsala", "postalCode": "753 11", "country": "SE"},
@@ -645,14 +646,14 @@ def build_arne():
                                  SEBASE + "SEBasePatient"]},
             "identifier": [{
                 "system": SE_PERSONNUMMER,
-                "value": "194302110004",
+                "value": "194302096997",
             }],
             "name": [{"text": "Arne Bergström", "family": "Bergström",
                       "given": ["Arne", "Gustav"]}],
             "telecom": [{"system": "phone", "value": "+46 70 000 00 02",
                          "use": "home"}],
             "gender": "male",
-            "birthDate": "1943-02-11",
+            "birthDate": "1943-02-09",
             "address": [{"use": "home", "type": "physical",
                          "line": ["Ängsbacken 8 A"], "city": "Falkenberg",
                          "postalCode": "311 34", "country": "SE"}],
