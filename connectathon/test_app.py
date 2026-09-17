@@ -1069,6 +1069,20 @@ def test_samples_link_to_their_scenario_briefs(client):
     assert samples["arne-complex-care"]["scenarioName"] == "The Arne Scenario"
     for sample in samples.values():
         assert sample["scenarioUrl"].startswith("https://")
+    # The page has to read the part names the API sends, or the link is
+    # silently never drawn.
+    text = client.get("/").text
+    assert "s.scenarioUrl" in text and "s.scenario_url" not in text
+
+
+def test_samples_carry_the_personnummer_from_the_bundle(client):
+    """The page shows each example's personnummer, read off the document so
+    the two cannot drift, in the hyphenated form people write it in."""
+    samples = {s["id"]: s for s in param_entries(client.get("/fhir/$samples"))}
+    assert samples["andrea-cross-border"]["personnummer"] == "20020725-2388"
+    assert samples["arne-complex-care"]["personnummer"] == "19430209-6997"
+    assert app_module.sample_personnummer(None) is None
+    assert app_module.sample_personnummer(b'{"entry": [{}]}') is None
 
 
 def test_index_lists_examples_as_a_company(client):

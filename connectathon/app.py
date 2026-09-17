@@ -2588,6 +2588,28 @@ def read_sample_bytes(sample_id: str) -> bytes | None:
         return None
 
 
+SE_PERSONNUMMER = "http://electronichealth.se/identifier/personnummer"
+
+
+def sample_personnummer(raw: bytes | None) -> str | None:
+    """The patient's personnummer as it is written on paper, YYYYMMDD-NNNN.
+    Read off the bundle rather than kept in SAMPLES, so the page cannot
+    disagree with the document it is describing."""
+    try:
+        entries = json.loads(raw or b"").get("entry", [])
+    except (ValueError, AttributeError):
+        return None
+    for entry in entries:
+        resource = entry.get("resource") or {}
+        if resource.get("resourceType") != "Patient":
+            continue
+        for ident in resource.get("identifier", []):
+            value = ident.get("value") or ""
+            if ident.get("system") == SE_PERSONNUMMER and len(value) == 12:
+                return value[:8] + "-" + value[8:]
+    return None
+
+
 @app.get("/fhir/$samples",
     tags=["Samples"],
     summary="List the worked examples",
@@ -2608,6 +2630,8 @@ def list_samples() -> Response:
                         "id": sample["id"],
                         "bundle": "%s/Bundle/%s" % (FHIR_BASE, sample["id"]),
                         "name": sample["name"],
+                        "personnummer": sample_personnummer(
+                            read_sample_bytes(sample["id"])),
                         "tagline": sample["tagline"],
                         "scenario": sample["scenario"],
                         "scenarioName": sample["scenario_name"],
@@ -3861,6 +3885,8 @@ tr.cv-row:hover td { background: var(--accent-soft); }
 footer { max-width: 1060px; margin: 26px auto 40px; padding: 0 var(--pad-x);
   font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
 footer a { color: var(--accent); }
+footer .colophon { margin-top: 14px; font-size: 0.72rem; }
+footer .colophon a { color: inherit; }
 /* example documents, listed in the same table as everyone else's submissions */
 .cv-sub { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
 td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
@@ -4233,6 +4259,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   types</a>, against its own HL7 Europe guide. External code systems those
   guides do not themselves carry and that require a license (such as SNOMED CT,
   LOINC, WHO ATC) are not checked.</p>
+  <p class="colophon">Runs on Provbana, built by <a href="https://vadimperetok.in"
+  target="_blank" rel="noopener">Vadim Peretokin</a>.</p>
 </footer>
 <script>
 "use strict";
@@ -5445,12 +5473,16 @@ function renderSampleList(box) {
     + cvSamples.map((s) => '<tr class="cv-row" data-sample="' + esc(s.id)
         + '" title="click to open"><td><strong><a class="cv-open" href="#clinical/sample/'
         + esc(s.id) + '">' + esc(s.name) + "</a></strong>"
-        + '<div class="cv-sub">' + esc(s.tagline) + "</div></td>"
+        + '<div class="cv-sub">' + esc(s.tagline) + "</div>"
+        + (s.personnummer
+            ? '<div class="cv-sub">Personnummer ' + esc(s.personnummer) + "</div>"
+            : "")
+        + "</td>"
         + "<td>" + esc(s.language) + "</td>"
         + '<td class="cv-scenario">' + esc(s.scenario)
-        + (s.scenario_url
-            ? ' <a href="' + esc(s.scenario_url) + '" target="_blank" rel="noopener">'
-              + esc(s.scenario_name || "Read the scenario") + " \u2197</a>"
+        + (s.scenarioUrl
+            ? ' <a href="' + esc(s.scenarioUrl) + '" target="_blank" rel="noopener">'
+              + esc(s.scenarioName || "Read the scenario") + " \u2197</a>"
             : "")
         + "</td></tr>").join("")
     + "</tbody></table></div>"
