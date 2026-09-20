@@ -20,6 +20,9 @@ COPY reset.py .
 # that the categories it keeps compiled are the categories the service accepts,
 # and sends the sample below at the validator on a timer.
 COPY warm.py .
+# And the subscription notifier, which drains the queue the service fills. The
+# service imports it too, for the endpoint check, so it is not optional here.
+COPY notify.py .
 # Only the bundles: generate.py is the authoring tool, not part of the service.
 COPY samples/*.json ./samples/
 

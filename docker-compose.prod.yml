@@ -86,6 +86,13 @@ services:
       # Only so the page can say the board is being wiped. The wiping itself is
       # the reset service's job; this container never deletes anything.
       PRACTICE_ENDS: ${PRACTICE_ENDS:-}
+      # What the references inside a subscription notification are written
+      # against. A notification is read on somebody else's machine, where
+      # "/fhir/Bundle/12" points nowhere.
+      PUBLIC_URL: https://${SITE_ADDRESS:-hackathon2026.vadimperetok.in}
+      # Only consulted here to refuse an obviously private endpoint at the
+      # door; the notify service is what enforces it. Keep the two the same.
+      SUBSCRIPTION_ALLOW_PRIVATE: ${SUBSCRIPTION_ALLOW_PRIVATE:-}
     volumes:
       - state:/srv
     depends_on:
@@ -131,6 +138,40 @@ services:
       PRACTICE_ENDS: ${PRACTICE_ENDS:-}
     volumes:
       - state:/srv
+    depends_on:
+      - app
+    mem_limit: 512m
+    logging: *logging
+
+  notify:
+    # Delivers FHIR Subscription notifications: the service queues one row per
+    # subscriber when a submission passes, and this drains the queue. Same
+    # image and same volume as backup and reset, because the queue is a table
+    # in the same SQLite file.
+    #
+    # It is the only container that opens connections to addresses a
+    # participant typed, which is why it is the only one on a network of its
+    # own. On `egress` there is no matchbox and no app - Docker keeps bridge
+    # networks apart, and answers names only for containers that share one -
+    # so an endpoint of http://matchbox:8080/ does not even resolve. What it
+    # can reach of this stack is at most what anybody can: the site's public
+    # address, through caddy. notify.py also refuses anything that is not a
+    # public address, resolves once and connects to what it vetted, and
+    # follows no redirects; this is the layer underneath for the day one of
+    # those checks turns out to have a hole in it.
+    build: ./connectathon
+    restart: unless-stopped
+    command: ["python", "notify.py", "--loop"]
+    environment:
+      DATA_DIR: /srv/data
+      # Unset on this box, which is on the public internet. Set to 1 only for
+      # a deployment on a venue LAN, where the participants' machines are
+      # private addresses by definition.
+      SUBSCRIPTION_ALLOW_PRIVATE: ${SUBSCRIPTION_ALLOW_PRIVATE:-}
+    volumes:
+      - state:/srv
+    networks:
+      - egress
     depends_on:
       - app
     mem_limit: 512m
@@ -183,6 +224,11 @@ services:
     depends_on:
       - app
     logging: *logging
+
+networks:
+  # Outbound only, and notify's alone - see that service. Everything else stays
+  # on the project's default network, which needs no declaration.
+  egress:
 
 volumes:
   # One volume, holding data/ and backups/ side by side. Both the hard-linking

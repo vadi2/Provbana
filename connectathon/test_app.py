@@ -11,16 +11,22 @@ first pass for the first team ever to go valid).
 
 import base64
 import datetime
+import errno
 import io
 import http.client
+import http.server
 import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import ssl
 import struct
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -31,6 +37,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import backup
+import notify
 import reset
 import warm
 
@@ -111,6 +118,9 @@ def _pin_env(monkeypatch):
     monkeypatch.setattr(app_module, "VALIDATION_IGS", ["hl7se.fhir.base#1.1.0"])
     monkeypatch.setattr(app_module, "MAX_BODY_BYTES", 5 * 1024 * 1024)
     monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 64 * 1024)
+    monkeypatch.setattr(app_module, "MAX_SUBSCRIPTIONS", 5)
+    monkeypatch.setattr(app_module, "PUBLIC_URL", "")
+    monkeypatch.delenv("SUBSCRIPTION_ALLOW_PRIVATE", raising=False)
     monkeypatch.setattr(app_module, "SAMPLES_DIR",
                         os.path.join(os.path.dirname(app_module.__file__), "samples"))
 
@@ -1736,7 +1746,7 @@ def test_metadata_describes_the_whole_api(client):
     assert cs["fhirVersion"] == "4.0.1"
     rest = cs["rest"][0]
     assert {r["type"] for r in rest["resource"]} == {
-        "Bundle", "Organization", "DocumentReference", "Binary"}
+        "Bundle", "Organization", "DocumentReference", "Binary", "Subscription"}
     assert {op["name"] for op in rest["operation"]} == {
         "register", "leaderboard", "submissions", "samples", "exchange",
         "documents", "status"}
@@ -3320,8 +3330,8 @@ def test_stored_counts_match_the_findings_that_are_shown(client, monkeypatch):
 # ------------------------------------------------------- practice-mode resets
 
 def practice_data_dir(path):
-    """The shape reset.py clears: the three result tables, plus a per-team
-    directory in each of the write-once trees."""
+    """The shape reset.py clears: the result tables, plus a per-team directory
+    in each of the write-once trees."""
     os.makedirs(path, exist_ok=True)
     conn = sqlite3.connect(os.path.join(path, reset.DB_NAME))
     conn.execute("CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT)")
@@ -3330,6 +3340,10 @@ def practice_data_dir(path):
     conn.execute("INSERT INTO teams (name) VALUES ('acme')")
     conn.executemany("INSERT INTO submissions (team) VALUES (?)", [(1,), (1,)])
     conn.execute("INSERT INTO renderings (sub) VALUES (1)")
+    conn.execute("CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, team INTEGER)")
+    conn.execute("CREATE TABLE notifications (id INTEGER PRIMARY KEY, sub INTEGER)")
+    conn.execute("INSERT INTO subscriptions (team) VALUES (1)")
+    conn.executemany("INSERT INTO notifications (sub) VALUES (?)", [(1,), (1,), (1,)])
     conn.commit()
     conn.close()
     for rel in ("submissions/acme/1.json", "renderings/acme/shot.png"):
@@ -3345,8 +3359,8 @@ def test_reset_clears_every_table_and_both_trees(tmp_path):
     removed = reset.clear(data)
     # The directories are counted too: a wipe that took forty teams' uploads
     # but no rows must not report itself as "nothing to clear".
-    assert removed == {"renderings": 1, "submissions": 2, "teams": 1,
-                       "team directories": 2}
+    assert removed == {"notifications": 3, "subscriptions": 1, "renderings": 1,
+                       "submissions": 2, "teams": 1, "team directories": 2}
     conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
     for table in reset.TABLES:
         assert conn.execute("SELECT count(*) FROM %s" % table).fetchone()[0] == 0
@@ -4074,3 +4088,3910 @@ def test_the_laboratory_guide_keeps_the_base_ballot_that_holds_its_missing_profi
     it and scores 0."""
     igs = app_module.DOCUMENTS_BY_ID["laboratory"]["igs"]
     assert "hl7.fhir.eu.base#2.0.0-ballot" in igs
+
+
+# ---------------------------------------------------------------- subscriptions
+
+TOPIC = app_module.SUBSCRIPTION_TOPIC
+
+
+class Hook:
+    """A subscriber's rest-hook: a real listener on a real socket, because the
+    part of delivery worth testing is the part that touches one."""
+
+    def __init__(self):
+        import http.server
+        hook = self
+        self.received = []      # (path, headers, parsed body)
+        self.answer = 200
+        self.delay = 0          # seconds it sits on a notification before answering
+        self.location = "http://127.0.0.1:1/elsewhere"
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                hook.received.append((self.path, dict(self.headers), json.loads(raw)))
+                time.sleep(hook.delay)
+                self.send_response(hook.answer)
+                if 300 <= hook.answer < 400:
+                    self.send_header("Location", hook.location)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d/hook" % self.server.server_address[1]
+        # shutdown() waits out one poll interval, and the default is half a
+        # second of every test that has a listener.
+        threading.Thread(target=self.server.serve_forever, args=(0.01,),
+                         daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def statuses(self):
+        """The status Parameters of everything received, flattened."""
+        return [
+            {p["name"]: _part_value(p) for p in body["entry"][0]["resource"]["parameter"]}
+            for _path, _headers, body in self.received
+        ]
+
+
+@pytest.fixture()
+def hook(monkeypatch):
+    # The listener is on loopback, which is exactly what the service refuses
+    # to call unless told it is on a private network.
+    monkeypatch.setenv("SUBSCRIPTION_ALLOW_PRIVATE", "1")
+    h = Hook()
+    yield h
+    h.close()
+
+
+def subscription(endpoint, content=None, filters=(), **extra):
+    channel = {"type": "rest-hook", "endpoint": endpoint,
+               "payload": "application/fhir+json"}
+    if content is not None:
+        channel["_payload"] = {"extension": [
+            {"url": notify.PAYLOAD_CONTENT_EXT, "valueCode": content}]}
+    body = {"resourceType": "Subscription", "status": "requested",
+            "criteria": TOPIC, "channel": channel}
+    if filters:
+        body["_criteria"] = {"extension": [
+            {"url": notify.FILTER_CRITERIA_EXT, "valueString": f} for f in filters]}
+    body.update(extra)
+    return body
+
+
+def subscribe(client, token, body):
+    return client.post("/fhir/Subscription", json=body,
+                       headers={"Authorization": "Bearer " + token})
+
+
+def deliver(client, now=None):
+    return notify.deliver_due(client.data_dir, now=now)
+
+
+def active_subscription(client, token, hook, **kwargs):
+    res = subscribe(client, token, subscription(hook.url, **kwargs))
+    assert res.status_code == 201, res.text
+    assert deliver(client) == (1, 0)
+    hook.received.clear()
+    return res.json()["id"]
+
+
+def test_a_subscription_is_requested_until_its_endpoint_answers_the_handshake(
+        client, hook):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(hook.url))
+    assert res.status_code == 201, res.text
+    sub = res.json()
+    assert sub["status"] == "requested"
+    assert res.headers["Location"] == "/fhir/Subscription/" + sub["id"]
+    assert sub["meta"]["profile"] == [notify.SUBSCRIPTION_PROFILE]
+    # unsaid, the payload content is id-only - and it is said back
+    assert sub["channel"]["_payload"]["extension"][0]["valueCode"] == "id-only"
+
+    assert deliver(client) == (1, 0)
+    path, headers, body = hook.received[0]
+    assert path == "/hook"
+    assert headers["Content-Type"] == "application/fhir+json"
+    assert body["type"] == "history"
+    assert body["meta"]["profile"] == [notify.NOTIFICATION_PROFILE]
+    status = hook.statuses()[0]
+    assert status["type"] == "handshake" and status["status"] == "requested"
+    assert status["topic"] == TOPIC
+    assert status["events-since-subscription-start"] == "0"
+    assert status["subscription"]["reference"] == \
+        "http://testserver/fhir/Subscription/" + sub["id"]
+
+    auth = {"Authorization": "Bearer " + tok}
+    assert client.get("/fhir/Subscription/" + sub["id"],
+                      headers=auth).json()["status"] == "active"
+
+
+def test_a_passing_submission_notifies_and_a_failing_one_does_not(
+        client, hook, monkeypatch):
+    sub_tok = register(client, "Subscriber")
+    prod_tok = register(client, "Producer Oy")
+    active_subscription(client, sub_tok, hook)
+
+    submit(client, prod_tok, outcome(errors=1), monkeypatch)
+    assert deliver(client) == (0, 0)
+    res = submit(client, prod_tok, outcome(), monkeypatch)
+    assert deliver(client) == (1, 0)
+
+    status = hook.statuses()[0]
+    assert status["type"] == "event-notification" and status["status"] == "active"
+    event = status["notification-event"]
+    assert event["event-number"] == "1"
+    # absolute, because the subscriber reads it somewhere our base URL is not
+    assert event["focus"]["reference"] == \
+        "http://testserver" + res.headers["Content-Location"]
+    assert event["additional-context"]["reference"] == \
+        "http://testserver/fhir/Organization/producer-oy"
+    assert event["additional-context"]["display"] == "Producer Oy"
+    # id-only: the document itself is not in the notification, and where it
+    # is, is - for whoever walks the entries rather than the Parameters
+    assert hook.received[0][2]["entry"][1:] == [{
+        "fullUrl": "http://testserver" + res.headers["Content-Location"],
+        "request": {"method": "POST", "url": "Bundle"},
+        "response": {"status": "201"}}]
+    # delivered once, and not again on the next pass
+    assert deliver(client) == (0, 0)
+
+
+def test_full_resource_carries_the_document_under_the_servers_id(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook, content="full-resource")
+    submitted = json.loads(bundle(sections=1, resources=2))
+    submitted["id"] = "whatever-the-team-called-it"
+    res = submit(client, tok, outcome(), monkeypatch, body=json.dumps(submitted))
+    deliver(client)
+    entry = hook.received[0][2]["entry"][1]
+    location = res.headers["Content-Location"]
+    assert entry["fullUrl"] == "http://testserver" + location
+    # an entry whose id contradicts its fullUrl is one a server may refuse
+    assert entry["resource"]["id"] == location.rsplit("/", 1)[1]
+    assert entry["resource"]["entry"] == submitted["entry"]
+    # ...while what the fullUrl serves is still the submitter's exact bytes
+    assert client.get(location).json()["id"] == "whatever-the-team-called-it"
+
+
+def test_empty_says_something_happened_and_not_what(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook, content="empty")
+    submit(client, tok, outcome(), monkeypatch)
+    deliver(client)
+    event = hook.statuses()[0]["notification-event"]
+    assert set(event) == {"event-number", "timestamp"}
+    # the IG: no entry but the status, for `empty`
+    assert len(hook.received[-1][2]["entry"]) == 1
+
+
+def test_filters_narrow_by_company_and_by_category(client, hook, monkeypatch):
+    sub_tok = register(client, "Subscriber")
+    acme = register(client, "Acme")
+    other = register(client, "Other")
+    active_subscription(client, sub_tok, hook, filters=[
+        "Bundle?organization=acme", "document-type=eps,laboratory"])
+    imaging = app_module.DOCUMENTS_BY_ID["imaging"]["profile"]
+
+    submit(client, other, outcome(), monkeypatch)            # wrong company
+    set_outcome(monkeypatch, outcome())
+    res = client.post("/fhir/Bundle/$validate?profile=" + imaging, content=BUNDLE,
+                      headers={"X-Team-Token": acme})        # wrong category
+    # it did pass, as imaging: a 4xx here would "not notify" for the wrong reason
+    assert res.status_code == 200 and res.headers["X-Pass"] == "true", res.text
+    assert res.headers["X-Document-Type"] == "imaging"
+    submit(client, acme, outcome(), monkeypatch)             # the one
+    assert deliver(client) == (1, 0)
+    context = hook.statuses()[0]["notification-event"]["additional-context"]
+    assert context["reference"].endswith("/Organization/acme")
+    # the count is of events *for this subscription*, not submissions
+    assert hook.statuses()[0]["events-since-subscription-start"] == "1"
+
+
+@pytest.mark.parametrize("filters, fragment", [
+    (["Bundle?patient=123"], "Unknown filter parameter"),
+    (["Encounter?organization=acme"], "not to Encounter"),
+    (["document-type=discharge"], "Unknown document-type"),
+    (["organization="], "has no value"),
+])
+def test_a_filter_this_topic_cannot_honour_is_refused(client, filters, fragment):
+    """Ignoring it instead would send a subscriber who asked for one company's
+    documents everybody's."""
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription("https://example.org/h", filters=filters))
+    assert res.status_code == 400
+    assert fragment in diagnostics(res)
+
+
+@pytest.mark.parametrize("endpoint", [
+    "http://127.0.0.1:8090/matchboxv3/fhir",
+    "http://localhost/hook",
+    "http://10.0.0.5/hook",
+    "http://192.168.1.20:8080/hook",
+    "http://169.254.169.254/latest/meta-data",
+    "http://[::1]/hook",
+    "http://[::ffff:10.0.0.5]/hook",
+    "http://0.0.0.0/hook",
+    "ftp://example.org/hook",
+    "https://user:secret@example.org/hook",
+    "https://exa mple.org/hook",
+    "not a url",
+    "",
+])
+def test_endpoints_this_server_must_not_call_are_refused_at_the_door(client, endpoint):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(endpoint))
+    assert res.status_code == 400, endpoint
+    assert "channel.endpoint" in diagnostics(res)
+
+
+def test_link_local_is_refused_even_on_a_private_network(client, monkeypatch):
+    """SUBSCRIPTION_ALLOW_PRIVATE is for laptops on a venue LAN. The cloud
+    metadata address is not one of those."""
+    monkeypatch.setenv("SUBSCRIPTION_ALLOW_PRIVATE", "1")
+    tok = register(client, "Subscriber")
+    assert subscribe(client, tok, subscription("http://10.0.0.5/h")).status_code == 201
+    res = subscribe(client, tok, subscription("http://169.254.169.254/h"))
+    assert res.status_code == 400
+
+
+def test_a_name_that_resolves_somewhere_private_is_not_called(monkeypatch):
+    """The check the service cannot make: what a hostname turns out to be. Every
+    address has to pass, and the connection goes to the one that was vetted."""
+    def resolves_to(*addresses):
+        monkeypatch.setattr(notify.socket, "getaddrinfo", lambda *a, **k: [
+            (None, None, None, "", (addr, 80)) for addr in addresses])
+
+    resolves_to("10.1.2.3")
+    with pytest.raises(notify.EndpointError, match="not a public address"):
+        notify.resolve_endpoint("http://innocent.example.org/h", False)
+    resolves_to("93.184.216.34", "127.0.0.1")
+    with pytest.raises(notify.EndpointError):
+        notify.resolve_endpoint("http://innocent.example.org/h", False)
+    resolves_to("93.184.216.34")
+    _parts, address = notify.resolve_endpoint("http://innocent.example.org/h", False)
+    assert address == "93.184.216.34"
+
+
+def test_the_connection_goes_to_the_vetted_address_not_back_to_the_name(
+        hook, monkeypatch):
+    """A second lookup is where a DNS answer that changed gets in - so the
+    second one here does not answer at all. Patching getaddrinfo to say the
+    same thing every time would pass with no pinning whatever."""
+    port = hook.server.server_address[1]
+    real = socket.getaddrinfo
+    lookups = []
+
+    def once(host, *a, **k):
+        if not str(host).endswith(".example.org"):
+            return real(host, *a, **k)
+        lookups.append(host)
+        assert len(lookups) == 1, "second lookup of %s" % host
+        return real("127.0.0.1", *a, **k)
+    monkeypatch.setattr(notify.socket, "getaddrinfo", once)
+    assert notify.post("http://rebinding.example.org:%d/hook" % port, b"{}", [],
+                       private_ok=True) == 200
+    assert lookups == ["rebinding.example.org"]
+    assert hook.received[0][1]["Host"] == "rebinding.example.org:%d" % port
+
+
+def test_a_redirect_is_a_failure_not_a_second_url_to_call(client, hook):
+    tok = register(client, "Subscriber")
+    elsewhere = Hook()      # somewhere that would answer, if it were asked
+    try:
+        hook.answer, hook.location = 302, elsewhere.url
+        subscribe(client, tok, subscription(hook.url))
+        assert deliver(client) == (0, 1)
+        assert len(hook.received) == 1 and elsewhere.received == []
+    finally:
+        elsewhere.close()
+    sub = client.get("/fhir/Subscription",
+                     headers={"Authorization": "Bearer " + tok}).json()
+    assert "redirects are not followed" in sub["entry"][0]["resource"]["error"]
+
+
+def test_the_subscribers_own_headers_are_sent_and_the_reserved_ones_refused(
+        client, hook):
+    tok = register(client, "Subscriber")
+    body = subscription(hook.url)
+    body["channel"]["header"] = ["Authorization: Bearer their-secret", "X-Env: dev"]
+    assert subscribe(client, tok, body).status_code == 201
+    deliver(client)
+    assert hook.received[0][1]["Authorization"] == "Bearer their-secret"
+    assert hook.received[0][1]["X-Env"] == "dev"
+
+    for bad in (["Host: matchbox"], ["X-A: b\r\nX-Injected: c"], ["no colon"],
+                ["Content-Length: 0"], ["X: y"] * 11, "Authorization: x"):
+        body["channel"]["header"] = bad
+        assert subscribe(client, tok, body).status_code == 400, bad
+
+
+def test_a_failing_endpoint_is_retried_in_order_then_given_up_on(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    auth = {"Authorization": "Bearer " + tok}
+    sub_id = active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    assert deliver(client, now) == (0, 1)
+    sub = client.get("/fhir/Subscription/" + sub_id, headers=auth).json()
+    assert sub["status"] == "error" and "answered 500" in sub["error"]
+    # backing off: nothing is due, and event 2 does not overtake event 1
+    assert deliver(client, now) == (0, 0)
+
+    # it comes back: both arrive, in order, and the subscription recovers
+    hook.answer = 200
+    hook.received.clear()
+    now += datetime.timedelta(seconds=notify.BACKOFF[0] + 1)
+    assert deliver(client, now) == (2, 0)
+    assert [s["notification-event"]["event-number"] for s in hook.statuses()] == ["1", "2"]
+    sub = client.get("/fhir/Subscription/" + sub_id, headers=auth).json()
+    assert sub["status"] == "active" and "error" not in sub
+
+    # it goes away for good: every attempt is spent, then the server stops
+    hook.answer = 503
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+    hook.received.clear()
+    for _ in range(len(notify.BACKOFF) + 1):
+        now += datetime.timedelta(seconds=max(notify.BACKOFF) + 1)
+        deliver(client, now)
+    assert len(hook.received) == len(notify.BACKOFF) + 1
+    sub = client.get("/fhir/Subscription/" + sub_id, headers=auth).json()
+    assert sub["status"] == "off" and sub["error"].startswith("Gave up after")
+    # the event queued behind it is dropped with it, and nothing new is queued
+    submit(client, tok, outcome(), monkeypatch)
+    now += datetime.timedelta(hours=1)
+    assert deliver(client, now) == (0, 0)
+
+    # PUT is how it is brought back, through a fresh handshake
+    hook.answer = 200
+    hook.received.clear()
+    res = client.put("/fhir/Subscription/" + sub_id, json=subscription(hook.url),
+                     headers=auth)
+    assert res.status_code == 200 and res.json()["status"] == "requested"
+    assert deliver(client) == (1, 0)
+    assert hook.statuses()[0]["type"] == "handshake"
+    # the count carried on rather than starting again
+    assert hook.statuses()[0]["events-since-subscription-start"] == "4"
+
+
+def test_a_handshake_nobody_answers_turns_the_subscription_off(client, monkeypatch):
+    """Port 1 on loopback: refused at once, which is what a typo looks like."""
+    monkeypatch.setenv("SUBSCRIPTION_ALLOW_PRIVATE", "1")
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription("http://127.0.0.1:1/hook"))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for _ in range(len(notify.HANDSHAKE_BACKOFF) + 1):
+        deliver(client, now)
+        now += datetime.timedelta(seconds=60)
+    sub = client.get("/fhir/Subscription/" + res.json()["id"],
+                     headers={"Authorization": "Bearer " + tok}).json()
+    # never `error`: that is for a subscription that worked once
+    assert sub["status"] == "off"
+    assert "could not reach the endpoint" in sub["error"]
+
+
+def test_a_subscription_is_its_owners_alone(client, hook):
+    mine = register(client, "Mine")
+    theirs = register(client, "Theirs")
+    sub_id = subscribe(client, mine, subscription(hook.url)).json()["id"]
+    other = {"Authorization": "Bearer " + theirs}
+    path = "/fhir/Subscription/" + sub_id
+
+    assert client.get(path).status_code == 401
+    assert client.get("/fhir/Subscription").status_code == 401
+    assert client.get(path, headers=other).status_code == 404
+    assert client.get(path + "/$status", headers=other).status_code == 404
+    assert client.put(path, json=subscription(hook.url), headers=other).status_code == 404
+    assert client.delete(path, headers=other).status_code == 404
+    assert client.get("/fhir/Subscription", headers=other).json()["total"] == 0
+
+    own = {"Authorization": "Bearer " + mine}
+    assert client.get("/fhir/Subscription", headers=own).json()["total"] == 1
+    assert client.get("/fhir/Subscription?status=active", headers=own).json()["total"] == 0
+    assert client.get("/fhir/Subscription", params={"url": hook.url},
+                      headers=own).json()["total"] == 1
+    assert client.delete(path, headers=own).status_code == 204
+    assert client.get(path, headers=own).status_code == 404
+    # its queued handshake went with it - counted, because a row left behind
+    # with no subscription to join to is one deliver() would never mention
+    assert deliver(client) == (0, 0)
+    conn = sqlite3.connect(os.path.join(client.data_dir, "connectathon.db"))
+    try:
+        assert conn.execute("SELECT count(*) FROM notifications").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_status_operation_reports_the_event_count(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    res = client.get("/fhir/Subscription/%s/$status" % sub_id,
+                     headers={"Authorization": "Bearer " + tok})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["type"] == "searchset"
+    params = body["entry"][0]["resource"]
+    assert params["meta"]["profile"] == [notify.STATUS_PROFILE]
+    flat = {p["name"]: _part_value(p) for p in params["parameter"]}
+    assert flat["type"] == "query-status" and flat["status"] == "active"
+    assert flat["events-since-subscription-start"] == "1"
+
+
+def test_a_company_holds_only_so_many_subscriptions(client, monkeypatch):
+    monkeypatch.setattr(app_module, "MAX_SUBSCRIPTIONS", 2)
+    tok = register(client, "Subscriber")
+    for _ in range(2):
+        assert subscribe(client, tok,
+                         subscription("https://example.org/h")).status_code == 201
+    res = subscribe(client, tok, subscription("https://example.org/h"))
+    assert res.status_code == 422
+    # another company's allowance is its own
+    assert subscribe(client, register(client, "Other"),
+                     subscription("https://example.org/h")).status_code == 201
+
+
+@pytest.mark.parametrize("mutate, fragment", [
+    (lambda b: b.update(criteria="Bundle?type=document"), "canonical of a topic"),
+    (lambda b: b["channel"].update(type="websocket"), "rest-hook"),
+    (lambda b: b["channel"].update(payload="application/fhir+xml"), "channel.payload"),
+    (lambda b: b.update(end="2020-01-01T00:00:00Z"), "in the past"),
+    (lambda b: b.update(end="tomorrow"), "instant"),
+    (lambda b: b.update(resourceType="Basic"), "FHIR Subscription"),
+])
+def test_what_this_server_cannot_do_is_refused_rather_than_ignored(
+        client, mutate, fragment):
+    tok = register(client, "Subscriber")
+    body = subscription("https://example.org/h")
+    mutate(body)
+    res = subscribe(client, tok, body)
+    assert res.status_code == 400
+    assert fragment in diagnostics(res)
+
+
+def test_a_subscription_stops_at_its_end(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    end = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
+    sub_id = active_subscription(client, tok, hook, end=end.isoformat())
+    with sqlite3.connect(os.path.join(client.data_dir, "connectathon.db")) as conn:
+        conn.execute("UPDATE subscriptions SET end_ts = ?",
+                     (notify.stamp(end - datetime.timedelta(hours=2)),))
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (0, 0)
+    sub = client.get("/fhir/Subscription/" + sub_id,
+                     headers={"Authorization": "Bearer " + tok}).json()
+    assert sub["status"] == "off" and sub["error"].startswith("Ended at")
+
+
+def test_status_off_parks_a_subscription_without_a_handshake(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(hook.url, status="off"))
+    assert res.json()["status"] == "off"
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (0, 0) and hook.received == []
+
+
+def test_public_url_wins_over_how_the_request_arrived(client, hook, monkeypatch):
+    monkeypatch.setattr(app_module, "PUBLIC_URL", "https://hackathon.example.org")
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    deliver(client)
+    assert hook.statuses()[0]["subscription"]["reference"].startswith(
+        "https://hackathon.example.org/fhir/Subscription/")
+
+
+def test_behind_the_proxy_the_links_are_https(client, hook):
+    tok = register(client, "Subscriber")
+    client.post("/fhir/Subscription", json=subscription(hook.url),
+                headers={"Authorization": "Bearer " + tok,
+                         "X-Forwarded-Proto": "https", "Host": "venue.example.org"})
+    deliver(client)
+    assert hook.statuses()[0]["subscription"]["reference"].startswith(
+        "https://venue.example.org/fhir/Subscription/")
+
+
+def test_a_queueing_failure_never_costs_the_team_its_submission(client, monkeypatch):
+    tok = register(client, "Producer")
+    monkeypatch.setattr(app_module, "filters_match",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    subscribe(client, tok, subscription("https://example.org/h"))
+    with sqlite3.connect(os.path.join(client.data_dir, "connectathon.db")) as conn:
+        conn.execute("UPDATE subscriptions SET status = 'active'")
+    res = submit(client, tok, outcome(), monkeypatch)
+    assert res.status_code == 200 and res.headers["X-Pass"] == "true"
+    assert len(param_entries(client.get("/fhir/$submissions"))) == 1
+
+
+def test_the_metadata_names_the_topic_and_the_backport(client):
+    cs = client.get("/fhir/metadata").json()
+    assert any("backport-subscription-server-r4" in c for c in cs["instantiates"])
+    sub = next(r for r in cs["rest"][0]["resource"] if r["type"] == "Subscription")
+    assert sub["extension"][0]["valueCanonical"] == TOPIC
+    assert [o["name"] for o in sub["operation"]] == ["status"]
+
+
+def test_openapi_covers_the_subscription_endpoints(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    for path, verbs in {"/fhir/Subscription": ("post", "get"),
+                        "/fhir/Subscription/{subscription_id}": ("get", "put", "delete"),
+                        "/fhir/Subscription/{subscription_id}/$status": ("get",)}.items():
+        for verb in verbs:
+            assert paths[path][verb]["security"] == [{"TeamToken": []}], (path, verb)
+    example = paths["/fhir/Subscription"]["post"]["requestBody"]["content"][
+        "application/fhir+json"]["example"]
+    assert app_module.parse_subscription(example)["content"] == "full-resource"
+
+
+def test_a_data_dir_without_the_tables_is_reported_not_crashed_on(tmp_path):
+    assert notify._has_tables(str(tmp_path)) is False
+    assert notify.print_status(str(tmp_path)) == 1
+
+
+def test_a_practice_reset_takes_the_subscriptions_with_the_teams(client, hook, monkeypatch):
+    """The token that could turn one off is wiped; an orphan would go on
+    calling an endpoint for ever."""
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    removed = reset.clear(client.data_dir)
+    assert removed["subscriptions"] == 1 and removed["notifications"] == 2
+    assert deliver(client) == (0, 0) and hook.received == []
+
+
+def test_the_page_spells_the_topic_and_extension_as_the_server_does(client):
+    """The interop tab's curl spells the topic and the extension out for itself,
+    the page being a static string. A copy that drifts is a snippet that 400s."""
+    page = client.get("/").text
+    assert 'const SUBSCRIPTION_TOPIC =\n  "%s";' % TOPIC in page
+    head, tail = notify.PAYLOAD_CONTENT_EXT.split("StructureDefinition/")
+    assert '"%s" +\n  "StructureDefinition/%s"' % (head, tail) in page
+
+
+# ----------------------------------------------------------------------------
+# subscriptions: the defences, the races and the failures
+#
+# What a test of the happy path lets through: TLS verification switched off,
+# the connection made to the name again instead of the vetted address, the
+# public-only rule ignored at delivery, a result recorded on a subscription
+# that changed while it was in flight.
+# ----------------------------------------------------------------------------
+
+
+UTC = datetime.timezone.utc
+FAILED_500 = notify.Outcome("endpoint", "the endpoint answered 500")
+
+
+def db(client):
+    conn = sqlite3.connect(os.path.join(client.data_dir, "connectathon.db"))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def auth(tok):
+    return {"Authorization": "Bearer " + tok}
+
+
+def get_sub(client, tok, sub_id):
+    return client.get("/fhir/Subscription/%s" % sub_id, headers=auth(tok)).json()
+
+
+@pytest.fixture()
+def hook2():
+    h = Hook()
+    yield h
+    h.close()
+
+
+def example_org_is_loopback(monkeypatch):
+    real = socket.getaddrinfo
+    monkeypatch.setattr(
+        notify.socket, "getaddrinfo",
+        lambda host, *a, **k: real("127.0.0.1" if str(host).endswith(".example.org")
+                                   else host, *a, **k))
+
+
+# ------------------------------------------------------------------ A. SSRF
+
+@pytest.mark.parametrize("endpoint", [
+    "http://example.org:99999/h",          # urlsplit .port raises
+    "http://example.org:0/h",              # port 0
+    "http:///h",                           # no host
+    "http://./h",                          # nor is this one, the dots stripped
+    "http://.../h",
+    "http://example.org/" + "a" * 2000,    # too long
+    "http://example.org/\x00",             # control char
+    "http://example.org/a\tb",
+    12345,
+    None,
+    ["http://example.org/h"],
+])
+def test_parse_endpoint_branches_refused_at_the_door(client, endpoint):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(endpoint))
+    assert res.status_code == 400, res.text
+    assert "channel.endpoint" in diagnostics(res)
+
+
+@pytest.mark.parametrize("address, private_ok, refused", [
+    ("::ffff:169.254.169.254", True, True),    # only the ipv4_mapped unwrap catches this
+    ("::ffff:169.254.169.254", False, True),
+    ("fe80::1", True, True),
+    ("169.254.0.1", True, True),
+    ("224.0.0.1", True, True),                 # is_global is True for multicast
+    ("224.0.0.1", False, True),
+    ("ff02::1", False, True),
+    ("0.0.0.0", True, True),
+    ("::", True, True),
+    ("100.64.0.1", False, True),               # CGNAT: not private, not global
+    ("127.0.0.1", False, True),
+    ("fc00::1", False, True),
+    # an IPv4 address in an IPv6 wrapper is vetted as what it wraps
+    ("64:ff9b::7f00:1", False, True),          # NAT64 loopback: is_global says True
+    ("64:ff9b::a00:1", False, True),
+    ("64:ff9b::a9fe:a9fe", True, True),
+    ("64:ff9b::5db8:d822", False, False),      # NAT64 of a public address is fine
+    ("2002:a9fe:a9fe::1", True, True),         # 6to4 of the metadata address
+    ("::169.254.169.254", True, True),
+    # metadata services that are not link-local, venue network or not
+    ("168.63.129.16", False, True),            # Azure - a public address
+    ("168.63.129.16", True, True),
+    ("100.100.100.200", True, True),
+    ("fd00:ec2::254", True, True),
+    ("192.0.0.192", True, True),
+    ("10.0.0.1", True, False),
+    ("127.0.0.1", True, False),
+    ("93.184.216.34", False, False),
+    ("2606:4700::1111", False, False),
+])
+def test_vet_address_matrix(address, private_ok, refused):
+    if refused:
+        with pytest.raises(notify.EndpointError):
+            notify.vet_address(address, private_ok)
+    else:
+        notify.vet_address(address, private_ok)
+
+
+@pytest.mark.parametrize("address", [
+    "64:ff9b::a9fe:a9fe",      # NAT64 spelling of 169.254.169.254
+    "64:ff9b::7f00:1",         # NAT64 spelling of 127.0.0.1
+])
+def test_nat64_spelling_of_a_forbidden_v4_address(address):
+    with pytest.raises(notify.EndpointError):
+        notify.vet_address(address, False)
+
+
+@pytest.mark.parametrize("url, private_ok, refused", [
+    ("http://foo.localhost/h", False, True),
+    ("http://LOCALHOST/h", False, True),
+    ("http://localhost/h", True, False),
+    ("http://example.org/h", False, False),     # a name: nothing to say offline
+    ("http://[fe80::1%25eth0]/h", True, True),
+])
+def test_check_endpoint_names(url, private_ok, refused):
+    if refused:
+        with pytest.raises(notify.EndpointError):
+            notify.check_endpoint(url, private_ok)
+    else:
+        notify.check_endpoint(url, private_ok)
+
+
+def test_localhost_with_a_trailing_dot_is_still_localhost():
+    with pytest.raises(notify.EndpointError):
+        notify.check_endpoint("http://localhost./h", False)
+
+
+def test_resolve_endpoint_failure_branches(monkeypatch):
+    def boom(*a, **k):
+        raise socket.gaierror(-2, "Name or service not known")
+    monkeypatch.setattr(notify.socket, "getaddrinfo", boom)
+    with pytest.raises(notify.EndpointError, match="does not resolve"):
+        notify.resolve_endpoint("http://nope.example.org/h", False)
+    monkeypatch.setattr(notify.socket, "getaddrinfo", lambda *a, **k: [])
+    with pytest.raises(notify.EndpointError, match="does not resolve"):
+        notify.resolve_endpoint("http://nope.example.org/h", False)
+
+
+def test_resolve_endpoint_vets_every_address_even_on_a_private_network(monkeypatch):
+    def resolves_to(*addresses):
+        monkeypatch.setattr(notify.socket, "getaddrinfo", lambda *a, **k: [
+            (None, None, None, "", (addr, 80)) for addr in addresses])
+    resolves_to("10.0.0.7", "169.254.169.254")
+    with pytest.raises(notify.EndpointError):
+        notify.resolve_endpoint("http://x.example.org/h", True)
+    resolves_to("fe80::1%eth0")      # scoped: the %zone must not break the vetting
+    with pytest.raises(notify.EndpointError):
+        notify.resolve_endpoint("http://x.example.org/h", True)
+    resolves_to("10.0.0.7", "10.0.0.8")
+    assert notify.resolve_endpoint("http://x.example.org/h", True)[1] == "10.0.0.7"
+
+
+@pytest.mark.parametrize("host", ["2130706433", "127.1", "0x7f.0.0.1", "017700000001"])
+def test_numeric_aliases_of_loopback_are_caught(host):
+    """ipaddress does not parse these and the resolver (inet_aton) does: they
+    are all 127.0.0.1. Refused at the door, and again at delivery."""
+    with pytest.raises(notify.EndpointError, match="127.0.0.1"):
+        notify.check_endpoint("http://%s/h" % host, False)
+    with pytest.raises(notify.EndpointError, match="127.0.0.1"):
+        notify.resolve_endpoint("http://%s/h" % host, False)
+
+
+def test_delivery_itself_refuses_a_name_that_turns_out_private(client, monkeypatch):
+    """End to end, with SUBSCRIPTION_ALLOW_PRIVATE unset: the name passes the
+    door, resolves to loopback at delivery, and the listener hears nothing."""
+    listener = Hook()
+    try:
+        example_org_is_loopback(monkeypatch)
+        tok = register(client, "Subscriber")
+        port = listener.server.server_address[1]
+        res = subscribe(client, tok, subscription("http://sneaky.example.org:%d/hook" % port))
+        assert res.status_code == 201, res.text
+        assert deliver(client) == (0, 1)
+        assert listener.received == []
+        assert "not a public address" in get_sub(client, tok, res.json()["id"])["error"]
+    finally:
+        listener.close()
+
+
+# ------------------------------------------------------------------ A2. TLS
+
+@pytest.fixture(scope="session")
+def pki(tmp_path_factory):
+    if shutil.which("openssl") is None:
+        pytest.skip("needs the openssl command to make a throwaway CA")
+    d = tmp_path_factory.mktemp("pki")
+    def run(*args):
+        subprocess.run(["openssl", *args], cwd=d, check=True, capture_output=True)
+    run("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "ca.key",
+        "-out", "ca.pem", "-subj", "/CN=test ca", "-days", "2",
+        "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", "keyUsage=critical,keyCertSign,cRLSign")
+    run("req", "-newkey", "rsa:2048", "-nodes", "-keyout", "leaf.key",
+        "-out", "leaf.csr", "-subj", "/CN=hook.example.org")
+    (d / "ext.cnf").write_text("subjectAltName=DNS:hook.example.org\n")
+    run("x509", "-req", "-in", "leaf.csr", "-CA", "ca.pem", "-CAkey", "ca.key",
+        "-CAcreateserial", "-out", "leaf.pem", "-days", "2", "-extfile", "ext.cnf")
+    return d
+
+
+class TLSHook:
+    def __init__(self, pki):
+        outer = self
+        self.received, self.sni = [], []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                outer.received.append((self.path, dict(self.headers)))
+                self.send_response(200)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(pki / "leaf.pem", pki / "leaf.key")
+        ctx.sni_callback = lambda sock, name, c: outer.sni.append(name)
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server.socket = ctx.wrap_socket(self.server.socket, server_side=True)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, args=(0.01,),
+                         daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture()
+def tls_hook(pki):
+    h = TLSHook(pki)
+    yield h
+    h.close()
+
+
+def test_https_pins_the_address_and_still_proves_the_name(
+        tls_hook, pki, monkeypatch):
+    example_org_is_loopback(monkeypatch)
+    monkeypatch.setattr(notify, "_TLS", ssl.create_default_context(cafile=pki / "ca.pem"))
+    assert notify.post("https://hook.example.org:%d/h?x=1" % tls_hook.port, b"{}",
+                       [], private_ok=True) == 200
+    assert tls_hook.sni == ["hook.example.org"]        # the name, not 127.0.0.1
+    path, headers = tls_hook.received[0]
+    assert path == "/h?x=1"
+    assert headers["Host"] == "hook.example.org:%d" % tls_hook.port
+
+
+def test_https_certificate_for_another_name_is_refused(tls_hook, pki, monkeypatch):
+    example_org_is_loopback(monkeypatch)
+    monkeypatch.setattr(notify, "_TLS", ssl.create_default_context(cafile=pki / "ca.pem"))
+    with pytest.raises(notify.DeliveryError, match="TLS failure"):
+        notify.post("https://other.example.org:%d/h" % tls_hook.port, b"{}", [],
+                    private_ok=True)
+    assert tls_hook.received == []
+
+
+def test_https_untrusted_certificate_is_refused(tls_hook, monkeypatch):
+    example_org_is_loopback(monkeypatch)
+    with pytest.raises(notify.DeliveryError, match="TLS failure"):
+        notify.post("https://hook.example.org:%d/h" % tls_hook.port, b"{}", [],
+                    private_ok=True)
+    assert tls_hook.received == []
+
+
+def test_the_default_tls_context_verifies():
+    assert notify._TLS.verify_mode == ssl.CERT_REQUIRED
+    assert notify._TLS.check_hostname is True
+
+
+def test_an_endpoint_that_never_answers_times_out():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    try:
+        with pytest.raises(notify.DeliveryError, match="did not answer within 0.3s"):
+            notify.post("http://127.0.0.1:%d/h" % srv.getsockname()[1], b"{}", [],
+                        private_ok=True, timeout=0.3)
+    finally:
+        srv.close()
+
+
+# ------------------------------------------------------------------ A3. headers
+
+@pytest.mark.parametrize("bad", [
+    ["Transfer-Encoding: chunked"],
+    ["Connection: close"],
+    ["content-type: text/plain"],
+    ["hOsT: matchbox"],
+    [5],
+    [None],
+    ["X-A: " + "b" * 1000],
+    ["X-A: b\rX-B: c"],
+    ["X-A: b\nX-B: c"],
+    ["X-A: b\x00"],
+    ["X-A: b\x7f"],
+    ["X A: b"],
+    [": b"],
+    {"Authorization": "x"},
+])
+def test_header_validation_branches(client, bad):
+    tok = register(client, "Subscriber")
+    body = subscription("https://example.org/h")
+    body["channel"]["header"] = bad
+    assert subscribe(client, tok, body).status_code == 400, bad
+
+
+def test_a_header_ending_in_a_newline_is_refused(client):
+    """A trailing newline must not slip through, which with `$` and match()
+    it would - why parse_subscription uses fullmatch()."""
+    tok = register(client, "Subscriber")
+    body = subscription("https://example.org/h")
+    body["channel"]["header"] = ["X-A: b\n"]
+    assert subscribe(client, tok, body).status_code == 400
+
+
+def test_a_header_http_client_cannot_encode_is_refused_at_the_door(client):
+    tok = register(client, "Subscriber")
+    body = subscription("https://example.org/h")
+    body["channel"]["header"] = ["X-A: ✓"]
+    assert subscribe(client, tok, body).status_code == 400
+
+
+def test_secrets_in_the_path_and_headers_are_never_logged(client, hook, capsys):
+    tok = register(client, "Subscriber")
+    body = subscription(hook.url + "/path-secret-123?key=query-secret-456")
+    body["channel"]["header"] = ["Authorization: Bearer header-secret-789"]
+    assert subscribe(client, tok, body).status_code == 201
+    assert deliver(client) == (1, 0)
+    assert notify.print_status(client.data_dir) == 0
+    out = "".join(capsys.readouterr())
+    assert "127.0.0.1" in out and "Subscription/1" in out
+    for secret in ("path-secret-123", "query-secret-456", "header-secret-789"):
+        assert secret not in out
+
+
+# ------------------------------------------------------------------ B. _record
+
+def in_flight(client):
+    """(conn, row) for the oldest pending notification, as deliver_due read it
+    before calling out."""
+    conn = notify.connect(client.data_dir)
+    far = datetime.datetime.now(UTC) + datetime.timedelta(days=1)
+    return conn, notify.due_queues(conn, far)[0][0]
+
+
+def test_late_handshake_success_for_the_old_endpoint_does_not_activate_the_new(
+        client, hook, hook2):
+    """What _record's guard (the UPDATE ... AND state = 'pending' AND attempts
+    = ?) is for. The old handshake is in flight, the
+    owner PUTs a new endpoint (status requested again, new handshake queued),
+    then the old handshake's 2xx is recorded."""
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    conn, row = in_flight(client)
+    assert client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+                      headers=auth(tok)).status_code == 200
+    notify._record(conn, row, notify.DELIVERED, datetime.datetime.now(UTC))
+    conn.close()
+    assert hook2.received == []
+    assert get_sub(client, tok, sub_id)["status"] == "requested"
+
+
+def test_late_final_failure_for_the_old_endpoint_does_not_kill_the_new_handshake(
+        client, hook, hook2, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:
+        c.execute("UPDATE notifications SET attempts = ? WHERE state = 'pending'",
+                  (len(notify.BACKOFF),))
+    conn, row = in_flight(client)
+    assert client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+                      headers=auth(tok)).status_code == 200
+    notify._record(conn, row, FAILED_500, datetime.datetime.now(UTC))
+    conn.close()
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "requested", sub
+    assert deliver(client) == (1, 0)
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+
+
+def test_late_retryable_failure_for_the_old_endpoint_does_not_mark_the_new(
+        client, hook, hook2, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    conn, row = in_flight(client)
+    client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+               headers=auth(tok))
+    notify._record(conn, row, FAILED_500, datetime.datetime.now(UTC))
+    conn.close()
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "requested" and "error" not in sub, sub
+
+
+def test_late_event_success_does_not_revive_a_parked_subscription(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)                 # -> error
+    conn, row = in_flight(client)
+    client.put("/fhir/Subscription/" + sub_id,
+               json=subscription(hook.url, status="off"), headers=auth(tok))
+    assert notify._record(conn, row, notify.DELIVERED, now) == notify.DROPPED
+    conn.close()
+    assert get_sub(client, tok, sub_id)["status"] == "off"
+
+
+def test_a_result_for_a_deleted_subscription_is_harmless(client, hook):
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    conn, row = in_flight(client)
+    assert client.delete("/fhir/Subscription/" + sub_id, headers=auth(tok)).status_code == 204
+    for outcome_ in (notify.DELIVERED, FAILED_500, notify.Outcome("server", "x")):
+        assert notify._record(conn, row, outcome_,
+                              datetime.datetime.now(UTC)) == notify.DROPPED
+    conn.close()
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM notifications").fetchone()[0] == 0
+
+
+def test_a_failing_handshake_stays_requested_and_is_tried_exactly_three_times(
+        client, hook):
+    tok = register(client, "Subscriber")
+    hook.answer = 500
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    now = datetime.datetime.now(UTC)
+    for i, wait in enumerate(notify.HANDSHAKE_BACKOFF):
+        assert deliver(client, now) == (0, 1)
+        sub = get_sub(client, tok, sub_id)
+        assert sub["status"] == "requested" and "answered 500" in sub["error"], (i, sub)
+        assert deliver(client, now + datetime.timedelta(seconds=wait - 1)) == (0, 0)
+        now += datetime.timedelta(seconds=wait)
+    assert deliver(client, now) == (0, 1)
+    assert get_sub(client, tok, sub_id)["status"] == "off"
+    assert len(hook.received) == len(notify.HANDSHAKE_BACKOFF) + 1
+    assert deliver(client, now + datetime.timedelta(days=1)) == (0, 0)
+
+
+def test_each_backoff_step_is_honoured(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    for wait in notify.BACKOFF:
+        assert deliver(client, now) == (0, 1)
+        assert deliver(client, now + datetime.timedelta(seconds=wait - 1)) == (0, 0), wait
+        now += datetime.timedelta(seconds=wait)
+    assert deliver(client, now) == (0, 1)
+    with db(client) as c:
+        rows = c.execute("SELECT state, attempts FROM notifications "
+                         "WHERE kind = 'event-notification'").fetchall()
+    assert [tuple(r) for r in rows] == [("failed", len(notify.BACKOFF) + 1)]
+
+
+def test_a_subscription_in_error_still_has_events_queued(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    assert get_sub(client, tok, sub_id)["status"] == "error"
+    submit(client, tok, outcome(), monkeypatch)          # while in `error`
+    hook.answer = 200
+    hook.received.clear()
+    assert deliver(client, now + datetime.timedelta(seconds=notify.BACKOFF[0])) == (2, 0)
+    assert [s["notification-event"]["event-number"] for s in hook.statuses()] == ["1", "2"]
+
+
+def test_one_subscribers_dead_endpoint_does_not_hold_up_anothers(
+        client, hook, hook2, monkeypatch):
+    a, b = register(client, "Dead"), register(client, "Alive")
+    dead = active_subscription(client, a, hook)
+    alive = active_subscription(client, b, hook2)
+    hook.answer = 500
+    submit(client, a, outcome(), monkeypatch)
+    submit(client, a, outcome(), monkeypatch)
+    assert deliver(client) == (2, 1)
+    assert [s["notification-event"]["event-number"] for s in hook2.statuses()] == ["1", "2"]
+    assert get_sub(client, a, dead)["status"] == "error"
+    assert get_sub(client, b, alive)["status"] == "active"
+
+
+def test_giving_up_fails_what_was_queued_behind_and_says_so(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    for _ in range(len(notify.BACKOFF) + 1):
+        deliver(client, now)
+        now += datetime.timedelta(seconds=max(notify.BACKOFF))
+    with db(client) as c:
+        rows = [tuple(r) for r in c.execute(
+            "SELECT event_number, state, attempts, error FROM notifications "
+            "WHERE kind = 'event-notification' ORDER BY id")]
+    assert rows == [(1, "failed", 6, "the endpoint answered 500"),
+                    (2, "failed", 0, "subscription turned off")]
+    assert len(hook.received) == len(notify.BACKOFF) + 1    # event 2 never sent
+
+
+# ------------------------------------------------------------------ C. PUT / DELETE / end
+
+def test_put_drops_the_old_queue_and_only_the_new_endpoint_is_called(
+        client, hook, hook2, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+    body = subscription(hook2.url, content="empty", filters=["organization=nobody"])
+    res = client.put("/fhir/Subscription/" + sub_id, json=body, headers=auth(tok))
+    assert res.status_code == 200
+    assert res.json()["channel"]["endpoint"] == hook2.url
+    assert res.json()["channel"]["_payload"]["extension"][0]["valueCode"] == "empty"
+    assert deliver(client) == (1, 0)
+    assert hook.received == []
+    assert [s["type"] for s in hook2.statuses()] == ["handshake"]
+    submit(client, tok, outcome(), monkeypatch)             # new filter excludes it
+    assert deliver(client) == (0, 0)
+
+
+def test_put_status_off_parks_and_a_second_put_revives(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    res = client.put("/fhir/Subscription/" + sub_id,
+                     json=subscription(hook.url, status="off"), headers=auth(tok))
+    assert res.json()["status"] == "off"
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (0, 0) and hook.received == []
+    res = client.put("/fhir/Subscription/" + sub_id, json=subscription(hook.url),
+                     headers=auth(tok))
+    assert res.json()["status"] == "requested"
+    assert deliver(client) == (1, 0)
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+
+
+def test_a_bad_put_changes_nothing(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    res = client.put("/fhir/Subscription/" + sub_id,
+                     json=subscription("http://169.254.169.254/x"), headers=auth(tok))
+    assert res.status_code == 400
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "active" and sub["channel"]["endpoint"] == hook.url
+    assert deliver(client) == (1, 0)                         # the queue survived
+    assert client.put("/fhir/Subscription/9999", json=subscription(hook.url),
+                      headers=auth(tok)).status_code == 404
+
+
+def test_delete_takes_every_queued_and_delivered_row_with_it(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    deliver(client)
+    submit(client, tok, outcome(), monkeypatch)             # one still pending
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM notifications").fetchone()[0] == 3
+    assert client.delete("/fhir/Subscription/" + sub_id, headers=auth(tok)).status_code == 204
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM notifications").fetchone()[0] == 0
+    # and the submissions the rows pointed at are untouched
+    assert len(param_entries(client.get("/fhir/$submissions"))) == 2
+
+
+def test_end_round_trips_in_utc_and_a_naive_one_is_refused(client, hook):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(hook.url, end="2099-06-01T12:00:00+02:00"))
+    assert res.status_code == 201
+    assert res.json()["end"] == "2099-06-01T10:00:00.000000+00:00"
+    assert datetime.datetime.fromisoformat(
+        get_sub(client, tok, res.json()["id"])["end"]) == datetime.datetime(
+            2099, 6, 1, 10, tzinfo=UTC)
+    # The last one parses, and is past the end of time once it is UTC.
+    for bad in ("2099-06-01T12:00:00", "2099-06-01", 5, ["x"],
+                "9999-12-31T23:59:59-10:00"):
+        assert subscribe(client, tok, subscription(hook.url, end=bad)).status_code == 400, bad
+    assert subscribe(client, tok, subscription(hook.url, end="2099-06-01T12:00:00Z")
+                     ).status_code == 201
+
+
+def test_an_id_too_big_for_the_database_is_no_subscription(client):
+    tok = register(client, "Subscriber")
+    for call in (client.get, client.delete):
+        assert call("/fhir/Subscription/99999999999999999999",
+                    headers=auth(tok)).status_code == 404
+
+
+def test_an_ended_subscription_counts_no_event_and_one_in_error_ends_too(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    past = notify.stamp(datetime.datetime.now(UTC) - datetime.timedelta(seconds=1))
+    with db(client) as c:
+        c.execute("UPDATE subscriptions SET end_ts = ?, status = 'error'", (past,))
+    submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:
+        row = c.execute("SELECT status, events FROM subscriptions").fetchone()
+        assert tuple(row) == ("off", 0)
+        assert c.execute("SELECT count(*) FROM notifications WHERE kind != 'handshake'"
+                         ).fetchone()[0] == 0
+    # a later end does not stop it
+    sub2 = active_subscription(client, tok, hook, end="2099-01-01T00:00:00Z")
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (1, 0)
+    assert get_sub(client, tok, sub2)["status"] == "active"
+
+
+# ------------------------------------------------------------------ D. filters
+
+@pytest.mark.parametrize("filters, slug, doc, expected", [
+    ([], "acme", "eps", True),
+    (["organization=acme"], "acme", "eps", True),
+    (["organization=acme"], "acme-two", "eps", False),
+    (["organization=Organization/acme"], "acme", "eps", True),
+    (["Bundle?organization=http://testserver/fhir/Organization/acme"], "acme", "eps", True),
+    (["organization=acme,other"], "other", "eps", True),
+    (["organization=acme&document-type=eps"], "acme", "laboratory", False),
+    (["organization=acme&document-type=eps"], "acme", "eps", True),
+    (["organization=acme", "document-type=laboratory"], "acme", "eps", False),
+    (["organization=acme", "organization=other"], "acme", "eps", False),   # ANDed
+    (["document-type=eps%2Claboratory"], "acme", "laboratory", False),  # escaped comma is one (unknown) value
+    ([" Bundle?organization = acme , other "], "acme", "eps", True),
+    (["document-type=discharge"], "acme", "eps", False),                   # retired
+    (["organization=acme", "document-type=discharge"], "acme", "eps", False),
+])
+def test_filters_match_combinations(filters, slug, doc, expected):
+    assert app_module.filters_match(filters, slug, doc) is expected
+
+
+def test_a_parameter_repeated_inside_one_filter_is_anded_like_a_fhir_search():
+    """Repeating a parameter is ANDed whether it is across two extensions (see
+    above) or inside one string, as in a FHIR search - so this asks for a
+    document that is both companies', and matches none."""
+    assert app_module.filters_match(["organization=acme&organization=other"],
+                                    "acme", "eps") is False
+
+
+def test_category_filter_alone_and_the_wrong_category_really_was_recorded(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook, filters=["document-type=laboratory"])
+    imaging = app_module.DOCUMENTS_BY_ID["imaging"]["profile"]
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]["profile"]
+    set_outcome(monkeypatch, outcome())
+    for profile, expected in ((imaging, (0, 0)), (lab, (1, 0))):
+        res = client.post("/fhir/Bundle/$validate?profile=" + profile, content=BUNDLE,
+                          headers={"X-Team-Token": tok})
+        assert res.status_code == 200 and res.headers["X-Pass"] == "true", res.text
+        assert deliver(client) == expected, profile
+
+
+# ------------------------------------------------------------------ E. numbering
+
+def test_each_subscription_numbers_its_own_events(client, hook, hook2, monkeypatch):
+    a, b = register(client, "Early"), register(client, "Late")
+    early = active_subscription(client, a, hook)
+    submit(client, a, outcome(), monkeypatch)
+    submit(client, a, outcome(), monkeypatch)
+    assert deliver(client) == (2, 0)
+    late = active_subscription(client, b, hook2, filters=["organization=late"])
+    submit(client, b, outcome(), monkeypatch)
+    assert deliver(client) == (2, 0)
+    assert [(s["notification-event"]["event-number"]) for s in hook.statuses()] == ["1", "2", "3"]
+    assert [(s["notification-event"]["event-number"]) for s in hook2.statuses()] == ["1"]
+    assert hook2.statuses()[0]["events-since-subscription-start"] == "1"
+    for tok, sub_id, n in ((a, early, "3"), (b, late, "1")):
+        res = client.get("/fhir/Subscription/%s/$status" % sub_id, headers=auth(tok)).json()
+        flat = {p["name"]: _part_value(p) for p in res["entry"][0]["resource"]["parameter"]}
+        assert flat["events-since-subscription-start"] == n
+
+
+# ------------------------------------------------------------------ F. misc
+
+def test_a_document_this_server_cannot_read_is_not_the_subscribers_fault(
+        client, hook, monkeypatch, capsys):
+    """Written off, said loudly in the log with the path - and the healthy
+    endpoint behind it keeps its subscription and gets the next event."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    team_dir = os.path.join(client.data_dir, "submissions", "subscriber")
+    for name in os.listdir(team_dir):
+        os.remove(os.path.join(team_dir, name))
+    submit(client, tok, outcome(), monkeypatch)
+    hook.received.clear()
+    assert deliver(client) == (1, 1)
+    assert [s["notification-event"]["event-number"] for s in hook.statuses()] == ["2"]
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "active" and "error" not in sub
+    with db(client) as c:
+        rows = c.execute("SELECT state, error FROM notifications "
+                         "WHERE kind = 'event-notification' ORDER BY id").fetchall()
+    assert [r["state"] for r in rows] == ["failed", "delivered"]
+    assert "could not read" in rows[0]["error"]
+    out = capsys.readouterr().out
+    assert "CANNOT READ " + team_dir in out and "FileNotFoundError" in out
+
+
+def test_a_bug_in_one_delivery_is_nobodys_subscription_turned_off(
+        client, hook, hook2, monkeypatch, capsys):
+    a, b = register(client, "Broken"), register(client, "Fine")
+    broken = active_subscription(client, a, hook)
+    active_subscription(client, b, hook2, filters=["organization=fine"])
+    real = notify.post
+
+    def post(url, *args, **kw):
+        if url == hook.url:
+            raise RuntimeError("boom")
+        return real(url, *args, **kw)
+    monkeypatch.setattr(notify, "post", post)
+    submit(client, a, outcome(), monkeypatch)
+    submit(client, b, outcome(), monkeypatch)
+    # Broken is sent both (no filter), Fine only its own. A bug may be the box
+    # out of threads for a moment, so it is tried again - on a clock of its
+    # own, in order, and never at the subscription's expense.
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (1, 1)
+    assert len(hook2.received) == 1           # its one event
+    for wait in notify.TRANSIENT_BACKOFF + (0,) + notify.TRANSIENT_BACKOFF:
+        sub = get_sub(client, a, broken)
+        # Never anything but active; and nothing said until an event has
+        # actually been written off, which the first is by the fifth pass.
+        assert sub["status"] == "active"
+        assert sub.get("error", "Event 1 was")[:11] == "Event 1 was"
+        now += datetime.timedelta(seconds=wait + 1)
+        assert deliver(client, now) == (0, 1)
+    assert deliver(client, now + datetime.timedelta(hours=1)) == (0, 0)
+    sub = get_sub(client, a, broken)
+    assert sub["status"] == "active"
+    assert sub["error"].startswith("Event 2 was not sent, and will not be:")
+    assert "not your endpoint's doing" in sub["error"]
+    with db(client) as c:
+        assert [tuple(r) for r in c.execute(
+            "SELECT attempts, faults FROM notifications WHERE state = 'failed'"
+        )] == [(0, 4), (0, 4)]
+        errors = [r[0] for r in c.execute(
+            "SELECT error FROM notifications WHERE state = 'failed'")]
+    assert len(errors) == 2 and all("not your endpoint's doing" in e for e in errors)
+    out = capsys.readouterr().out
+    assert "Traceback" in out and "RuntimeError: boom" in out
+
+
+def test_payload_content_defaults_and_bad_codes(client):
+    tok = register(client, "Subscriber")
+    body = subscription("https://example.org/h")
+    del body["channel"]["payload"]
+    res = subscribe(client, tok, body)
+    assert res.status_code == 201
+    assert res.json()["channel"]["_payload"]["extension"][0]["valueCode"] == "empty"
+    res = subscribe(client, tok, subscription("https://example.org/h", content="everything"))
+    assert res.status_code == 400 and "Payload content" in diagnostics(res)
+
+
+def test_a_queueing_failure_costs_one_subscription_and_is_rolled_back(
+        client, hook, hook2, monkeypatch, capsys):
+    """Three subscriptions match and the second blows up *after* it was counted.
+    Its notification is rolled back, the other two are queued, and the
+    submission never hears of any of it. The count stands, on its own: an event
+    number nobody was sent is how the second subscriber finds out."""
+    tok = register(client, "Producer")
+    hook3 = Hook()
+    try:
+        for h in (hook, hook2, hook3):
+            active_subscription(client, tok, h)
+        real = sqlite3.Connection.execute
+
+        class Flaky(sqlite3.Connection):
+            def execute(self, sql, *a):
+                if sql.startswith("INSERT INTO notifications") and a and a[0][-1] == 2 \
+                        and "event-notification" in sql:
+                    raise RuntimeError("boom")
+                return real(self, sql, *a)
+        real_connect = app_module.connect
+
+        def connect():
+            conn = sqlite3.connect(os.path.join(client.data_dir, "connectathon.db"),
+                                   timeout=30, factory=Flaky)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON")
+            return conn
+        monkeypatch.setattr(app_module, "connect", connect)
+        res = submit(client, tok, outcome(), monkeypatch)
+        monkeypatch.setattr(app_module, "connect", real_connect)
+        assert res.status_code == 200 and res.headers["X-Pass"] == "true"
+        with db(client) as c:
+            assert [r[0] for r in c.execute(
+                "SELECT events FROM subscriptions ORDER BY id")] == [1, 1, 1]
+            assert [r[0] for r in c.execute(
+                "SELECT subscription_id FROM notifications "
+                "WHERE kind != 'handshake' ORDER BY id")] == [1, 3]
+        out = capsys.readouterr().out
+        assert "for Subscription/2" in out and "RuntimeError: boom" in out
+    finally:
+        hook3.close()
+
+
+def test_main_once_exit_codes(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    monkeypatch.setattr("sys.argv", ["notify.py", "--once", "--data-dir", client.data_dir])
+    assert notify.main() == 0
+    hook.answer = 500
+    subscribe(client, tok, subscription(hook.url))
+    assert notify.main() == 1
+    monkeypatch.setattr("sys.argv", ["notify.py"])
+    assert notify.main() == 2
+
+
+def test_the_loop_survives_a_failing_look_and_slows_down(tmp_path, monkeypatch, capsys):
+    looks, sleeps = [], []
+
+    def look(self, now=None):
+        looks.append(1)
+        if len(looks) <= 3:
+            raise sqlite3.OperationalError("database is locked")
+        if len(looks) == 5:
+            raise KeyboardInterrupt        # the way out of `while True`
+        return []
+    monkeypatch.setattr(notify, "_has_tables", lambda d: True)
+    monkeypatch.setattr(notify.Dispatcher, "look", look)
+    monkeypatch.setattr(notify.time, "sleep", sleeps.append)
+    with pytest.raises(KeyboardInterrupt):
+        notify.run_loop(str(tmp_path))
+    # backing off while it fails, and straight back to POLL once it does not
+    assert sleeps == [2 * notify.POLL, 4 * notify.POLL, 8 * notify.POLL, notify.POLL]
+    out = capsys.readouterr().out
+    assert "LOOK FAILED (3 in a row)" in out and "database is locked" in out
+
+
+def test_put_clears_the_old_endpoints_error(client, hook, hook2, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (0, 1)
+    assert "error" in get_sub(client, tok, sub_id)
+    res = client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+                     headers=auth(tok))
+    assert "error" not in res.json()
+
+
+# ------------------------------------ in flight, out of order, out of luck
+
+
+def wait_for(condition, seconds=3):
+    deadline = time.monotonic() + seconds
+    while not condition():
+        assert time.monotonic() < deadline, "waited %ss" % seconds
+        time.sleep(0.01)
+
+
+def test_repointing_a_subscription_mid_handshake_does_not_skip_the_new_handshake(
+        client, hook, hook2):
+    """Through the API alone. The subscriber's own endpoint is slow to answer
+    the handshake, and while it is, the subscription is PUT at somebody else's
+    server. The late 200 from the first endpoint says nothing about the second:
+    it stays `requested` until *it* has answered."""
+    tok = register(client, "Subscriber")
+    hook.delay = 0.4
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    out = {}
+    passing = threading.Thread(target=lambda: out.update(r=deliver(client)))
+    passing.start()
+    wait_for(lambda: hook.received)
+    put = client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+                     headers=auth(tok))
+    assert put.status_code == 200, put.text
+    passing.join()
+    assert out["r"] == (0, 0)
+    assert get_sub(client, tok, sub_id)["status"] == "requested"
+    assert hook2.received == []
+    assert deliver(client) == (1, 0)
+    assert [s["type"] for s in hook2.statuses()] == ["handshake"]
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+
+
+def test_a_put_mid_queue_stops_the_rest_going_to_the_old_endpoint(
+        client, hook, hook2, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    for _ in range(3):
+        submit(client, tok, outcome(), monkeypatch)
+    real = notify._attempt
+
+    def attempt_then_put(*args):
+        result = real(*args)
+        if len(hook.received) == 1 and not hook2.location.endswith("#put"):
+            hook2.location += "#put"          # once
+            client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+                       headers=auth(tok))
+        return result
+    monkeypatch.setattr(notify, "_attempt", attempt_then_put)
+    deliver(client)
+    assert len(hook.received) == 1 and hook2.received == []
+    assert deliver(client) == (1, 0)
+    assert [s["type"] for s in hook2.statuses()] == ["handshake"]
+
+
+def test_a_queue_listed_before_a_put_is_not_sent_where_it_used_to_point(
+        client, hook, hook2, monkeypatch):
+    """The list is made when the look begins and a worker may get to it
+    seconds later. Each row is read again before it is sent."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    real = notify.due_queues
+
+    def listed_then_put(*args):
+        queues = real(*args)
+        monkeypatch.setattr(notify, "due_queues", real)
+        client.put("/fhir/Subscription/" + sub_id, json=subscription(hook2.url),
+                   headers=auth(tok))
+        return queues
+    monkeypatch.setattr(notify, "due_queues", listed_then_put)
+    assert deliver(client) == (0, 0)
+    assert hook.received == [] and hook2.received == []
+    assert deliver(client) == (1, 0)
+    assert [s["type"] for s in hook2.statuses()] == ["handshake"]
+
+
+def test_an_id_is_never_handed_to_the_next_subscription(client, hook):
+    a, b = register(client, "First"), register(client, "Second")
+    first = subscribe(client, a, subscription(hook.url)).json()["id"]
+    assert client.delete("/fhir/Subscription/" + first, headers=auth(a)).status_code == 204
+    second = subscribe(client, b, subscription(hook.url)).json()["id"]
+    assert second != first
+    with db(client) as c:
+        assert [r[0] for r in c.execute("SELECT id FROM notifications")] == [2]
+
+
+def test_a_result_that_cannot_be_written_down_is_not_sent_again(
+        client, hook, monkeypatch, capsys):
+    """The database is locked for longer than its timeout between the POST and
+    the write. The event went out once, and once is how often it goes out."""
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    real_connect, real_attempt = notify.connect, notify._attempt
+
+    def impatient(data_dir):
+        conn = real_connect(data_dir)
+        conn.execute("PRAGMA busy_timeout = 50")
+        return conn
+    locker = sqlite3.connect(os.path.join(client.data_dir, "connectathon.db"),
+                             isolation_level=None, check_same_thread=False)
+
+    def attempt_then_lock(*args):
+        result = real_attempt(*args)
+        locker.execute("BEGIN IMMEDIATE")
+        return result
+    monkeypatch.setattr(notify, "connect", impatient)
+    monkeypatch.setattr(notify, "_attempt", attempt_then_lock)
+    try:
+        assert deliver(client) == (0, 1)
+        assert len(hook.received) == 1
+        assert "COULD NOT BE WRITTEN DOWN" in capsys.readouterr().out
+        assert deliver(client) == (0, 1)          # still locked: not sent again
+        assert len(hook.received) == 1
+        locker.execute("ROLLBACK")
+        assert deliver(client) == (1, 0)          # written down, from memory
+        assert len(hook.received) == 1
+    finally:
+        locker.close()
+    assert notify._UNRECORDED == {}
+    with db(client) as c:
+        assert [tuple(r) for r in c.execute(
+            "SELECT state, attempts FROM notifications WHERE kind != 'handshake'"
+        )] == [("delivered", 1)]
+
+
+def test_a_backlog_is_numbered_as_it_happened_not_as_it_stands(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    hook.answer = 500
+    for _ in range(3):
+        submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    hook.answer = 200
+    hook.received.clear()
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (3, 0)
+    assert [(s["notification-event"]["event-number"],
+             s["events-since-subscription-start"]) for s in hook.statuses()] == [
+        ("1", "1"), ("2", "2"), ("3", "3")]
+
+
+def test_an_answer_dripped_a_byte_at_a_time_is_cut_off_at_the_deadline():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def drip():
+        conn, _ = srv.accept()
+        try:
+            for byte in b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n":
+                time.sleep(0.1)       # every recv is well inside the timeout
+                conn.sendall(bytes([byte]))
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    threading.Thread(target=drip, daemon=True).start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(notify.DeliveryError, match="did not answer within 0.5s"):
+            notify.post("http://127.0.0.1:%d/h" % srv.getsockname()[1], b"{}", [],
+                        private_ok=True, timeout=0.5)
+    finally:
+        srv.close()
+    assert time.monotonic() - started < 1.5
+
+
+def test_a_slow_endpoint_holds_up_nobody_else(client, hook, hook2, monkeypatch):
+    """look() does not wait. The fast subscriber's event is delivered *and
+    written down* while the slow one is still thinking, and a second look
+    leaves the busy subscription alone rather than sending its event twice."""
+    slow, fast = register(client, "Slow"), register(client, "Fast")
+    active_subscription(client, slow, hook, filters=["organization=slow"])
+    active_subscription(client, fast, hook2, filters=["organization=fast"])
+    hook.delay = 0.6
+    submit(client, slow, outcome(), monkeypatch)
+    submit(client, fast, outcome(), monkeypatch)
+    dispatcher = notify.Dispatcher(client.data_dir)
+    try:
+        tasks = dispatcher.look()
+        assert len(tasks) == 2
+
+        def fast_is_written_down():
+            with db(client) as c:
+                return c.execute(
+                    "SELECT count(*) FROM notifications WHERE state = 'pending'"
+                ).fetchone()[0] == 1
+        wait_for(fast_is_written_down, 0.5)
+        assert not all(task.done() for task in tasks)
+        assert dispatcher.look() == []            # the slow one is still busy
+        assert sorted(task.result() for task in tasks) == [(1, 0), (1, 0)]
+    finally:
+        dispatcher.close()
+    assert len(hook.received) == 1 and len(hook2.received) == 1
+
+
+def test_end_is_honoured_by_the_notifier_with_no_submission_to_prompt_it(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    end = datetime.datetime.now(UTC) + datetime.timedelta(hours=1)
+    sub_id = active_subscription(client, tok, hook, end=end.isoformat())
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (0, 1)              # queued before `end`, retrying
+    hook.received.clear()
+    assert deliver(client, end + datetime.timedelta(seconds=1)) == (0, 0)
+    assert hook.received == []
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "off" and sub["error"].startswith("Ended at ")
+    with db(client) as c:
+        assert [r[0] for r in c.execute(
+            "SELECT state FROM notifications WHERE kind != 'handshake'")] == ["failed"]
+
+
+def test_an_error_never_quotes_the_path_back():
+    parts = notify.parse_endpoint("https://example.org/hooks/S3CRET?key=T0KEN")
+    text = notify._describe(
+        ValueError("URL can't contain control characters. '/hooks/S3CRET?key=T0KEN'"),
+        parts)
+    assert "S3CRET" not in text and "T0KEN" not in text
+    assert notify._describe(http.client.NotConnected(), parts) == "NotConnected"
+
+
+@pytest.mark.parametrize("endpoint", [
+    "https://example.org/hook\x7f",            # DEL: http.client quotes the path back
+    "https://example.org/caf\u00e9",
+    "https://m\u00fcnchen.example/hook",
+])
+def test_an_endpoint_http_client_could_not_send_is_refused_at_the_door(client, endpoint):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(endpoint))
+    assert res.status_code == 400 and "printable ASCII" in diagnostics(res)
+
+
+def test_an_endpoint_that_answers_early_and_hangs_up_is_explained_not_unreachable():
+    """A proxy with a body limit says 413 and closes while the document is
+    still being sent. The 413 is the useful half of that."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def refuse():
+        conn, _ = srv.accept()
+        conn.recv(1024)
+        conn.sendall(b"HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\n"
+                     b"Connection: close\r\n\r\n")
+        time.sleep(0.2)
+        conn.close()
+    threading.Thread(target=refuse, daemon=True).start()
+    try:
+        with pytest.raises(notify.DeliveryError) as raised:
+            notify.post("http://127.0.0.1:%d/h" % srv.getsockname()[1],
+                        b"x" * (8 * 1024 * 1024), [], private_ok=True, timeout=5)
+    finally:
+        srv.close()
+    assert ("answered 413" in str(raised.value)
+            or "body size limit" in str(raised.value)), str(raised.value)
+
+
+def _one_connection(serve):
+    """A port whose first connection is `serve`'s to do with as it likes."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def run():
+        conn, _ = srv.accept()
+        try:
+            serve(conn)
+        finally:
+            conn.close()
+            srv.close()
+    threading.Thread(target=run, daemon=True).start()
+    return srv.getsockname()[1]
+
+
+def _whole_request(conn, body):
+    data = b""
+    while not data.endswith(body):
+        data += conn.recv(65536)
+
+
+def test_a_reset_before_anything_was_sent_is_not_blamed_on_the_body():
+    """request() connects as well as sends, and https on a port that is not
+    speaking TLS is reset during the handshake - with nothing sent yet."""
+    def reset(conn):
+        conn.recv(10)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    with pytest.raises(notify.DeliveryError) as raised:
+        notify.post("https://127.0.0.1:%d/h" % _one_connection(reset), b"{}", [],
+                    private_ok=True, timeout=5)
+    assert "body size limit" not in str(raised.value)
+    assert "could not reach the endpoint" in str(raised.value)
+
+
+@pytest.mark.parametrize("answer", [
+    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab",
+    b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nab",
+])
+def test_a_2xx_is_delivered_whatever_becomes_of_its_body(answer):
+    """Nothing in the body is used. Failing the delivery over it sends the
+    endpoint again what it has just said it has."""
+    def serve(conn):
+        _whole_request(conn, b"{}")
+        conn.sendall(answer)
+        conn.shutdown(socket.SHUT_WR)
+        time.sleep(0.2)
+    assert notify.post("http://127.0.0.1:%d/h" % _one_connection(serve), b"{}", [],
+                       private_ok=True, timeout=5) == 200
+
+
+def test_what_is_not_http_is_not_quoted_back():
+    """BadStatusLine's text is the peer's first line: with private addresses
+    allowed, the banner of any port in the room."""
+    def banner(conn):
+        conn.sendall(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n")
+        time.sleep(0.2)
+    with pytest.raises(notify.DeliveryError) as raised:
+        notify.post("http://127.0.0.1:%d/h" % _one_connection(banner), b"{}", [],
+                    private_ok=True, timeout=5)
+    assert str(raised.value) == "the endpoint did not answer with HTTP"
+
+
+def test_a_volume_without_locks_is_not_mistaken_for_another_notifier(
+        tmp_path, monkeypatch):
+    def no_locks(*a):
+        raise OSError(errno.ENOLCK, "No locks available")
+    monkeypatch.setattr(notify.fcntl, "flock", no_locks)
+    with pytest.raises(OSError) as raised:
+        notify._claim(str(tmp_path))
+    assert not isinstance(raised.value, notify.AlreadyDelivering)
+
+
+def test_once_is_not_green_while_a_delivery_waits_on_its_retry(
+        client, hook, monkeypatch, capsys):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    monkeypatch.setattr("sys.argv", ["notify.py", "--once", "--data-dir", client.data_dir])
+    assert notify.main() == 1
+    assert notify.main() == 1          # nothing due, so nothing tried - and not fine
+    assert "0 delivered, 0 failed, 1 still queued" in capsys.readouterr().out
+
+
+# --------------------------------------- whose fault it was, and who is told
+
+
+@pytest.fixture(autouse=True)
+def _nothing_remembered_between_tests():
+    yield
+    with notify._UNRECORDED_LOCK:
+        notify._UNRECORDED.clear()
+
+
+def pending(client):
+    with db(client) as c:
+        return c.execute("SELECT count(*) FROM notifications "
+                         "WHERE state = 'pending'").fetchone()[0]
+
+
+def test_a_document_that_cannot_be_read_just_now_is_tried_again(
+        client, hook, monkeypatch, capsys):
+    """Out of file handles is not "the document is gone"."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    real_open, calls = open, []
+
+    def flaky_open(path, *a, **k):
+        if "submissions" in str(path) and not calls:
+            calls.append(path)
+            raise OSError(24, "Too many open files", str(path))
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(notify, "open", flaky_open, raising=False)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "active" and "error" not in sub     # not their doing
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (1, 0)
+    assert len(hook.received) == 1 and len(hook.received[0][2]["entry"]) == 2
+    out = capsys.readouterr().out
+    assert "CANNOT READ" in out and "NOT SENT, our trouble, retry in 5s" in out
+    assert "EMFILE" in out
+
+
+def test_a_document_that_is_gone_is_written_off_at_once(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:
+        slug, name = c.execute("SELECT t.slug, s.filename FROM submissions s "
+                               "JOIN teams t ON t.id = s.team_id ORDER BY s.id").fetchone()
+    os.remove(os.path.join(client.data_dir, "submissions", slug, name))
+    assert deliver(client) == (1, 1)      # and the one behind it goes out in the same pass
+    assert [event_number(b) for b in hook.received] == ["2"]
+
+
+def event_number(received):
+    params = {p["name"]: p for p in received[2]["entry"][0]["resource"]["parameter"]}
+    return params["notification-event"]["part"][0]["valueString"]
+
+
+def test_a_thread_that_would_not_start_does_not_cost_a_new_subscription(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    real_start, starts = notify.threading.Timer.start, []
+
+    def start(self):
+        starts.append(1)
+        if len(starts) == 1:
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+    monkeypatch.setattr(notify.threading.Timer, "start", start)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    # still waiting, and told why it is taking a while
+    assert sub["status"] == "requested" and "not your endpoint's doing" in sub["error"]
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (1, 0)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "active" and "error" not in sub
+
+
+def test_a_handshake_this_server_never_manages_to_send_turns_it_off_saying_so(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+
+    def post(*a, **k):
+        raise RuntimeError("boom")
+    monkeypatch.setattr(notify, "post", post)
+    now = datetime.datetime.now(UTC)
+    for wait in (0,) + notify.TRANSIENT_BACKOFF:
+        now += datetime.timedelta(seconds=wait + 1)
+        assert deliver(client, now) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "off" and "PUT the subscription to try again" in sub["error"]
+
+
+def test_this_servers_own_resolver_being_down_costs_nobody_a_subscription(
+        client, hook, monkeypatch, capsys):
+    tok = register(client, "Subscriber")
+    example_org_is_loopback(monkeypatch)
+    res = subscribe(client, tok, subscription(
+        "http://hooks.example.org:%d/hook" % hook.server.server_address[1]))
+    sub_id = res.json()["id"]
+    assert deliver(client) == (1, 0)
+    submit(client, tok, outcome(), monkeypatch)
+
+    def broken(host, *a, **k):
+        raise socket.gaierror(socket.EAI_AGAIN, "Temporary failure in name resolution")
+    working = notify.socket.getaddrinfo
+    monkeypatch.setattr(notify.socket, "getaddrinfo", broken)
+    now = datetime.datetime.now(UTC)
+    for wait in (0,) + notify.TRANSIENT_BACKOFF:
+        now += datetime.timedelta(seconds=wait + 1)
+        assert deliver(client, now) == (0, 1)
+        sub = get_sub(client, tok, sub_id)
+        assert sub["status"] == "active"
+        assert "error" not in sub or wait == notify.TRANSIENT_BACKOFF[-1]
+    assert pending(client) == 0           # that event is a gap now; the subscription is not
+    # ... but its owner is told, for as long as nothing gets through: the
+    # resolver that is not answering may as well be the one for their name.
+    assert sub["error"].startswith("Event 1 was not sent, and will not be:")
+    monkeypatch.setattr(notify.socket, "getaddrinfo", working)
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client, now + datetime.timedelta(seconds=1)) == (1, 0)
+    assert "error" not in get_sub(client, tok, sub_id)
+    assert "could not be looked up just now" in capsys.readouterr().out
+
+
+def test_a_name_that_does_not_exist_is_the_subscribers_to_fix(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    with db(client) as c:
+        c.execute("UPDATE subscriptions SET endpoint = 'http://gone.example.org/h'")
+    submit(client, tok, outcome(), monkeypatch)
+
+    def no_such_name(host, *a, **k):
+        raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
+    monkeypatch.setattr(notify.socket, "getaddrinfo", no_such_name)
+    assert deliver(client) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "error" and "does not resolve" in sub["error"]
+
+
+def test_a_resolver_hiccup_does_not_use_up_the_endpoints_last_try(client, hook, monkeypatch):
+    """attempts and faults are counted apart."""
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    with db(client) as c:
+        c.execute("UPDATE notifications SET attempts = ? WHERE state = 'pending'",
+                  (len(notify.BACKOFF),))
+    with notify.connect(client.data_dir) as conn:
+        row = conn.execute(notify.DUE + " ORDER BY n.id").fetchone()
+        verdict = notify._record(conn, row, notify.Outcome("transient", "resolver"), now)
+        assert verdict.startswith("NOT SENT")
+        row = conn.execute(notify.DUE + " ORDER BY n.id").fetchone()
+        assert (row["attempts"], row["faults"], row["status"]) == (5, 1, "active")
+
+
+def test_the_deadline_cutting_a_slow_upload_is_not_called_a_hang_up():
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    held = []
+    threading.Thread(target=lambda: held.append(srv.accept()), daemon=True).start()
+    try:
+        with pytest.raises(notify.DeliveryError) as raised:
+            notify.post("http://127.0.0.1:%d/hook" % srv.getsockname()[1],
+                        b"x" * (20 * 1024 * 1024), [], private_ok=True, timeout=0.5)
+    finally:
+        srv.close()
+        for conn, _ in held:
+            conn.close()
+    assert "did not take the notification (20971520 bytes) within 0.5s" in str(raised.value)
+
+
+def test_once_is_not_green_with_a_backlog_it_ran_out_of_time_for(
+        client, hook, monkeypatch, capsys):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    for _ in range(3):
+        submit(client, tok, outcome(), monkeypatch)
+    monkeypatch.setattr(notify, "DRAIN_BUDGET", 0)
+    monkeypatch.setattr("sys.argv", ["notify.py", "--once", "--data-dir", client.data_dir])
+    assert notify.main() == 1
+    assert "1 delivered, 0 failed, 2 still queued" in capsys.readouterr().out
+
+
+def test_a_clock_stepped_back_does_not_park_what_was_never_tried(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    earlier = datetime.datetime.now(UTC) - datetime.timedelta(minutes=30)
+    assert deliver(client, earlier) == (1, 0)
+
+
+def test_a_backoff_is_still_a_backoff(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    assert deliver(client, now + datetime.timedelta(seconds=1)) == (0, 0)
+
+
+def test_a_retired_category_in_a_stored_filter_silences_only_itself(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    with db(client) as c:
+        c.execute("UPDATE subscriptions SET filters = ? WHERE id = ?",
+                  (json.dumps(["Bundle?document-type=eps,hospital-discharge"]), sub_id))
+    submit(client, tok, outcome(), monkeypatch)             # an eps document
+    assert deliver(client) == (1, 0)
+    assert app_module.filters_match(["document-type=hospital-discharge"], "x", "eps") is False
+    # and at the door it is still refused
+    res = subscribe(client, tok, subscription(
+        hook.url, filters=["document-type=eps,hospital-discharge"]))
+    assert res.status_code == 400
+
+
+def test_a_notification_whose_subscription_is_gone_is_failed_not_invisible(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:                # by hand, as sqlite3's CLI would: no foreign keys
+        c.execute("DELETE FROM subscriptions WHERE id = ?", (sub_id,))
+    assert pending(client) == 1
+    assert deliver(client) == (0, 0)
+    assert pending(client) == 0 and hook.received == []
+
+
+def test_one_notifier_per_data_directory(client, hook, monkeypatch, capsys):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    loop = notify.Dispatcher(client.data_dir)
+    try:
+        with pytest.raises(notify.AlreadyDelivering):
+            deliver(client)
+        monkeypatch.setattr("sys.argv", ["notify.py", "--once", "--data-dir", client.data_dir])
+        assert notify.main() == 1
+        assert "already delivering" in capsys.readouterr().err
+        assert hook.received == []
+    finally:
+        loop.close()
+    assert deliver(client) == (1, 0)      # and the lock goes with its holder
+
+
+def test_the_loop_waits_for_the_notifier_it_replaces(client, monkeypatch, capsys):
+    old = notify.Dispatcher(client.data_dir)
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        if len(sleeps) == 2:
+            old.close()
+        if len(sleeps) == 4:
+            raise KeyboardInterrupt
+    looks = []
+    monkeypatch.setattr(notify.Dispatcher, "look", lambda self, now=None: looks.append(1))
+    monkeypatch.setattr(notify.time, "sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        notify.run_loop(client.data_dir)
+    assert len(looks) == 2
+    assert capsys.readouterr().out.count("another notifier still has") == 1
+
+
+def test_the_loop_says_so_when_the_data_dir_is_not_there_and_keeps_saying_it(
+        tmp_path, monkeypatch, capsys):
+    clock, sleeps = [0.0], []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += 25
+        if len(sleeps) == 6:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(notify.time, "sleep", sleep)
+    monkeypatch.setattr(notify.time, "monotonic", lambda: clock[0])
+    with pytest.raises(KeyboardInterrupt):
+        notify.run_loop(str(tmp_path / "dtaa-typo"))
+    out = capsys.readouterr().out
+    assert out.count("DOES NOT EXIST") == 2         # at 0s and at 75s: once a minute
+    capsys.readouterr()
+    sleeps.clear()
+    with pytest.raises(KeyboardInterrupt):
+        notify.run_loop(str(tmp_path))              # there, but the service has not been
+    assert "waiting for the service" in capsys.readouterr().out
+
+
+def test_what_could_not_be_written_is_remembered_per_database(client, hook, tmp_path):
+    """Notification 1 of one data directory is not notification 1 of another."""
+    with notify._UNRECORDED_LOCK:
+        notify._UNRECORDED[(str(tmp_path / "other" / "connectathon.db"), 1)] = notify.DELIVERED
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    hook.answer = 500
+    assert deliver(client) == (0, 1)
+    assert len(hook.received) == 1                  # asked, not assumed
+    assert get_sub(client, tok, sub_id)["status"] == "requested"
+    # Nor is it this database's to forget: there is no notification 7 here,
+    # and that says nothing about the one over there.
+    theirs = (str(tmp_path / "other" / "connectathon.db"), 7)
+    with notify._UNRECORDED_LOCK:
+        notify._UNRECORDED[theirs] = notify.DELIVERED
+    deliver(client)
+    assert theirs in notify._UNRECORDED
+
+
+def test_an_outcome_nobody_handles_is_refused_and_not_sent_again(
+        client, hook, monkeypatch, capsys):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    sent = []
+
+    def attempt(data_dir, row, private_ok):
+        sent.append(1)
+        return notify.Outcome("timeout", "no such kind")
+    monkeypatch.setattr(notify, "_attempt", attempt)
+    for _ in range(3):
+        assert deliver(client) == (0, 1)
+    assert len(sent) == 1                           # remembered, however it failed to write
+    out = capsys.readouterr().out
+    assert "COULD NOT BE WRITTEN DOWN" in out and "unknown outcome 'timeout'" in out
+
+
+def test_trouble_writing_gives_that_subscription_a_rest(client, hook, hook2, monkeypatch, capsys):
+    a, b = register(client, "Troubled"), register(client, "Fine")
+    subscribe(client, a, subscription(hook.url))
+    real = notify._record
+
+    def record(conn, row, outcome, now):
+        if row["id"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real(conn, row, outcome, now)
+    monkeypatch.setattr(notify, "_record", record)
+    dispatcher = notify.Dispatcher(client.data_dir)
+    try:
+        assert [t.result() for t in dispatcher.look()] == [(0, 1)]
+        assert dispatcher.resting[1][0] == 1
+        # A rest, not a retirement: bounded, and doubling with the count.
+        rest = dispatcher.resting[1][1] - time.monotonic()
+        assert 0 < rest <= min(notify.POLL * 2, notify.MAX_LOOP_BACKOFF)
+        subscribe(client, b, subscription(hook2.url))
+        # looked at again at once: the troubled one rests, the other does not wait for it
+        assert [t.result() for t in dispatcher.look()] == [(1, 0)]
+        dispatcher.resting[1] = (1, 0.0)            # rested
+        assert [t.result() for t in dispatcher.look()] == [(0, 1)]
+        assert dispatcher.resting[1][0] == 2
+        longer = dispatcher.resting[1][1] - time.monotonic()
+        assert rest < longer <= min(notify.POLL * 4, notify.MAX_LOOP_BACKOFF)
+        dispatcher.resting[1] = (20, time.monotonic())
+        assert [t.result() for t in dispatcher.look()] == [(0, 1)]
+        assert dispatcher.resting[1][1] - time.monotonic() <= notify.MAX_LOOP_BACKOFF
+        monkeypatch.setattr(notify, "_record", real)
+        dispatcher.resting[1] = (2, 0.0)
+        assert [t.result() for t in dispatcher.look()] == [(1, 0)]
+        assert 1 not in dispatcher.resting
+    finally:
+        dispatcher.close()
+    assert len(hook.received) == 1                  # sent once, through all of that
+
+
+def test_a_locked_database_is_not_called_a_bug(client, hook, monkeypatch, capsys):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+
+    def drain(*a, **k):
+        raise sqlite3.OperationalError("database is locked")
+    monkeypatch.setattr(notify, "_drain", drain)
+    assert deliver(client) == (0, 1)
+    out = capsys.readouterr().out
+    assert "DATABASE TROUBLE working on Subscription/1: database is locked" in out
+    assert "BUG" not in out and "Traceback" not in out
+
+
+def test_a_worker_that_never_started_does_not_leave_its_subscription_busy(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    dispatcher = notify.Dispatcher(client.data_dir)
+    real_submit, calls = dispatcher.pool.submit, []
+
+    def submit_once_broken(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("can't start new thread")
+        return real_submit(*a, **k)
+    dispatcher.pool.submit = submit_once_broken
+    try:
+        with pytest.raises(RuntimeError):
+            dispatcher.look()
+        assert dispatcher.busy == set()
+        assert [t.result() for t in dispatcher.look()] == [(1, 0)]
+    finally:
+        dispatcher.close()
+
+
+def test_an_endpoint_let_in_with_a_trailing_dot_is_one_that_can_be_delivered_to(
+        client, hook):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(hook.url.replace("127.0.0.1", "127.0.0.1.")))
+    assert res.status_code == 201
+    assert deliver(client) == (1, 0)
+
+
+def test_error_does_not_outlive_the_last_thing_being_retried(client, hook, monkeypatch):
+    """`error` means "still trying". The retry that finds the document gone is
+    written off, and with nothing queued behind it nothing is being tried."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    assert get_sub(client, tok, sub_id)["status"] == "error"
+    with db(client) as c:
+        slug, name = c.execute("SELECT t.slug, s.filename FROM submissions s "
+                               "JOIN teams t ON t.id = s.team_id").fetchone()
+    os.remove(os.path.join(client.data_dir, "submissions", slug, name))
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    # Not `error` any more, and told what became of the event all the same -
+    # until something gets through.
+    assert sub["status"] == "active"
+    assert sub["error"].startswith("Event 1 was not sent, and will not be:")
+    hook.answer = 200
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client, now + datetime.timedelta(seconds=7)) == (1, 0)
+    assert "error" not in get_sub(client, tok, sub_id)
+
+
+def test_giving_up_does_not_rewrite_why_an_ended_subscription_is_off(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    with notify.connect(client.data_dir) as conn:
+        row = conn.execute(notify.DUE + " ORDER BY n.id").fetchone()
+        conn.execute("UPDATE notifications SET attempts = ?", (len(notify.BACKOFF),))
+        conn.execute("UPDATE subscriptions SET status = 'off', error = 'Ended at X'")
+        conn.commit()
+        row = dict(row, attempts=len(notify.BACKOFF))
+        assert notify._record(conn, row, FAILED_500, now) == "gave up, subscription off"
+    assert get_sub(client, tok, sub_id)["error"] == "Ended at X"
+
+
+@pytest.mark.parametrize("sql", [
+    "UPDATE subscriptions SET status = 'Active'",
+    "UPDATE subscriptions SET content = 'everything'",
+    "UPDATE subscriptions SET events = -1",
+    "UPDATE notifications SET state = 'Pending'",
+    "UPDATE notifications SET kind = 'event'",
+    "UPDATE notifications SET attempts = -1",
+    "UPDATE notifications SET faults = -1",
+    "UPDATE notifications SET next_attempt = 'tomorrow'",
+    "UPDATE notifications SET next_attempt = '2026-11-18T10:02:11+00:00'",   # no microseconds
+    "UPDATE notifications SET event_number = 7 WHERE kind = 'handshake'",
+    "UPDATE notifications SET submission_id = NULL WHERE kind != 'handshake'",
+    "UPDATE notifications SET event_number = 1 WHERE kind != 'handshake'",   # twice the same
+])
+def test_the_schema_refuses_what_the_code_would_silently_mishandle(
+        client, hook, monkeypatch, sql):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+    with pytest.raises(sqlite3.IntegrityError):
+        with db(client) as c:
+            c.execute(sql)
+
+
+def test_everything_the_code_itself_writes_passes_the_schema(client, hook, monkeypatch):
+    """The other half of the above: handshake, event, retry, give-up, PUT, park."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    now = datetime.datetime.now(UTC)
+    for hours in range(len(notify.BACKOFF) + 1):
+        assert deliver(client, now + datetime.timedelta(hours=hours)) == (0, 1)
+    assert get_sub(client, tok, sub_id)["status"] == "off"
+    hook.answer = 200
+    assert client.put("/fhir/Subscription/" + sub_id, json=subscription(hook.url),
+                      headers=auth(tok)).status_code == 200
+    assert deliver(client) == (1, 0)
+    parked = subscription(hook.url, status="off")
+    assert client.put("/fhir/Subscription/" + sub_id, json=parked,
+                      headers=auth(tok)).json()["status"] == "off"
+
+
+@pytest.mark.parametrize("address", [
+    "2a00:1450:4001::5efe:a9fe:a9fe",          # ISATAP around 169.254.169.254
+    "2a00:1450:4001:0:200:5efe:7f00:1",        # and around 127.0.0.1, global-id form
+])
+def test_isatap_is_vetted_as_the_address_it_wraps(address):
+    with pytest.raises(notify.EndpointError):
+        notify.vet_address(address, False)
+
+
+# --------------------------------- what mutating the code showed nothing pinned
+
+
+# ---------------------------------------------------------------- _record
+
+def ended_under_a_flight(client, hook, monkeypatch):
+    """An event is in flight when the service, taking a later submission,
+    notices the subscription's `end` has passed and turns it off. The service
+    does not touch the queue, so the in-flight row is still pending."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, end="2099-01-01T00:00:00Z")
+    submit(client, tok, outcome(), monkeypatch)
+    conn, row = in_flight(client)
+    past = notify.stamp(datetime.datetime.now(UTC) - datetime.timedelta(seconds=1))
+    with db(client) as c:
+        c.execute("UPDATE subscriptions SET end_ts = ?", (past,))
+    submit(client, tok, outcome(), monkeypatch)
+    assert get_sub(client, tok, sub_id)["status"] == "off"
+    return tok, sub_id, conn, row
+
+
+def test_a_late_success_does_not_switch_an_ended_subscription_back_on(
+        client, hook, monkeypatch):
+    tok, sub_id, conn, row = ended_under_a_flight(client, hook, monkeypatch)
+    notify._record(conn, row, notify.DELIVERED, datetime.datetime.now(UTC))
+    conn.close()
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "off" and sub["error"].startswith("Ended at")
+
+
+def test_a_late_failure_does_not_overwrite_why_a_subscription_is_off(
+        client, hook, monkeypatch):
+    tok, sub_id, conn, row = ended_under_a_flight(client, hook, monkeypatch)
+    notify._record(conn, row, FAILED_500, datetime.datetime.now(UTC))
+    conn.close()
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "off" and sub["error"].startswith("Ended at"), sub
+
+
+def test_a_result_for_a_row_already_written_off_is_dropped(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    end = datetime.datetime.now(UTC) + datetime.timedelta(hours=1)
+    active_subscription(client, tok, hook, end=end.isoformat())
+    submit(client, tok, outcome(), monkeypatch)
+    conn, row = in_flight(client)
+    other = notify.connect(client.data_dir)
+    notify.expire(other, end + datetime.timedelta(seconds=1))
+    other.close()
+    assert notify._record(conn, row, FAILED_500, datetime.datetime.now(UTC)) == notify.DROPPED
+    conn.close()
+    with db(client) as c:
+        assert [tuple(r) for r in c.execute(
+            "SELECT state, attempts, error FROM notifications WHERE kind != 'handshake'"
+        )] == [("failed", 0, "subscription turned off")]
+
+
+def test_a_stale_result_does_not_move_a_retry_that_was_already_scheduled(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    conn, stale = in_flight(client)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    with db(client) as c:
+        before = tuple(c.execute("SELECT state, attempts, next_attempt FROM notifications "
+                                 "WHERE kind != 'handshake'").fetchone())
+    assert notify._record(conn, stale, FAILED_500,
+                          now + datetime.timedelta(hours=1)) == notify.DROPPED
+    assert notify._record(conn, stale, notify.DELIVERED, now) == notify.DROPPED
+    conn.close()
+    with db(client) as c:
+        assert tuple(c.execute("SELECT state, attempts, next_attempt FROM notifications "
+                               "WHERE kind != 'handshake'").fetchone()) == before
+
+
+def test_a_handshake_this_server_could_not_send_turns_the_subscription_off(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    monkeypatch.setattr(notify, "post",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    now = datetime.datetime.now(UTC)
+    for wait in (0,) + notify.TRANSIENT_BACKOFF:
+        assert get_sub(client, tok, sub_id)["status"] == "requested"
+        now += datetime.timedelta(seconds=wait + 1)
+        assert deliver(client, now=now) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "off"
+    assert "not your endpoint's doing" in sub["error"] and "PUT" in sub["error"]
+
+
+# ---------------------------------------------------------------- vetting
+
+@pytest.mark.parametrize("address, private_ok", [
+    # Teredo: server 169.254.169.254, client (xor ffff:ffff) 10.0.0.1
+    ("2001:0:a9fe:a9fe::f5ff:fffe", True),
+    # Teredo: public server, client (xor) 169.254.169.254
+    ("2001:0:5db8:d822::5601:5601", True),
+    ("64:ff9b:1::a9fe:a9fe", True),            # NAT64 local-use prefix, RFC 8215
+    ("64:ff9b:1::7f00:1", False),
+    ("fd00:ec2::1", True),                     # the /32, not one address in it
+    ("2002:a83f:8110::1", True),               # 6to4 of Azure's 168.63.129.16
+    ("64:ff9b::6464:64c8", True),              # NAT64 of Alibaba's 100.100.100.200
+])
+def test_wrapped_and_never_addresses_the_matrix_left_out(address, private_ok):
+    with pytest.raises(notify.EndpointError):
+        notify.vet_address(address, private_ok)
+
+
+def test_a_name_server_that_never_answers_is_given_up_on(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(notify.socket, "getaddrinfo",
+                        lambda *a, **k: release.wait(5) and [])
+    started = time.monotonic()
+    try:
+        # Within the resolver's share of the attempt, not the whole of it: the
+        # rest was the endpoint's, had the name come back.
+        with pytest.raises(notify.ServerTrouble, match="looked up within 0.1s"):
+            notify.post("http://slow-dns.example.org/h", b"{}", [], False, timeout=0.2)
+    finally:
+        release.set()
+    assert time.monotonic() - started < 2
+
+
+# ---------------------------------------------------------------- post()
+
+def test_the_connect_itself_is_bounded_and_https_means_443(monkeypatch):
+    seen = []
+
+    def refuse(address, timeout=None, *a, **k):
+        seen.append((address, timeout))
+        raise ConnectionRefusedError("refused")
+    monkeypatch.setattr(notify.socket, "create_connection", refuse)
+    monkeypatch.setattr(notify.socket, "getaddrinfo", lambda *a, **k: [
+        (None, None, None, "", ("93.184.216.34", 0))])
+    for url, port in (("https://hook.example.org/h", 443), ("http://hook.example.org/h", 80),
+                      ("https://hook.example.org:8443/h", 8443)):
+        with pytest.raises(notify.DeliveryError, match="could not reach"):
+            notify.post(url, b"{}", [], False, timeout=3)
+        address, timeout = seen.pop()
+        assert address == ("93.184.216.34", port)
+        assert timeout is not None and 0 < timeout <= 3
+
+
+@pytest.mark.parametrize("answer", [401, 404, 410, 429])
+def test_a_4xx_is_not_a_delivery(client, hook, answer):
+    tok = register(client, "Subscriber")
+    hook.answer = answer
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    assert deliver(client) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "requested" and "answered %d" % answer in sub["error"]
+
+
+def test_the_timer_does_not_outlive_the_attempt(hook):
+    before = {t for t in threading.enumerate() if isinstance(t, threading.Timer)}
+    assert notify.post(hook.url, b"{}", [], True, timeout=5) == 200
+    time.sleep(0.05)
+    assert [t for t in threading.enumerate()
+            if isinstance(t, threading.Timer) and t not in before and t.is_alive()] == []
+
+
+def test_a_long_error_is_cut_to_a_sentence(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    monkeypatch.setattr(notify, "post", lambda *a, **k: (_ for _ in ()).throw(
+        notify.DeliveryError("x" * 5000)))
+    deliver(client)
+    assert len(get_sub(client, tok, sub_id)["error"]) == notify.MAX_ERROR_CHARS
+
+
+# ---------------------------------------------------------------- resources
+
+def test_status_says_why_a_subscription_is_in_trouble(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    hook.answer = 500
+    submit(client, tok, outcome(), monkeypatch)
+    deliver(client)
+    res = client.get("/fhir/Subscription/%s/$status" % sub_id, headers=auth(tok)).json()
+    flat = {p["name"]: _part_value(p) for p in res["entry"][0]["resource"]["parameter"]}
+    assert flat["status"] == "error"
+    assert "answered 500" in json.dumps(flat["error"])
+
+
+def test_the_notification_is_shaped_as_the_backport_says(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    deliver(client)
+    first, focus = hook.received[0][2]["entry"]
+    assert first["request"] == {
+        "method": "GET",
+        "url": "http://testserver/fhir/Subscription/%s/$status" % sub_id}
+    assert first["response"] == {"status": "200"}
+    assert first["fullUrl"] == "urn:uuid:" + first["resource"]["id"]
+    assert focus["request"] == {"method": "POST", "url": "Bundle"}
+
+
+def test_a_submission_that_is_gone_is_written_off_not_sent_as_none(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:
+        c.execute("PRAGMA foreign_keys = OFF")
+        c.execute("DELETE FROM submissions")
+    assert deliver(client) == (0, 1)
+    assert hook.received == []
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+    with db(client) as c:
+        assert "no longer exists" in c.execute(
+            "SELECT error FROM notifications WHERE state = 'failed'").fetchone()[0]
+
+
+# ---------------------------------------------------------------- dispatcher
+
+def test_the_loops_dispatcher_comes_back_to_a_subscription(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    dispatcher = notify.Dispatcher(client.data_dir)
+    try:
+        for n in ("1", "2"):
+            submit(client, tok, outcome(), monkeypatch)
+            assert [t.result() for t in dispatcher.look()] == [(1, 0)]
+            assert hook.statuses()[-1]["notification-event"]["event-number"] == n
+        assert dispatcher.busy == set()
+        # ...and after a worker that blew up, too
+        monkeypatch.setattr(notify, "_drain",
+                            lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+        submit(client, tok, outcome(), monkeypatch)
+        assert [t.result() for t in dispatcher.look()] == [(0, 1)]
+        assert dispatcher.busy == set()
+    finally:
+        dispatcher.close()
+
+
+def test_a_slow_backlog_is_left_for_the_next_look(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    for _ in range(3):
+        submit(client, tok, outcome(), monkeypatch)
+    monkeypatch.setattr(notify, "DRAIN_BUDGET", 0.05)
+    hook.delay = 0.1
+    assert deliver(client) == (1, 0)
+    assert deliver(client) == (1, 0)
+
+
+def test_a_subscription_turned_off_under_a_listed_queue_is_not_sent_to(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, end="2099-01-01T00:00:00Z")
+    submit(client, tok, outcome(), monkeypatch)
+    real = notify.due_queues
+
+    def listed_then_ended(*args):
+        queues = real(*args)
+        with db(client) as c:
+            c.execute("UPDATE subscriptions SET status = 'off'")
+        return queues
+    monkeypatch.setattr(notify, "due_queues", listed_then_ended)
+    assert deliver(client) == (0, 0)
+    assert hook.received == []
+    assert get_sub(client, tok, sub_id)["status"] == "off"
+
+
+def test_the_loop_never_waits_longer_than_its_cap(tmp_path, monkeypatch):
+    sleeps = []
+
+    def look(self, now=None):
+        if len(sleeps) == 8:
+            raise KeyboardInterrupt
+        raise sqlite3.OperationalError("disk full")
+    monkeypatch.setattr(notify, "_has_tables", lambda d: True)
+    monkeypatch.setattr(notify.Dispatcher, "look", look)
+    monkeypatch.setattr(notify.time, "sleep", sleeps.append)
+    monkeypatch.setattr(notify, "log", lambda m: None)
+    with pytest.raises(KeyboardInterrupt):
+        notify.run_loop(str(tmp_path))
+    assert max(sleeps) == notify.MAX_LOOP_BACKOFF
+
+
+def test_the_loop_does_not_look_at_a_database_without_the_tables(tmp_path, monkeypatch, capsys):
+    sleeps = []
+
+    def sleep(s):
+        sleeps.append(s)
+        if len(sleeps) == 3:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(notify.time, "sleep", sleep)
+    with pytest.raises(KeyboardInterrupt):
+        notify.run_loop(str(tmp_path))
+    out = capsys.readouterr().out
+    assert out.count("waiting for the service") == 1 and "LOOK FAILED" not in out
+    assert sleeps == [notify.POLL] * 3
+
+
+def test_once_is_red_when_something_was_given_up_on_or_written_off(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:
+        c.execute("PRAGMA foreign_keys = OFF")
+        c.execute("DELETE FROM submissions")          # -> a `server` write-off
+    monkeypatch.setattr("sys.argv", ["notify.py", "--once", "--data-dir", client.data_dir])
+    assert notify.main() == 1
+    assert notify.main() == 0                          # nothing left, nothing wrong
+
+
+def test_once_against_the_wrong_directory_is_red(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["notify.py", "--once", "--data-dir", str(tmp_path)])
+    assert notify.main() == 1
+    assert "no subscription tables" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------- app.py
+
+@pytest.mark.parametrize("claimed", ["active", "error", "entered-in-error", None, 5])
+def test_nobody_talks_a_subscription_active(client, hook, monkeypatch, claimed):
+    tok = register(client, "Subscriber")
+    body = subscription(hook.url, status=claimed)
+    res = subscribe(client, tok, body)
+    assert res.status_code == 201 and res.json()["status"] == "requested"
+    put = client.put("/fhir/Subscription/" + res.json()["id"], json=body, headers=auth(tok))
+    assert put.json()["status"] == "requested"
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (1, 0)
+    assert [s["type"] for s in hook.statuses()] == ["handshake"]
+
+
+def test_a_subscription_not_yet_shaken_has_nothing_queued_for_it(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    submit(client, tok, outcome(), monkeypatch)
+    assert deliver(client) == (1, 0)
+    assert [s["type"] for s in hook.statuses()] == ["handshake"]
+    with db(client) as c:
+        assert c.execute("SELECT events FROM subscriptions").fetchone()[0] == 0
+
+
+def test_search_by_url_and_status_narrows(client, hook, hook2):
+    tok = register(client, "Subscriber")
+    subscribe(client, tok, subscription(hook.url))
+    subscribe(client, tok, subscription(hook2.url, status="off"))
+
+    def found(**params):
+        res = client.get("/fhir/Subscription", params=params, headers=auth(tok)).json()
+        return [e["resource"]["channel"]["endpoint"] for e in res.get("entry", [])]
+    assert found() == [hook.url, hook2.url]
+    assert found(url=hook2.url) == [hook2.url]
+    assert found(url="https://nobody.example.org/") == []
+    assert found(status="off") == [hook2.url]
+    assert found(status="requested,off") == [hook.url, hook2.url]
+
+
+def test_a_subscription_reads_back_as_it_was_written(client, hook):
+    tok = register(client, "Subscriber")
+    body = subscription(hook.url, filters=["Bundle?organization=acme", "document-type=eps"],
+                        reason="because")
+    body["channel"]["header"] = ["X-%d: v" % i for i in range(app_module.MAX_SUBSCRIPTION_HEADERS)]
+    res = subscribe(client, tok, body)
+    assert res.status_code == 201, res.text
+    back = get_sub(client, tok, res.json()["id"])
+    assert back["channel"]["header"] == body["channel"]["header"]
+    assert back["_criteria"] == body["_criteria"]
+    assert back["reason"] == "because" and back["criteria"] == body["criteria"]
+    # ...and what reads back can be PUT back
+    assert client.put("/fhir/Subscription/" + back["id"], json=back,
+                      headers=auth(tok)).status_code == 200
+    body["channel"]["header"].append("X-one-too-many: v")
+    assert subscribe(client, tok, body).status_code == 400
+
+
+def test_a_forged_host_header_does_not_end_up_in_the_links(client, hook):
+    tok = register(client, "Subscriber")
+    client.post("/fhir/Subscription", json=subscription(hook.url),
+                headers={"Authorization": "Bearer " + tok,
+                         "Host": "evil.example.org/x?y=<script>"})
+    deliver(client)
+    assert hook.statuses()[0]["subscription"]["reference"].startswith(
+        "http://testserver/fhir/Subscription/")
+
+
+def test_two_creates_at_once_do_not_both_take_the_last_place(client, monkeypatch):
+    """The COUNT and the INSERT are microseconds apart, and eight threads at a
+    barrier do not land in that window by themselves - so the first COUNT is
+    made to sit in it. BEGIN IMMEDIATE is what keeps the others out."""
+    monkeypatch.setattr(app_module, "MAX_SUBSCRIPTIONS", 1)
+    tok = register(client, "Subscriber")
+    gate = threading.Barrier(8, timeout=5)
+    codes = []
+    counted = threading.Event()
+
+    class Interleaved(sqlite3.Connection):
+        def execute(self, sql, *a):
+            cur = super().execute(sql, *a)
+            if sql.startswith("SELECT COUNT(*) FROM subscriptions") and not counted.is_set():
+                counted.set()
+                time.sleep(0.5)     # the other seven COUNT now - or wait
+            return cur
+
+    def connect():
+        conn = sqlite3.connect(app_module.db_path(), timeout=30, factory=Interleaved)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+    monkeypatch.setattr(app_module, "connect", connect)
+
+    def create():
+        try:
+            gate.wait()
+        except threading.BrokenBarrierError:
+            pass
+        codes.append(subscribe(client, tok, subscription("https://example.org/h")).status_code)
+    threads = [threading.Thread(target=create) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(codes) == [201] + [422] * 7
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM subscriptions").fetchone()[0] == 1
+
+
+def test_the_metadata_says_what_can_be_done_with_a_subscription(client):
+    cs = client.get("/fhir/metadata").json()
+    sub = next(r for r in cs["rest"][0]["resource"] if r["type"] == "Subscription")
+    assert [i["code"] for i in sub["interaction"]] == [
+        "read", "search-type", "create", "update", "delete"]
+    assert [p["name"] for p in sub["searchParam"]] == ["url", "status"]
+    assert sub["supportedProfile"] == [notify.SUBSCRIPTION_PROFILE]
+
+
+# ---------------------------------------------------------------- added after the first run
+
+def test_what_the_service_left_queued_for_an_ended_subscription_is_written_off(
+        client, hook, monkeypatch):
+    tok, sub_id, conn, row = ended_under_a_flight(client, hook, monkeypatch)
+    conn.close()
+    hook.received.clear()
+    assert deliver(client) == (0, 0) and hook.received == []
+    with db(client) as c:
+        assert [tuple(r) for r in c.execute(
+            "SELECT state, error FROM notifications WHERE kind != 'handshake'"
+        )] == [("failed", "subscription turned off")]
+
+
+def test_the_retry_schedule_is_the_documented_one():
+    assert notify.BACKOFF == (5, 30, 120, 600, 1800)
+    assert notify.HANDSHAKE_BACKOFF == (5, 30)
+    assert notify.TRANSIENT_BACKOFF == (5, 30, 120)
+    assert 42 * 60 < sum(notify.BACKOFF) < 44 * 60
+
+
+def test_a_remembered_result_goes_when_its_row_does(client, hook, monkeypatch):
+    monkeypatch.setattr(notify, "_UNRECORDED", {})
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    conn, row = in_flight(client)
+    key = (notify._database(conn), row["notification_id"])
+    conn.close()
+    notify._UNRECORDED[key] = notify.DELIVERED
+    assert client.delete("/fhir/Subscription/" + sub_id, headers=auth(tok)).status_code == 204
+    assert deliver(client) == (0, 0)
+    assert notify._UNRECORDED == {}
+
+
+def test_an_answer_that_never_ends_is_not_read_to_its_end():
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def stream():
+        conn, _ = srv.accept()
+        try:
+            conn.recv(65536)
+            conn.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+            for _ in range(300):              # 3 s, ~19 MB
+                conn.sendall(b"x" * 65536)
+                time.sleep(0.01)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    threading.Thread(target=stream, daemon=True).start()
+    started = time.monotonic()
+    try:
+        assert notify.post("http://127.0.0.1:%d/h" % srv.getsockname()[1], b"{}", [],
+                           private_ok=True, timeout=2) == 200
+    finally:
+        srv.close()
+    assert time.monotonic() - started < 1
+
+
+def test_a_queue_that_cannot_even_be_read_never_costs_the_team_its_submission(
+        client, monkeypatch, capsys):
+    tok = register(client, "Producer")
+    real = sqlite3.Connection.execute
+
+    class Flaky(sqlite3.Connection):
+        def execute(self, sql, *a):
+            if "FROM subscriptions" in sql and sql.lstrip().startswith("SELECT id, filters"):
+                raise sqlite3.OperationalError("no such table: subscriptions")
+            return real(self, sql, *a)
+
+    def connect():
+        conn = sqlite3.connect(os.path.join(client.data_dir, "connectathon.db"),
+                               timeout=30, factory=Flaky)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+    monkeypatch.setattr(app_module, "connect", connect)
+    res = submit(client, tok, outcome(), monkeypatch)
+    assert res.status_code == 200 and res.headers["X-Pass"] == "true"
+    assert "could not queue notifications for submission" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("head", [
+    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+    b"HTTP/1.0 200 OK\r\n\r\n",          # what http.server and many small frameworks say
+])
+def test_a_body_dripped_after_prompt_headers_is_cut_off_at_the_deadline(head):
+    """The existing drip test drips the *status line and headers*. Drip the
+    body instead, on a response that closes the connection: http.client then
+    sets conn.sock to None inside getresponse(), cut_off() finds nothing to
+    shut down, and resp.read(64 KiB) runs for as long as the endpoint keeps
+    each recv inside the socket timeout - 64 KiB at a byte per 9 s is a week
+    of one worker, and sixteen of those are the pool."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+
+    def drip():
+        conn, _ = srv.accept()
+        try:
+            conn.recv(65536)
+            conn.sendall(head)
+            for _ in range(40):               # 4 s
+                time.sleep(0.1)
+                conn.sendall(b"x")
+        except OSError:
+            pass
+        finally:
+            conn.close()
+    threading.Thread(target=drip, daemon=True).start()
+    started = time.monotonic()
+    try:
+        try:
+            notify.post("http://127.0.0.1:%d/h" % srv.getsockname()[1], b"{}", [],
+                        private_ok=True, timeout=0.5)
+        except notify.DeliveryError:
+            pass                              # 200 or "did not answer": either is defensible
+    finally:
+        srv.close()
+    assert time.monotonic() - started < 1.5
+
+
+class Dripper:
+    """A TCP proxy that passes what the client says straight on, and what the
+    server says a byte at a time with pace(bytes so far) seconds before each -
+    every recv() well inside any socket timeout, and the whole of it as slow
+    as it likes."""
+
+    def __init__(self, to_port, pace):
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]
+        self.to_port, self.pace = to_port, pace
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        try:
+            client, _ = self.srv.accept()
+            server = socket.create_connection(("127.0.0.1", self.to_port))
+        except OSError:
+            return
+
+        def up():
+            try:
+                while data := client.recv(65536):
+                    server.sendall(data)
+            except OSError:
+                pass
+        threading.Thread(target=up, daemon=True).start()
+        passed = 0
+        try:
+            while byte := server.recv(1):
+                wait = self.pace(passed)
+                if wait:
+                    time.sleep(wait)
+                client.sendall(byte)
+                passed += 1
+        except OSError:
+            pass
+        finally:
+            client.close()
+            server.close()
+
+    def close(self):
+        self.srv.close()
+
+
+class SlowTLSHook:
+    """Answers over TLS a header line at a time. (Dripping bytes will not do
+    here: a TLS record is read whole or not at all, within the socket timeout,
+    so it takes an endpoint that writes small records slowly.)"""
+
+    def __init__(self, pki, every=0.2, lines=30):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(pki / "leaf.pem", pki / "leaf.key")
+        self.srv = socket.socket()
+        self.srv.bind(("127.0.0.1", 0))
+        self.srv.listen(1)
+        self.port = self.srv.getsockname()[1]
+        self.asked = threading.Event()
+
+        def serve():
+            try:
+                raw, _ = self.srv.accept()
+                conn = ctx.wrap_socket(raw, server_side=True)
+                conn.recv(65536)
+                self.asked.set()
+                conn.sendall(b"HTTP/1.1 200 OK\r\n")
+                for n in range(lines):
+                    time.sleep(every)
+                    conn.sendall(b"X-Thinking-%d: still here\r\n" % n)
+                conn.sendall(b"Content-Length: 0\r\n\r\n")
+            except OSError:
+                pass
+        threading.Thread(target=serve, daemon=True).start()
+
+    def close(self):
+        self.srv.close()
+
+
+def test_a_deadline_that_falls_inside_the_tls_handshake_still_holds(pki, monkeypatch):
+    """Wrapping a socket for TLS takes the descriptor away from the plain one,
+    so a deadline that shuts down *that* one during the handshake shuts down
+    nothing - and it only fires once. The handshake has a budget of its own,
+    counted from after the connect: so a connect stretched to most of the
+    deadline (drop a SYN or two), a handshake that ends just after it, and
+    then an answer a line at a time, held a worker for as long as it liked."""
+    example_org_is_loopback(monkeypatch)
+    monkeypatch.setattr(notify, "_TLS", ssl.create_default_context(cafile=pki / "ca.pem"))
+    endpoint = SlowTLSHook(pki)                                   # six seconds of answer
+    slow = Dripper(endpoint.port, lambda passed: 0.003 if passed < 100 else 0)
+    real = socket.create_connection
+
+    def stretched(address, *a, **k):
+        if address[1] == slow.port:
+            time.sleep(0.4)
+        return real(address, *a, **k)
+    monkeypatch.setattr(notify.socket, "create_connection", stretched)
+    started = time.monotonic()
+    try:
+        with pytest.raises(notify.DeliveryError, match="within 0.5s"):
+            notify.post("https://hook.example.org:%d/h" % slow.port, b"{}", [],
+                        private_ok=True, timeout=0.5)
+    finally:
+        slow.close()
+        endpoint.close()
+    assert time.monotonic() - started < 1.5
+
+
+def test_an_https_answer_a_line_at_a_time_is_cut_off_at_the_deadline(pki, monkeypatch):
+    """The cut made under a thread that is reading through OpenSSL rather than
+    from a socket. What is asserted is when it returns, not what: the status
+    line was in, and http.client reads the cut as the end of the headers, so
+    this is the 200 the endpoint said it was."""
+    example_org_is_loopback(monkeypatch)
+    monkeypatch.setattr(notify, "_TLS", ssl.create_default_context(cafile=pki / "ca.pem"))
+    endpoint = SlowTLSHook(pki)
+    started = time.monotonic()
+    try:
+        assert notify.post("https://hook.example.org:%d/h" % endpoint.port, b"{}", [],
+                           private_ok=True, timeout=0.5) == 200
+    finally:
+        endpoint.close()
+    assert time.monotonic() - started < 1.5
+    assert endpoint.asked.is_set()
+
+
+def test_names_that_never_resolve_hold_up_nobody_elses_lookup(monkeypatch):
+    """getaddrinfo cannot be cancelled. A fixed pool of resolver threads is
+    used up by as many names that hang, and everybody else's lookups then queue
+    behind them until the process is restarted."""
+    monkeypatch.setattr(notify, "_LOOKUPS", {})
+    real, release = socket.getaddrinfo, threading.Event()
+
+    def getaddrinfo(host, *a, **k):
+        if host.startswith("hangs"):
+            release.wait(10)
+            raise socket.gaierror(socket.EAI_NONAME, "released")
+        return real(host, *a, **k)
+    monkeypatch.setattr(notify.socket, "getaddrinfo", getaddrinfo)
+
+    def hung(i):
+        with pytest.raises(notify.Unresolved):
+            notify.resolve_endpoint("http://hangs%d.example/h" % i, True, 0.2)
+    try:
+        askers = [threading.Thread(target=hung, args=(i,))
+                  for i in range(2 * notify.WORKERS)]
+        [t.start() for t in askers]
+        [t.join() for t in askers]
+        started = time.monotonic()
+        assert notify.resolve_endpoint("http://localhost:1/h", True, 2)[1] in ("127.0.0.1", "::1")
+        assert time.monotonic() - started < 1
+
+        # Retried, a name that hangs is waited on again rather than looked up
+        # again: one abandoned thread a name, however long it goes on.
+        resolving = lambda: [t for t in threading.enumerate()
+                             if t.name.startswith("resolve hangs")]
+        before = len(resolving())
+        assert before == 2 * notify.WORKERS
+        for _ in range(3):
+            hung(0)
+        assert len(resolving()) == before
+        # And abandoned is all they are: nothing waits for them at exit, which
+        # is what kept `--once` from ever returning to cron.
+        assert all(t.daemon for t in resolving())
+    finally:
+        release.set()
+    wait_for(lambda: not notify._LOOKUPS, 2)
+    assert notify._LOOKUPS == {}
+
+
+def test_a_lookup_answers_everyone_who_was_waiting_on_it(monkeypatch):
+    monkeypatch.setattr(notify, "_LOOKUPS", {})
+    calls, release, waiting = [], threading.Event(), []
+
+    def getaddrinfo(host, *a, **k):
+        calls.append(host)
+        release.wait(5)
+        return [(None, None, None, "", ("93.184.216.34", 0))]
+    monkeypatch.setattr(notify.socket, "getaddrinfo", getaddrinfo)
+
+    # Released only once all four are waiting on the one lookup: let go as
+    # soon as the first has asked, an asker still on its way in finds the
+    # answer gone and asks again - a race, not the sharing under test.
+    class Counted(threading.Event):
+        def wait(self, timeout=None):
+            waiting.append(1)
+            return super().wait(timeout)
+
+    class Lookup(notify._Lookup):
+        def __init__(self):
+            super().__init__()
+            self.done = Counted()
+    monkeypatch.setattr(notify, "_Lookup", Lookup)
+    got = []
+    askers = [threading.Thread(target=lambda: got.append(
+        notify.resolve_endpoint("http://hook.example.org/h", False, 5)[1]))
+        for _ in range(4)]
+    [t.start() for t in askers]
+    wait_for(lambda: len(waiting) == 4, 2)
+    release.set()
+    [t.join() for t in askers]
+    assert got == ["93.184.216.34"] * 4 and calls == ["hook.example.org"]
+    # And the next one asks afresh: an answer is shared, not cached.
+    notify.resolve_endpoint("http://hook.example.org/h", False, 5)
+    assert len(calls) == 2
+
+
+def test_each_subscription_is_sent_its_own_headers_and_nobody_elses(
+        client, hook, hook2, monkeypatch):
+    tok = register(client, "Subscriber")
+    other = register(client, "Other Subscriber")
+    for who, where, secret in ((tok, hook, "Bearer one"), (other, hook2, "Bearer two")):
+        body = subscription(where.url)
+        body["channel"]["header"] = ["Authorization: " + secret]
+        assert subscribe(client, who, body).status_code == 201
+    deliver(client)
+    submit(client, tok, outcome(), monkeypatch)
+    deliver(client)
+    for where, secret in ((hook, "Bearer one"), (hook2, "Bearer two")):
+        assert len(where.received) == 2
+        assert {r[1].get("Authorization") for r in where.received} == {secret}
+
+
+def test_a_stale_result_does_not_move_a_retry_of_our_own_trouble_either(
+        client, hook, monkeypatch):
+    """The row guard's `faults = ?`: after our own trouble `attempts` has not
+    moved, so that clause is all that tells a stale reader from a fresh one."""
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    conn, stale = in_flight(client)
+    now = datetime.datetime.now(UTC)
+    other = notify.connect(client.data_dir)
+    assert notify._record(other, stale, notify.Outcome("transient", "resolver"),
+                          now).startswith("NOT SENT")
+    other.close()
+    assert notify._record(conn, stale, notify.DELIVERED, now) == notify.DROPPED
+    conn.close()
+    with db(client) as c:
+        assert [tuple(r) for r in c.execute(
+            "SELECT state, attempts, faults FROM notifications "
+            "WHERE kind != 'handshake'")] == [("pending", 0, 1)]
+
+
+def test_a_connection_made_after_the_deadline_is_cut_as_it_is_made():
+    """The deadline can pass while the socket is still being made - a connect
+    that took all of it - and there is then nothing to cut until there is."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    conn = notify._PinnedHTTPConnection("127.0.0.1", srv.getsockname()[1],
+                                        ["127.0.0.1"], 2)
+    try:
+        conn.cut()
+        conn.connect()
+        theirs, _ = srv.accept()
+        theirs.settimeout(2)
+        assert theirs.recv(1) == b""                # shut down, not merely idle
+        theirs.close()
+    finally:
+        conn.close()
+        srv.close()
+
+
+def test_the_tls_socket_is_held_before_it_is_shaken(monkeypatch):
+    """wrap_socket() that handshakes by itself returns only once that is done,
+    and until then the only socket anybody holds is the plain one it has taken
+    the descriptor from - nothing a deadline can cut."""
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    conn = notify._PinnedHTTPSConnection("hook.example.org", srv.getsockname()[1],
+                                         ["127.0.0.1"], 2)
+    seen = {}
+
+    class Wrapped:
+        def do_handshake(self):
+            seen["held"] = conn._held is self
+
+        def close(self):
+            pass
+
+    class Context:
+        def wrap_socket(self, sock, **kwargs):
+            seen.update(kwargs)
+            sock.close()
+            return Wrapped()
+    monkeypatch.setattr(notify, "_TLS", Context())
+    try:
+        conn.connect()
+    finally:
+        srv.close()
+    assert seen == {"server_hostname": "hook.example.org",
+                    "do_handshake_on_connect": False, "held": True}
+
+
+def test_a_submission_that_went_with_its_transaction_is_not_answered_200(
+        client, hook, monkeypatch):
+    """Some failures (a full disk, an I/O error) make SQLite roll back the whole
+    transaction rather than the statement. Awkward to provoke honestly, so the
+    shape of it is: the transaction gone from under the savepoint, then the
+    error. Swallowed like any other queueing failure, that was a 200 and a
+    Bundle id for a submission that does not exist."""
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook)
+    made = []
+    real_connect, real_match = app_module.connect, app_module.filters_match
+    monkeypatch.setattr(app_module, "connect",
+                        lambda: made.append(real_connect()) or made[-1])
+
+    def aborted(*a):
+        made[-1].execute("ROLLBACK")
+        raise sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(app_module, "filters_match", aborted)
+    with pytest.raises(sqlite3.OperationalError, match="rolled back"):
+        submit(client, tok, outcome(), monkeypatch)
+    monkeypatch.setattr(app_module, "filters_match", real_match)
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM submissions").fetchone()[0] == 0
+    assert pending(client) == 0
+
+
+def test_nor_is_one_that_went_while_the_subscriptions_were_being_read(
+        client, monkeypatch):
+    """The same, one statement earlier: before there is a subscription to loop
+    over, which used to be a way out that skipped the check."""
+    tok = register(client, "Subscriber")
+    real = app_module.enqueue_notifications
+
+    class Aborting:
+        def __init__(self, conn):
+            self.conn = conn
+        in_transaction = property(lambda self: self.conn.in_transaction)
+
+        def execute(self, sql, *args):
+            if "FROM subscriptions" in sql:
+                self.conn.execute("ROLLBACK")
+                raise sqlite3.OperationalError("disk I/O error")
+            return self.conn.execute(sql, *args)
+    monkeypatch.setattr(app_module, "enqueue_notifications",
+                        lambda conn, *a: real(Aborting(conn), *a))
+    with pytest.raises(sqlite3.OperationalError, match="rolled back"):
+        submit(client, tok, outcome(), monkeypatch)
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM submissions").fetchone()[0] == 0
+
+
+
+
+# ------------------------------ what a write to one leaves of the others
+
+# Every WHERE id = ? in both programs, turned into one that is always true,
+# used to pass the whole suite: what happens to the subscription acted on was
+# pinned everywhere, and that nobody else's moved, nowhere.
+
+def _bystander(client, hook2, monkeypatch):
+    """Another company's healthy subscription with one event still queued."""
+    tok = register(client, "Bystander")
+    body = subscription(hook2.url, filters=["organization=bystander"])
+    body["channel"]["header"] = ["Authorization: Bearer bystander-secret"]
+    res = subscribe(client, tok, body)
+    assert deliver(client)[0] >= 1
+    submit(client, tok, outcome(), monkeypatch)
+    hook2.received.clear()
+    return tok, res.json()["id"]
+
+
+def _snapshot(client, sub_id):
+    with db(client) as c:
+        return (tuple(c.execute("SELECT * FROM subscriptions WHERE id = ?", (sub_id,)).fetchone()),
+                [tuple(r) for r in c.execute(
+                    "SELECT id, state, attempts, faults, error FROM notifications "
+                    "WHERE subscription_id = ? ORDER BY id", (sub_id,))])
+
+
+def test_put_touches_nobody_elses_subscription_or_queue(client, hook, hook2, monkeypatch):
+    theirs_tok, theirs = _bystander(client, hook2, monkeypatch)
+    mine = register(client, "Mine")
+    mine_id = subscribe(client, mine, subscription(hook.url)).json()["id"]
+    before = _snapshot(client, theirs)
+    assert client.put("/fhir/Subscription/" + mine_id, json=subscription(hook.url, content="empty"),
+                      headers=auth(mine)).status_code == 200
+    assert _snapshot(client, theirs) == before
+    deliver(client)
+    assert [event_number(r) for r in hook2.received if len(r[2]["entry"][0]["resource"]["parameter"]) > 5] == ["1"]
+
+
+def test_delete_touches_nobody_elses_subscription(client, hook, hook2, monkeypatch):
+    theirs_tok, theirs = _bystander(client, hook2, monkeypatch)
+    mine = register(client, "Mine")
+    mine_id = subscribe(client, mine, subscription(hook.url)).json()["id"]
+    before = _snapshot(client, theirs)
+    assert client.delete("/fhir/Subscription/" + mine_id, headers=auth(mine)).status_code == 204
+    assert _snapshot(client, theirs) == before
+
+
+def test_giving_up_on_one_subscription_touches_nobody_elses(client, hook, hook2, monkeypatch):
+    mine = register(client, "Mine")
+    active_subscription(client, mine, hook, filters=["organization=mine"])
+    theirs_tok, theirs = _bystander(client, hook2, monkeypatch)
+    submit(client, mine, outcome(), monkeypatch)
+    before = _snapshot(client, theirs)
+    with db(client) as c:
+        c.execute("UPDATE notifications SET attempts = ? WHERE state = 'pending' "
+                  "AND subscription_id != ?", (len(notify.BACKOFF), theirs))
+    conn = notify.connect(client.data_dir)
+    row = [q[0] for q in notify.due_queues(conn, datetime.datetime.now(UTC)) if q[0]["id"] != int(theirs)][0]
+    assert notify._record(conn, row, FAILED_500, datetime.datetime.now(UTC)) == "gave up, subscription off"
+    conn.close()
+    assert _snapshot(client, theirs) == before
+
+
+def test_a_handshake_written_off_touches_nobody_elses(client, hook, hook2, monkeypatch):
+    theirs_tok, theirs = _bystander(client, hook2, monkeypatch)
+    mine = register(client, "Mine")
+    subscribe(client, mine, subscription(hook.url))
+    before = _snapshot(client, theirs)
+    conn = notify.connect(client.data_dir)
+    row = [q[0] for q in notify.due_queues(conn, datetime.datetime.now(UTC)) if q[0]["kind"] == "handshake"][0]
+    assert notify._record(conn, row, notify.Outcome("server", "x"), datetime.datetime.now(UTC)).startswith("WRITTEN OFF")
+    conn.close()
+    assert _snapshot(client, theirs) == before
+
+
+def test_one_subscription_ending_ends_nobody_elses(client, hook, hook2, monkeypatch):
+    mine = register(client, "Mine")
+    mine_id = active_subscription(client, mine, hook, end="2099-01-01T00:00:00Z",
+                                  filters=["organization=mine"])
+    theirs_tok, theirs = _bystander(client, hook2, monkeypatch)
+    past = notify.stamp(datetime.datetime.now(UTC) - datetime.timedelta(seconds=1))
+    with db(client) as c:
+        c.execute("UPDATE subscriptions SET end_ts = ? WHERE id = ?", (past, mine_id))
+    submit(client, mine, outcome(), monkeypatch)       # bystander filters on its own slug
+    assert get_sub(client, mine, mine_id)["status"] == "off"
+    assert get_sub(client, theirs_tok, theirs)["status"] == "active"
+
+
+def test_a_stored_filter_that_no_longer_parses_matches_nothing():
+    for broken in (["patient=123"], ["Encounter?organization=acme"], ["organization="], [5]):
+        with pytest.raises(app_module.StaleFilter):
+            app_module.filters_match(broken, "acme", "eps")
+
+
+def test_a_stale_filter_is_named_in_the_log_and_told_to_its_owner(
+        client, hook, monkeypatch, capsys):
+    """A filter the rules changed under matches nothing - and says so where
+    the owner will look, without a gap in the count: nothing says the document
+    would have matched."""
+    tok = register(client, "Acme")
+    sub_id = int(active_subscription(client, tok, hook, filters=["organization=acme"]))
+    with db(client) as c:
+        c.execute("UPDATE subscriptions SET filters = ? WHERE id = ?",
+                  (json.dumps(["patient=123"]), sub_id))
+    capsys.readouterr()
+    submit(client, tok, outcome(), monkeypatch)
+    assert "Subscription/%d: a stored filter no longer parses" % sub_id \
+        in capsys.readouterr().out
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "active"
+    assert "patient=123" in sub["error"] and "PUT the subscription" in sub["error"]
+    with db(client) as c:
+        assert c.execute("SELECT events FROM subscriptions WHERE id = ?",
+                         (sub_id,)).fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM notifications WHERE kind != "
+                         "'handshake'").fetchone()[0] == 0
+    assert not hook.received
+
+
+@pytest.mark.parametrize("value, allowed", [("0", False), ("false", False), ("no", False),
+                                            ("off", False), (" ", False), ("1", True), ("TRUE", True)])
+def test_only_a_yes_lifts_the_public_only_rule(monkeypatch, value, allowed):
+    monkeypatch.setenv("SUBSCRIPTION_ALLOW_PRIVATE", value)
+    assert notify.allow_private() is allowed
+
+
+# ------------------------------------------------ what a second review found
+
+
+def test_a_header_named_twice_is_refused_rather_than_half_sent(client, hook):
+    """post() sends one value per name. Echoing two back and sending the last
+    is a 401 at the subscriber's end that nothing here explains."""
+    tok = register(client, "Subscriber")
+    body = subscription(hook.url)
+    body["channel"]["header"] = ["X-Key: one", "x-key: two"]
+    res = subscribe(client, tok, body)
+    assert res.status_code == 400 and "once" in diagnostics(res)
+
+
+def test_put_writes_its_links_against_where_it_was_put(client, hook):
+    tok = register(client, "Subscriber")
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    assert client.put("/fhir/Subscription/" + sub_id, json=subscription(hook.url),
+                      headers=dict(auth(tok), Host="elsewhere.example:8000")
+                      ).status_code == 200
+    deliver(client)
+    assert hook.statuses()[-1]["subscription"]["reference"] == \
+        "http://elsewhere.example:8000/fhir/Subscription/" + sub_id
+
+
+def test_a_document_that_is_pythons_json_and_nobody_elses_is_not_sent(
+        client, hook, monkeypatch):
+    """NaN survives json.load and json.dumps, and is a body the endpoint cannot
+    parse - which it would then be charged for."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    team_dir = os.path.join(client.data_dir, "submissions", "subscriber")
+    for name in os.listdir(team_dir):
+        with open(os.path.join(team_dir, name), "w") as fh:
+            fh.write('{"resourceType": "Bundle", "total": NaN}')
+    assert deliver(client) == (0, 1)
+    assert hook.received == []
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+    with db(client) as c:
+        assert c.execute("SELECT state FROM notifications WHERE kind = "
+                         "'event-notification'").fetchone()[0] == "failed"
+
+
+def test_only_so_many_workers_hold_a_whole_document_at_once(monkeypatch):
+    """Sixteen 5 MB documents being wrapped at once were 626 MB, in a
+    container allowed 512."""
+    holding, most, lock = [0], [0], threading.Lock()
+
+    def held(data_dir, row, private_ok):
+        with lock:
+            holding[0] += 1
+            most[0] = max(most[0], holding[0])
+        time.sleep(0.05)
+        with lock:
+            holding[0] -= 1
+        return notify.DELIVERED
+    monkeypatch.setattr(notify, "_attempt_held", held)
+    row = {"kind": "event-notification", "content": "full-resource"}
+    threads = [threading.Thread(target=notify._attempt, args=("", row, True))
+               for _ in range(notify.WORKERS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert most[0] == notify.WHOLE_DOCUMENTS
+    # and nobody else waits on them
+    assert notify._attempt("", dict(row, content="id-only"), True) is notify.DELIVERED
+
+
+# ------------------------------------------------ what a third review found
+
+@pytest.mark.parametrize("address", [
+    "::ffff:0:7f00:1",         # IPv4-translated (RFC 2765) spelling of 127.0.0.1
+    "::ffff:0:a9fe:a9fe",      # ... of 169.254.169.254
+    "::ffff:0:a00:5",          # ... of 10.0.0.5
+])
+def test_ipv4_translated_spelling_of_a_forbidden_v4_address(client, address):
+    """The one wrapper the table lacked: ::ffff:0:0:0/96 is global as far as
+    its own bits go, and is the IPv4 address in its low 32 bits to an SIIT
+    translator."""
+    with pytest.raises(notify.EndpointError):
+        notify.vet_address(address, False)
+    tok = register(client, "Subscriber")
+    assert subscribe(client, tok, subscription("http://[%s]/h" % address)
+                     ).status_code == 400
+    # link-local stays refused whatever the network
+    if address.endswith("a9fe:a9fe"):
+        with pytest.raises(notify.EndpointError):
+            notify.vet_address(address, True)
+
+
+def test_a_slow_but_working_resolver_is_not_charged_to_the_endpoint(hook, monkeypatch):
+    """A lookup that comes back at the last moment left the endpoint
+    milliseconds, and the failure that followed was charged to it - six times,
+    and then the subscription was turned off over a resolver."""
+    real = socket.getaddrinfo
+    slow = [0.0]
+
+    def getaddrinfo(host, *a, **k):
+        if str(host).endswith(".example.org"):
+            time.sleep(slow[0])
+            return real("127.0.0.1", *a, **k)
+        return real(host, *a, **k)
+    monkeypatch.setattr(notify.socket, "getaddrinfo", getaddrinfo)
+    url = "http://hook.example.org:%d/h" % hook.server.server_address[1]
+
+    # Slower than its share: the resolver's trouble, and ours.
+    slow[0] = 0.3
+    with pytest.raises(notify.ServerTrouble, match="could not be looked up within 0.2s"):
+        notify.post(url, b"{}", [], True, timeout=0.4)
+    assert hook.received == []
+    # Within its share: the endpoint keeps the rest, and answers in it.
+    slow[0] = 0.1
+    assert notify.post(url, b"{}", [], True, timeout=0.4) == 200
+    # And an endpoint that then does not answer is told how long it really had.
+    hook.delay = 2
+    slow[0] = 0.2
+    with pytest.raises(notify.DeliveryError, match=r"did not answer within 0\.[678]s"):
+        notify.post(url, b"{}", [], True, timeout=1)
+
+
+@pytest.mark.parametrize("errno_", [errno.EMFILE, errno.ENETUNREACH])
+def test_this_boxs_own_connection_failures_are_not_charged_to_the_subscriber(
+        client, hook, monkeypatch, errno_):
+    """Out of file descriptors, or no route out: the endpoint was never
+    reached, and used to be blamed for it - `error`, then `off`."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    real = socket.create_connection
+
+    def cannot(*a, **k):
+        raise OSError(errno_, os.strerror(errno_))
+    monkeypatch.setattr(notify.socket, "create_connection", cannot)
+    assert deliver(client) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "active" and "error" not in sub
+    with db(client) as c:
+        row = c.execute("SELECT attempts, faults, error FROM notifications "
+                        "WHERE kind = 'event-notification'").fetchone()
+    assert (row["attempts"], row["faults"]) == (0, 1)
+    assert "not your endpoint's doing" in row["error"]
+    assert errno.errorcode[errno_] in row["error"]
+    # whereas a connection the endpoint refuses is still the endpoint's
+    monkeypatch.setattr(notify.socket, "create_connection", real)
+    hook.close()
+    now = datetime.datetime.now(UTC) + datetime.timedelta(seconds=10)
+    assert deliver(client, now) == (0, 1)
+    assert get_sub(client, tok, sub_id)["status"] == "error"
+
+
+def test_the_second_vetted_address_is_tried_when_the_first_cannot_be_reached(
+        hook, monkeypatch):
+    """Pinning the connection to a vetted address lost what connecting to a
+    name gives for free: a host with an IPv6 record this box cannot route to
+    and an IPv4 one it can is reachable."""
+    real_resolve, real_connect = socket.getaddrinfo, socket.create_connection
+    port = hook.server.server_address[1]
+    monkeypatch.setattr(notify.socket, "getaddrinfo", lambda host, *a, **k: [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+    ] if host == "dual.example.org" else real_resolve(host, *a, **k))
+    tried = []
+
+    def create_connection(address, *a, **k):
+        tried.append(address[0])
+        if address[0] == "2001:db8::1":
+            raise OSError(errno.ENETUNREACH, "Network is unreachable")
+        return real_connect(address, *a, **k)
+    monkeypatch.setattr(notify.socket, "create_connection", create_connection)
+    assert notify.post("http://dual.example.org:%d/h" % port, b"{}", [], True) == 200
+    assert tried == ["2001:db8::1", "127.0.0.1"]
+    assert len(hook.received) == 1
+    # every address is still vetted, not just the one that was reachable
+    monkeypatch.setattr(notify.socket, "getaddrinfo", lambda host, *a, **k: [
+        (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0)),
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", port)),
+    ])
+    with pytest.raises(notify.DeliveryError, match="169.254.169.254"):
+        notify.post("http://dual.example.org:%d/h" % port, b"{}", [], True)
+
+
+def test_after_a_whole_transaction_rollback_no_gap_is_committed(
+        client, hook, hook2, monkeypatch):
+    """SQLite rolling back the whole transaction, honestly provoked: a trigger
+    that does what a full disk does. The submission is gone, the submitter is
+    told so - and nobody's event count moves for a document that does not
+    exist, which used to be committed on the way out, one savepoint at a
+    time, as a gap in every subscriber's numbering."""
+    tok = register(client, "Subscriber")
+    for h in (hook, hook2):
+        active_subscription(client, tok, h)
+    with db(client) as c:
+        c.execute("CREATE TRIGGER full BEFORE INSERT ON notifications "
+                  "WHEN NEW.kind = 'event-notification' BEGIN "
+                  "SELECT RAISE(ROLLBACK, 'database or disk is full'); END")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="rolled back"):
+            submit(client, tok, outcome(), monkeypatch)
+    finally:
+        with db(client) as c:
+            c.execute("DROP TRIGGER full")
+    with db(client) as c:
+        assert c.execute("SELECT count(*) FROM submissions").fetchone()[0] == 0
+        assert [r[0] for r in c.execute("SELECT events FROM subscriptions")] == [0, 0]
+    assert pending(client) == 0
+
+
+def test_a_dropped_result_still_says_how_the_attempt_went(client, hook, capsys):
+    """Whether the old endpoint was handed the notification before its owner
+    re-pointed the subscription is what somebody asking about a duplicate
+    needs to know, and this line is the only record of it."""
+    tok = register(client, "Subscriber")
+    hook.delay = 0.5
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    dispatcher = notify.Dispatcher(client.data_dir)
+    try:
+        tasks = dispatcher.look()
+        wait_for(lambda: hook.received, 2)
+        assert client.delete("/fhir/Subscription/" + sub_id,
+                             headers=auth(tok)).status_code == 204
+        [t.result() for t in tasks]
+    finally:
+        dispatcher.close()
+    out = capsys.readouterr().out
+    assert "result dropped, the subscription changed meanwhile (was delivered)" in out
+
+
+def test_giving_up_says_what_to_do_about_it(client, hook):
+    tok = register(client, "Subscriber")
+    hook.answer = 500
+    sub_id = subscribe(client, tok, subscription(hook.url)).json()["id"]
+    now = datetime.datetime.now(UTC)
+    for _ in range(len(notify.HANDSHAKE_BACKOFF) + 1):
+        deliver(client, now)
+        now += datetime.timedelta(seconds=max(notify.HANDSHAKE_BACKOFF) + 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "off"
+    assert sub["error"] == ("Gave up after 3 attempts: the endpoint answered 500. "
+                            "PUT the subscription to try again")
+
+
+@pytest.mark.parametrize("header", [None, "Authorization: Bearer x", {"X-A": "b"}])
+def test_a_channel_header_that_is_not_a_list_is_told_so(client, header):
+    tok = register(client, "Subscriber")
+    body = subscription("https://example.org/h")
+    body["channel"]["header"] = header
+    res = subscribe(client, tok, body)
+    assert res.status_code == 400
+    assert "must be a list" in res.json()["issue"][0]["diagnostics"]
+
+
+def test_a_malformed_criteria_is_refused_rather_than_read_as_no_filter(client, hook):
+    """The `extension` wrapper forgotten, and a filter for one company's
+    documents used to be no filter at all: 201, and the room's documents."""
+    tok = register(client, "Subscriber")
+    ext = {"url": notify.FILTER_CRITERIA_EXT, "valueString": "organization=nobody"}
+    for bad in ([ext], {"extension": ext}, {"extension": [ext, "x"]}, "organization=nobody"):
+        body = subscription(hook.url)
+        body["_criteria"] = bad
+        res = subscribe(client, tok, body)
+        assert res.status_code == 400, bad
+        assert "_criteria" in res.json()["issue"][0]["diagnostics"]
+    body = subscription(hook.url)
+    body["channel"]["_payload"] = [{"url": notify.PAYLOAD_CONTENT_EXT, "valueCode": "empty"}]
+    res = subscribe(client, tok, body)
+    assert res.status_code == 400 and "_payload" in res.json()["issue"][0]["diagnostics"]
+    # somebody else's extension on the element is theirs, and passes over
+    body = subscription(hook.url)
+    body["_criteria"] = {"extension": [{"url": "http://example.org/note", "valueString": "x"}]}
+    res = subscribe(client, tok, body)
+    assert res.status_code == 201 and "_criteria" not in res.json()
+
+
+def test_a_subscription_body_that_is_not_json_or_too_big_is_refused(client, hook):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    for call, path in ((client.post, "/fhir/Subscription"),
+                       (client.put, "/fhir/Subscription/" + sub_id)):
+        res = call(path, content=b"{not json", headers=dict(
+            auth(tok), **{"Content-Type": "application/fhir+json"}))
+        assert res.status_code == 400 and "not valid JSON" in res.text
+        big = dict(subscription(hook.url), reason="r" * app_module.MAX_JSON_BODY_BYTES)
+        assert call(path, json=big, headers=auth(tok)).status_code == 413
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+
+
+def test_put_drops_only_what_was_pending(client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    deliver(client)
+    submit(client, tok, outcome(), monkeypatch)             # one still pending
+    assert client.put("/fhir/Subscription/" + sub_id, json=subscription(hook.url),
+                      headers=auth(tok)).status_code == 200
+    with db(client) as c:
+        assert [tuple(r) for r in c.execute(
+            "SELECT kind, state FROM notifications ORDER BY id")] == [
+            ("handshake", "delivered"), ("event-notification", "delivered"),
+            ("handshake", "pending")]
+
+
+def test_reason_is_cut_to_size_and_has_a_default(client, hook):
+    tok = register(client, "Subscriber")
+    res = subscribe(client, tok, subscription(hook.url, reason="  " + "r" * 5000))
+    assert res.status_code == 201
+    assert res.json()["reason"] == "r" * app_module.MAX_NOTE_CHARS
+    res = subscribe(client, tok, subscription(hook.url, reason=5))
+    assert res.json()["reason"] == "Notify of documents that pass validation"
+
+
+def test_a_forwarded_proto_that_is_not_a_scheme_is_ignored(client, hook):
+    tok = register(client, "Subscriber")
+    client.post("/fhir/Subscription", json=subscription(hook.url),
+                headers={"Authorization": "Bearer " + tok, "X-Forwarded-Proto": "ftp"})
+    deliver(client)
+    assert hook.statuses()[0]["subscription"]["reference"].startswith(
+        "http://testserver/fhir/Subscription/")
+
+
+def test_a_document_that_is_json_but_not_an_object_is_written_off_at_once(
+        client, hook, monkeypatch):
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    team_dir = os.path.join(client.data_dir, "submissions", "subscriber")
+    for name in os.listdir(team_dir):
+        with open(os.path.join(team_dir, name), "w") as fh:
+            fh.write("[]")
+    assert deliver(client) == (0, 1)
+    assert hook.received == []
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+    with db(client) as c:
+        assert tuple(c.execute("SELECT state, faults FROM notifications WHERE kind "
+                               "= 'event-notification'").fetchone()) == ("failed", 1)
+
+
+# ------------------------------------------------- added after the review pass
+
+def _dual_stack(port, v4_first=True):
+    v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port))
+    v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::1", port, 0, 0))
+    return lambda host, *a, **k: [v4, v6] if v4_first else [v6, v4]
+
+
+@pytest.mark.parametrize("v4_first", [True, False])
+def test_a_refused_connection_is_the_endpoints_whichever_address_this_box_could_not_route_to(
+        monkeypatch, v4_first):
+    """A dual-stack endpoint that is down, called from a box with no IPv6
+    route: refused on the A record, unreachable on the AAAA. The refusal is
+    the endpoint's and must be what is reported - the resolver sorts the
+    unroutable address last, so "the last error" would call every dead
+    endpoint this server's routing."""
+    tried = []
+
+    def create_connection(address, *a, **k):
+        tried.append(address[0])
+        if address[0] == "127.0.0.1":
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+        raise OSError(errno.ENETUNREACH, "Network is unreachable")
+    monkeypatch.setattr(notify.socket, "getaddrinfo", _dual_stack(9, v4_first))
+    monkeypatch.setattr(notify.socket, "create_connection", create_connection)
+    with pytest.raises(notify.DeliveryError, match="refused"):
+        notify.post("http://dual%d.example.org:9/h" % v4_first, b"{}", [], True)
+    assert sorted(tried) == ["127.0.0.1", "2001:db8::1"]
+
+
+def test_only_when_every_address_was_this_boxs_trouble_is_it_server_trouble(monkeypatch):
+    def create_connection(address, *a, **k):
+        raise OSError(errno.ENETUNREACH, "Network is unreachable")
+    monkeypatch.setattr(notify.socket, "getaddrinfo", _dual_stack(9))
+    monkeypatch.setattr(notify.socket, "create_connection", create_connection)
+    with pytest.raises(notify.ServerTrouble, match="ENETUNREACH"):
+        notify.post("http://dual-down.example.org:9/h", b"{}", [], True)
+
+
+@pytest.mark.parametrize("code", ["413 Payload Too Large", "401 Unauthorized"])
+def test_an_endpoint_that_answers_early_over_tls_is_explained_by_its_answer(
+        pki, monkeypatch, code):
+    """The plain-HTTP version of this is BrokenPipe; over TLS the same hang-up
+    is an "EOF in violation of protocol", and every real subscriber is https.
+    Reported as a TLS failure it sends them checking certificates."""
+    example_org_is_loopback(monkeypatch)
+    monkeypatch.setattr(notify, "_TLS", ssl.create_default_context(cafile=pki / "ca.pem"))
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(pki / "leaf.pem", pki / "leaf.key")
+
+    def answer_early(raw):
+        conn = ctx.wrap_socket(raw, server_side=True)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += conn.recv(4096)
+        conn.sendall(("HTTP/1.1 %s\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                      % code).encode())
+        time.sleep(0.2)
+        conn.close()
+    port = _one_connection(answer_early)
+    with pytest.raises(notify.DeliveryError, match="answered %s" % code[:3]):
+        notify.post("https://hook.example.org:%d/h" % port, b"x" * (8 * 1024 * 1024),
+                    [], private_ok=True, timeout=5)
+
+
+def test_a_2xx_answered_before_the_body_was_taken_is_delivered_and_said(capsys):
+    """The endpoint's word stands - but an operator asked why a platform never
+    ingested an event the log calls delivered must be able to find this."""
+    def answer_at_once(conn):
+        conn.settimeout(5)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            buf += conn.recv(4096)
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    port = _one_connection(answer_at_once)
+    body = b"{" + b" " * (8 * 1024 * 1024) + b"}"
+    assert notify.post("http://127.0.0.1:%d/hook" % port, body, [], True) == 200
+    out = capsys.readouterr().out
+    assert "127.0.0.1 answered 200 before it had taken the whole notification" in out
+    assert "counted as delivered" in out
+
+
+def test_the_dispatcher_starts_every_worker_up_front_or_none(client, hook, monkeypatch):
+    """submit() queues the work before it starts a thread for it, so a thread
+    that fails to start mid-run would leave a work item behind for the next
+    free worker, after look() had given the subscription up as never started
+    - two workers on one subscription. So the pool is filled at construction,
+    where a failure is loud and leaves nothing behind, not even the lock."""
+    real_start = threading.Thread.start
+
+    def cannot_start(self):
+        if self.name.startswith("deliver"):
+            raise RuntimeError("can't start new thread")
+        return real_start(self)
+    monkeypatch.setattr(threading.Thread, "start", cannot_start)
+    with pytest.raises(RuntimeError, match="can't start new thread"):
+        notify.Dispatcher(client.data_dir)
+    monkeypatch.setattr(threading.Thread, "start", real_start)
+    dispatcher = notify.Dispatcher(client.data_dir)        # the lock was let go
+    try:
+        tok = register(client, "Subscriber")
+        subscribe(client, tok, subscription(hook.url))
+        subscribe(client, tok, subscription(hook.url + "2"))
+        # From here on no thread is ever started, and nothing needs one.
+        monkeypatch.setattr(threading.Thread, "start", cannot_start)
+        assert sorted(t.result() for t in dispatcher.look()) == [(1, 0), (1, 0)]
+        assert len(hook.received) == 2
+    finally:
+        monkeypatch.setattr(threading.Thread, "start", real_start)
+        dispatcher.close()
+
+
+def test_a_write_off_behind_a_failing_event_does_not_call_the_subscription_active(
+        client, hook, monkeypatch):
+    """`error` means something is being retried. Writing off event 1 while
+    event 2 is still queued must not report the subscription healthy."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(), monkeypatch)
+    hook.answer = 500
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    assert get_sub(client, tok, sub_id)["status"] == "error"
+    hook.answer = 200
+    with db(client) as c:
+        slug, name = c.execute("SELECT t.slug, s.filename FROM submissions s "
+                               "JOIN teams t ON t.id = s.team_id ORDER BY s.id").fetchone()
+    os.remove(os.path.join(client.data_dir, "submissions", slug, name))
+    monkeypatch.setattr(notify, "DRAIN_BUDGET", -1)      # one notification per pass
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (0, 1)
+    sub = get_sub(client, tok, sub_id)
+    assert sub["status"] == "error"
+    assert sub["error"].startswith("Event 1 was not sent, and will not be:")
+    assert deliver(client, now + datetime.timedelta(seconds=7)) == (1, 0)
+    assert get_sub(client, tok, sub_id)["status"] == "active"
+
+
+def test_a_fault_that_was_never_an_attempt_still_waits_its_backoff(
+        client, hook, monkeypatch):
+    """attempts = 0 and faults = 1 is not "never tried": due_queues must
+    honour the stamp _record set, or the failing resource is hit every pass."""
+    tok = register(client, "Subscriber")
+    active_subscription(client, tok, hook, content="full-resource")
+    submit(client, tok, outcome(), monkeypatch)
+    real_open, calls = open, []
+
+    def flaky_open(path, *a, **k):
+        if "submissions" in str(path) and not calls:
+            calls.append(path)
+            raise OSError(24, "Too many open files", str(path))
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(notify, "open", flaky_open, raising=False)
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    assert deliver(client, now + datetime.timedelta(seconds=1)) == (0, 0)
+    assert deliver(client, now + datetime.timedelta(seconds=4)) == (0, 0)
+    assert hook.received == []
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (1, 0)
+
+
+def test_a_host_label_too_long_to_resolve_is_the_endpoints_fault():
+    """The door lets a 64-character label in (it is printable ASCII); the
+    resolver refuses it with a UnicodeError, not a gaierror. That is a wrong
+    name, to be told to the subscriber - not a bug to be retried."""
+    url = "https://%s.example.org/h" % ("a" * 64)
+    notify.check_endpoint(url, False)
+    with pytest.raises(notify.EndpointError, match="does not resolve"):
+        notify.resolve_addresses(url, False)
+
+
+@pytest.mark.parametrize("code, expected", [
+    (socket.EAI_AGAIN, notify.Unresolved), (socket.EAI_FAIL, notify.Unresolved),
+    (socket.EAI_SYSTEM, notify.Unresolved), (socket.EAI_NONAME, notify.EndpointError),
+])
+def test_which_resolver_answers_are_the_names_fault(monkeypatch, code, expected):
+    def answer(host, *a, **k):
+        raise socket.gaierror(code, "resolver said %d" % code)
+    monkeypatch.setattr(notify.socket, "getaddrinfo", answer)
+    with pytest.raises(expected):
+        notify.resolve_addresses("http://eai%d.example.org/h" % abs(code), False)
+
+
+def test_a_network_error_after_connecting_counts_against_the_endpoint(hook, monkeypatch):
+    """OUR_ERRNOS are this box's only before there was a connection. Once one
+    is up, whatever breaks it is an attempt the endpoint had."""
+    def send(self, data):
+        if self.sock is None:
+            self.connect()
+        raise OSError(errno.ENETUNREACH, "Network is unreachable")
+    monkeypatch.setattr(notify._PinnedHTTPConnection, "send", send)
+    with pytest.raises(notify.DeliveryError, match="could not reach the endpoint"):
+        notify.post(hook.url, b"{}", [], True)
+
+
+def test_the_second_address_is_not_tried_once_the_deadline_has_passed(monkeypatch):
+    """N black-holed addresses must cost one deadline, not N connect timeouts,
+    or one host holds a worker and its queue for minutes."""
+    tried = []
+
+    def black_hole(address, *a, **k):
+        tried.append(address[0])
+        time.sleep(0.6)
+        raise OSError(errno.ETIMEDOUT, "Connection timed out")
+    monkeypatch.setattr(notify.socket, "getaddrinfo", _dual_stack(9))
+    monkeypatch.setattr(notify.socket, "create_connection", black_hole)
+    started = time.monotonic()
+    with pytest.raises(notify.DeliveryError, match="did not take the notification"):
+        notify.post("http://blackhole.example.org:9/h", b"{}", [], True, timeout=0.3)
+    assert tried == ["127.0.0.1"]
+    assert time.monotonic() - started < 1.0
+
+
+def test_an_event_notification_carries_no_error_parameter_even_while_there_is_one(
+        client, hook, monkeypatch):
+    """`error` is $status's - the backport's Parameters for a notification
+    have no such part, and a subscriber validates the shape it is sent."""
+    tok = register(client, "Subscriber")
+    sub_id = active_subscription(client, tok, hook)
+    submit(client, tok, outcome(), monkeypatch)
+    hook.answer = 500
+    now = datetime.datetime.now(UTC)
+    assert deliver(client, now) == (0, 1)
+    status = client.get("/fhir/Subscription/%s/$status" % sub_id, headers=auth(tok)).json()
+    assert "error" in [p["name"] for p in status["entry"][0]["resource"]["parameter"]]
+    hook.answer = 200
+    assert deliver(client, now + datetime.timedelta(seconds=6)) == (1, 0)
+    names = [p["name"] for p in hook.received[-1][2]["entry"][0]["resource"]["parameter"]]
+    assert names == ["subscription", "topic", "status", "type",
+                     "events-since-subscription-start", "notification-event"]
+
+
+def test_plain_application_json_is_an_accepted_payload_type(client, hook):
+    tok = register(client, "Subscriber")
+    body = subscription(hook.url)
+    body["channel"]["payload"] = "application/json"
+    assert subscribe(client, tok, body).status_code == 201
+    body["channel"]["payload"] = "application/xml"
+    assert subscribe(client, tok, body).status_code == 400
+
+
+def test_a_forwarded_proto_list_uses_its_first_entry(client, hook):
+    tok = register(client, "Subscriber")
+    client.post("/fhir/Subscription", json=subscription(hook.url),
+                headers={"Authorization": "Bearer " + tok,
+                         "X-Forwarded-Proto": "https, http"})
+    deliver(client)
+    assert hook.statuses()[0]["subscription"]["reference"].startswith(
+        "https://testserver/fhir/Subscription/")
