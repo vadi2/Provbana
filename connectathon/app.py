@@ -4340,6 +4340,28 @@ def ui_document(doc_id: str) -> dict:
     }
 
 
+@app.post("/ui/preview", include_in_schema=False)
+async def ui_preview(request: Request) -> dict:
+    """The readable view of a bundle that is not on the hackathon at all.
+
+    Nothing is stored, validated or scored - it is the clinical view pointed at
+    a file on someone's own disk, so they can see how it reads before (or
+    without ever) submitting it.
+    """
+    bundle = _loads_or_none(await read_limited_body(request, MAX_BODY_BYTES, "Bundle"))
+    if not isinstance(bundle, dict) or bundle.get("resourceType") != "Bundle":
+        raise HTTPException(400, detail="Not a FHIR Bundle in JSON")
+    return {
+        "id": "local",
+        "team": "Local preview",
+        "team_slug": None,
+        "ts": None,
+        "preview": True,
+        "bundle_readable": True,
+        "summary": safe_summary(bundle),
+    }
+
+
 @app.get("/favicon.svg", include_in_schema=False)
 def favicon() -> Response:
     return Response(
@@ -4772,6 +4794,10 @@ tr.cv-row:hover a.cv-open { text-decoration: underline; }
   margin: 0 0 14px; font-weight: 600; }
 tr.cv-row { cursor: pointer; }
 tr.cv-row:hover td { background: var(--accent-soft); }
+/* previewing a bundle that is not on the hackathon */
+#cv-preview-msg { margin: 8px 0 0; color: var(--fail); }
+.cv-paste textarea { min-height: 120px; }
+.cv-paste .row { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
 footer { max-width: 1060px; margin: 26px auto 40px; padding: 0 var(--pad-x);
   font-size: 0.8rem; color: var(--muted); line-height: 1.6; }
 footer a { color: var(--accent); }
@@ -5095,6 +5121,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <h2>Clinical view of submitted documents</h2>
   <label for="cv-team">Company</label>
   <select id="cv-team"></select>
+  <p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>
+  <input type="file" id="cv-file" accept=".json,application/json,application/fhir+json" hidden>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
 
@@ -6252,6 +6280,8 @@ let cvDisclaimer = "";
 /* The worked examples are one more entry in the company picker rather than a
    list of their own, so there is a single place to open a document from. */
 const SAMPLE_TEAM = "__samples";
+/* Previewing your own file is one more entry in the picker too. */
+const PREVIEW_TEAM = "__preview";
 
 async function initSamples() {
   try {
@@ -6269,6 +6299,8 @@ async function initSamples() {
    leave the picker pointing at the company you came from. */
 function routeTeam() {
   const parts = routeParts();
+  // a local preview belongs to no company, so leave the picker where it is
+  if (parts[1] === "preview") return $("#cv-team").value || SAMPLE_TEAM;
   if (parts[1] === "company" && parts[2]) return parts[2];
   if (parts[1] === "submission") {
     if (cvCurrent && String(cvCurrent.id) === parts[2] && cvCurrent.team_slug) {
@@ -6318,7 +6350,8 @@ async function initClinical() {
     const current = sel.value;
     sel.innerHTML = '<option value="' + SAMPLE_TEAM + '">Example documents</option>'
       + teams.map((t) =>
-          '<option value="' + esc(t.team_slug) + '">' + esc(t.team) + "</option>").join("");
+          '<option value="' + esc(t.team_slug) + '">' + esc(t.team) + "</option>").join("")
+      + '<option value="' + PREVIEW_TEAM + '">Preview your own file\u2026</option>';
     cvSubsByTeam = new Map();  // a fresh visit deserves fresh lists
     /* A #clinical/company route is an explicit request for that company, so it
        wins over whatever the picker happened to be showing; otherwise a company
@@ -6386,6 +6419,7 @@ async function renderCvList() {
   const box = $("#cv-list");
   if (!slug) { box.innerHTML = ""; return; }
   if (slug === SAMPLE_TEAM) { renderSampleList(box); return; }
+  if (slug === PREVIEW_TEAM) { renderPreviewBox(box); return; }
   let subs = cvSubsByTeam.get(slug);
   if (!subs) {
     box.innerHTML = '<p class="muted">Loading\u2026</p>';
@@ -6427,6 +6461,7 @@ $("#cv-team").addEventListener("change", () => {
      reload or a shared link lands on the company just picked, not the old one. */
   if (routeParts()[1] === "company") {
     const slug = $("#cv-team").value;
+    if (slug === PREVIEW_TEAM) { renderCvList(); return; }
     history.replaceState(null, "", slug === SAMPLE_TEAM ? "#clinical"
                                                         : "#clinical/company/" + slug);
   }
@@ -6450,6 +6485,7 @@ async function showDoc(kind, id, scroll) {
      than pretending to be a resource. Samples and submissions share one id
      space, so one path serves both. */
   if (!kind || !id) { hideDoc(); return; }
+  if (kind === "preview") { showPreviewDoc(scroll); return; }
   const path = "/ui/documents/";
   const key = kind + "/" + id;
   if (key === cvDocKey && cvCurrent) { renderClinicalDoc(cvCurrent); return; }
@@ -6881,7 +6917,7 @@ function renderClinicalDoc(d) {
   const s = d.summary || {};
   const comp = s.composition || {};
   let html = "";
-  if (!d.sample && !d.pass) {
+  if (!d.sample && !d.preview && !d.pass) {
     html += '<div class="warn-banner">Invalid submission - this document failed'
       + " validation and would be rejected in production. Content shown as-is.</div>";
   }
@@ -6893,7 +6929,10 @@ function renderClinicalDoc(d) {
   html += cvModesHtml();
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
   html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
-    + (d.sample
+    + (d.preview
+        ? " of " + esc(d.filename || "pasted JSON")
+          + " &middot; not uploaded, validated or scored"
+      : d.sample
         ? ' &middot; <a href="/fhir/Bundle/' + esc(d.sample.id)
           + '" download>download the FHIR bundle</a>'
         : " &middot; submitted " + new Date(d.ts).toLocaleString()
@@ -6918,6 +6957,84 @@ $("#cv-doc").addEventListener("click", (ev) => {
   if (parts[1] && parts[2]) go(["clinical", parts[1], parts[2], cvMode].join("/"), true);
   else if (cvCurrent) renderClinicalDoc(cvCurrent);
 });
+
+/* ---- local preview ----
+   A bundle on the reader's own disk, run through the same readable view as a
+   submission. The server only summarises it; the result lives in this tab
+   (and sessionStorage, so a reload or view switch keeps it) and nowhere else. */
+const CV_PREVIEW_KEY = "cv-preview";
+let cvPreview = null;
+
+function previewMsg(text) {
+  const box = $("#cv-preview-msg");
+  box.textContent = text || "";
+  box.style.display = text ? "block" : "none";
+}
+
+async function previewBundle(text, filename) {
+  previewMsg("");
+  let data;
+  try {
+    const res = await fetch("/ui/preview", { method: "POST",
+      headers: { "Content-Type": "application/fhir+json" }, body: text });
+    if (!res.ok) {
+      let why = "HTTP " + res.status;
+      try { why = (await res.json()).issue[0].diagnostics || why; } catch (e) { /* keep the status */ }
+      previewMsg("Could not preview " + (filename || "that") + ": " + why);
+      return;
+    }
+    data = await res.json();
+  } catch (e) {
+    previewMsg("Could not preview " + (filename || "that") + ": " + e.message);
+    return;
+  }
+  data.filename = filename || null;
+  cvPreview = data;
+  try { sessionStorage.setItem(CV_PREVIEW_KEY, JSON.stringify(data)); } catch (e) { /* too big or blocked: it still shows */ }
+  cvDocKey = null;  // a second preview reuses the route, so force the redraw
+  go("clinical/preview/local/" + CV_DEFAULT);
+}
+
+async function previewFile(file) {
+  if (!file) return;
+  try { await previewBundle(await file.text(), file.name); }
+  catch (e) { previewMsg("Could not read " + file.name + ": " + e.message); }
+}
+
+function showPreviewDoc(scroll) {
+  if (!cvPreview) {
+    try { cvPreview = JSON.parse(sessionStorage.getItem(CV_PREVIEW_KEY) || "null"); }
+    catch (e) { cvPreview = null; }
+  }
+  if (!cvPreview) {
+    showDocMessage("Nothing to preview - pick a file again.");
+    return;
+  }
+  const first = cvDocKey !== "preview/local";
+  cvDocKey = "preview/local";
+  renderClinicalDoc(cvPreview);
+  if (scroll || first) $("#cv-doc").scrollIntoView({ behavior: "smooth" });
+}
+
+function renderPreviewBox(box) {
+  box.innerHTML = '<div class="cv-paste">'
+    + '<p class="muted" style="margin:0">Pick a Bundle .json or paste one below.'
+    + " It is only rendered here, not uploaded to the hackathon.</p>"
+    + '<textarea id="cv-paste" spellcheck="false" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
+    + '<div class="row"><button type="button" id="cv-paste-go">Preview</button>'
+    + '<button type="button" class="ghost" id="cv-pick">Choose a file&hellip;</button></div>'
+    + "</div>";
+  $("#cv-pick").addEventListener("click", () => {
+    $("#cv-file").value = "";  // picking the same file again should still fire
+    $("#cv-file").click();
+  });
+  $("#cv-paste-go").addEventListener("click", () => {
+    const text = $("#cv-paste").value.trim();
+    if (text) previewBundle(text, null); else previewMsg("Paste a bundle first.");
+  });
+}
+
+$("#cv-file").addEventListener("change", () => previewFile($("#cv-file").files[0]));
 
 /* ---- interop testing ---- */
 /* The same two strings as SUBSCRIPTION_TOPIC and notify.PAYLOAD_CONTENT_EXT.

@@ -892,6 +892,19 @@ def test_submission_404s(client, monkeypatch):
     assert client.get(f"/fhir/Bundle/{sub_id}").status_code == 404
 
 
+def test_preview_renders_a_bundle_without_storing_it(client):
+    res = client.post("/ui/preview", content=CLINICAL_BODY)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["preview"] is True
+    assert data["summary"]["patient"]["name"] == "Petra M. Schwartz"
+    assert data["summary"]["sections"][0]["items"]
+    # nothing reached the hackathon
+    assert param_entries(client.get("/fhir/$submissions")) == []
+    assert client.post("/ui/preview", content=b"not json").status_code == 400
+    assert client.post("/ui/preview", content=b'{"resourceType": "Patient"}').status_code == 400
+
+
 # ---------------------------------------------------------------- interop
 
 def interop_setup(client, monkeypatch):
