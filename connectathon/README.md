@@ -466,6 +466,21 @@ name is not 2-40 characters, **403** if `REGISTER_CODE` is set and the `code` pa
 is wrong or missing, **409** if the name is taken (whitespace-normalised;
 case-insensitive for ASCII letters only).
 
+If your system can take documents in directly, say where in the same call: an
+`endpoint` part carrying an [Endpoint](#advertising-where-your-system-takes-documents-in)
+resource is stored with the company, and the `Organization` comes back referencing it. A
+bad endpoint is a **400** that registers nothing, so the retry is not a 409.
+
+```
+curl -X POST 'localhost:8095/fhir/$register' -H 'Content-Type: application/fhir+json' -d '{
+  "resourceType": "Parameters",
+  "parameter": [{"name": "name", "valueString": "My Company"},
+                {"name": "endpoint", "resource": {"resourceType": "Endpoint",
+                  "status": "active", "connectionType": {"code": "web-page"},
+                  "address": "https://example.org/send-us-data"}}]
+}'
+```
+
 The `Organization`'s id is the slug - the lower-cased, ASCII-folded name with runs of
 anything else turned into `-` (`Åland Hälsa` is `aland-halsa`), suffixed `-2`, `-3` if
 that slug is taken. It is how the company is addressed everywhere else, and it is what
@@ -619,6 +634,43 @@ characters, and `PUT` rewrites only that - the image, the companies and the docu
 points at are settled at upload. A screenshot pins to `context.related`, the exact
 Bundle, not the company: when a producer beats its own score the exchange document moves
 on and the old screenshots stay with the bytes they were taken from.
+
+#### Advertising where your system takes documents in
+
+The other direction: if your platform would rather be sent documents than go and fetch
+them, say where with an `Endpoint`. `connectionType.code` is `hl7-fhir-rest` for a FHIR
+base, or `web-page` for a page that explains how to get data in. `address` is the http(s) URL. `name` is an optional short label, and
+R5's `Endpoint.description` (carried as a cross-version extension) is where to say what
+to send and how to authenticate. `managingOrganization` is taken from your token, and the
+company's `Organization` lists its endpoints under `endpoint`. The server never calls the
+address. It is there for other people to find, and they see it on the Interop tab.
+
+```
+curl -X POST localhost:8095/fhir/Endpoint -H 'Authorization: Bearer TOKEN' \
+     -H 'Content-Type: application/fhir+json' -d '{
+  "resourceType": "Endpoint", "status": "active",
+  "connectionType": {"code": "hl7-fhir-rest"},
+  "name": "Staging server", "address": "https://fhir.example.org/r4",
+  "extension": [{"url": "http://hl7.org/fhir/5.0/StructureDefinition/extension-Endpoint.description",
+                 "valueString": "POST a document Bundle to /Bundle. Ask at our table for a token."}]}'
+# everyone's, or one company's, or one kind
+curl localhost:8095/fhir/Endpoint
+curl 'localhost:8095/fhir/Endpoint?organization=COMPANY_SLUG&connection-type=web-page'
+# your own only: PUT replaces it whole, DELETE stops advertising it
+curl -X PUT localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN' \
+     -H 'Content-Type: application/fhir+json' -d @endpoint.json
+curl -X DELETE localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN'
+```
+
+**400** for an address that is not an absolute http(s) URL or is over 2000 characters, a
+`connectionType` code other than these two (or with a `system` that is not that code's),
+a `status` other than `active` (delete an endpoint rather than parking it), a top-level
+R5 `description` (R4 has none - use the extension), a `header` (this list is public, so
+say how to authenticate in the description instead), or a body `id` that differs from the
+URL's on `PUT`. `payloadType` is set by the server: `any` for a FHIR base, `none` for a
+page. **403** on changing somebody else's, **404** for one that does not exist,
+**422** past five per company. The name has its whitespace collapsed and is trimmed to
+100 characters, the description to 2000.
 
 ### Subscriptions
 

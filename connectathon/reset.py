@@ -42,8 +42,12 @@ DB_NAME = "connectathon.db"
 # in this order never leaves a row pointing at one that has gone. Subscriptions
 # go with the teams because a subscription is its team's: the token that could
 # change or delete it stops existing in the same wipe, and one left behind
-# would go on calling an endpoint nobody can turn off any more.
-TABLES = ("notifications", "subscriptions", "renderings", "submissions", "teams")
+# would go on calling an endpoint nobody can turn off any more. Advertised
+# endpoints (the endpoints table) go too: once the token is gone nobody could
+# change or remove them, and the next company to be given that team id would
+# find them listed as its own.
+TABLES = ("notifications", "subscriptions", "endpoints", "renderings",
+          "submissions", "teams")
 # Each holds one directory per team slug. The trees themselves stay: app.py
 # creates submissions/ at boot and renderings/ on the first upload, both with
 # exist_ok=True, so removing them would be survivable but pointless churn.

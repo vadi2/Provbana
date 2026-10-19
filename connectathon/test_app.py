@@ -1759,7 +1759,8 @@ def test_metadata_describes_the_whole_api(client):
     assert cs["fhirVersion"] == "4.0.1"
     rest = cs["rest"][0]
     assert {r["type"] for r in rest["resource"]} == {
-        "Bundle", "Organization", "DocumentReference", "Binary", "Subscription"}
+        "Bundle", "Organization", "DocumentReference", "Binary", "Subscription",
+        "Endpoint"}
     assert {op["name"] for op in rest["operation"]} == {
         "register", "leaderboard", "submissions", "samples", "exchange",
         "documents", "status"}
@@ -2675,6 +2676,350 @@ def test_renderings_are_readable_without_a_token(client, monkeypatch):
                           headers=headers).status_code == 200
 
 
+# ------------------------------------------------------------ endpoints
+
+DESC_EXT = app_module.ENDPOINT_DESCRIPTION_EXT
+
+
+def endpoint(address="https://fhir.example.org/r4", kind="hl7-fhir-rest", **extra):
+    body = {"resourceType": "Endpoint", "status": "active",
+            "connectionType": {"code": kind}, "address": address}
+    body.update(extra)
+    return body
+
+
+def advertise(client, token, body, endpoint_id=None):
+    headers = {"Authorization": "Bearer " + token,
+               "Content-Type": "application/fhir+json"}
+    if endpoint_id is None:
+        return client.post("/fhir/Endpoint", json=body, headers=headers)
+    return client.put("/fhir/Endpoint/%s" % endpoint_id, json=body, headers=headers)
+
+
+def test_an_endpoint_says_whose_it_is_and_how_to_send_to_it(client):
+    tok = register(client, "Åland Hälsa")
+    res = advertise(client, tok, endpoint(
+        name="  Staging   server ",
+        managingOrganization={"reference": "Organization/someone-else"},
+        extension=[{"url": DESC_EXT, "valueString": " POST a Bundle to /Bundle\n"}]))
+    assert res.status_code == 201, res.text
+    ep = res.json()
+    assert res.headers["location"] == "/fhir/Endpoint/" + ep["id"]
+    # the company is the token's, not whatever the body claimed
+    assert ep["managingOrganization"] == {"reference": "Organization/aland-halsa",
+                                          "display": "Åland Hälsa"}
+    assert ep["connectionType"] == {
+        "system": "http://terminology.hl7.org/CodeSystem/endpoint-connection-type",
+        "code": "hl7-fhir-rest", "display": "HL7 FHIR"}
+    assert ep["name"] == "Staging server"
+    assert ep["address"] == "https://fhir.example.org/r4"
+    assert ep["extension"] == [{"url": DESC_EXT,
+                                "valueString": "POST a Bundle to /Bundle"}]
+    assert ep["payloadType"][0]["coding"][0]["code"] == "any"
+    # reads are open: finding it is the point
+    assert client.get("/fhir/Endpoint/" + ep["id"]).json() == ep
+    org = client.get("/fhir/Organization/aland-halsa").json()
+    assert org["endpoint"] == [{"reference": "Endpoint/" + ep["id"]}]
+    listed = client.get("/fhir/Organization").json()["entry"][0]["resource"]
+    assert listed["endpoint"] == org["endpoint"]
+
+
+def test_an_endpoint_can_be_advertised_at_registration(client):
+    body = as_params(name="Early Bird")
+    body["parameter"].append({"name": "endpoint", "resource": endpoint(
+        "https://docs.example.org", kind="web-page",
+        extension=[{"url": DESC_EXT, "valueString": "Read me"}])})
+    res = client.post("/fhir/$register", json=body)
+    assert res.status_code == 200, res.text
+    org = param_one(res, "organization")
+    [ref] = org["endpoint"]
+    ep = client.get("/fhir/" + ref["reference"]).json()
+    assert ep["managingOrganization"]["reference"] == "Organization/early-bird"
+    assert ep["address"] == "https://docs.example.org"
+    assert ep["extension"][0]["valueString"] == "Read me"
+
+
+def test_a_bad_endpoint_at_registration_registers_nothing(client):
+    """Otherwise the retry with the address fixed is a 409 for the name."""
+    body = as_params(name="Typo Health")
+    body["parameter"].append({"name": "endpoint",
+                              "resource": endpoint("fhir.example.org")})
+    res = client.post("/fhir/$register", json=body)
+    assert res.status_code == 400 and "http or https" in diagnostics(res)
+    body["parameter"][-1]["resource"] = {"resourceType": "Organization"}
+    assert "Endpoint resource" in diagnostics(client.post("/fhir/$register", json=body))
+    assert client.get("/fhir/Organization").json()["total"] == 0
+    assert register(client, "Typo Health")
+
+
+def test_a_web_page_is_an_endpoint_that_takes_no_payload(client):
+    tok = register(client, "Pages")
+    ep = advertise(client, tok, endpoint("http://docs.example.org/send",
+                                         kind="web-page")).json()
+    assert ep["connectionType"]["system"] == (
+        app_module.CANONICAL_BASE + "/CodeSystem/endpoint-connection-type")
+    assert ep["payloadType"][0]["coding"][0]["code"] == "none"
+    assert "name" not in ep and "extension" not in ep
+
+
+def test_endpoints_are_searched_by_company_and_kind(client):
+    a = register(client, "Alpha")
+    b = register(client, "Beta")
+    advertise(client, b, endpoint(kind="web-page"))
+    advertise(client, a, endpoint())
+    advertise(client, a, endpoint(kind="web-page"))
+
+    def found(query=""):
+        bundle = client.get("/fhir/Endpoint" + query).json()
+        assert bundle["type"] == "searchset"
+        return [(e["resource"]["managingOrganization"]["display"],
+                 e["resource"]["connectionType"]["code"]) for e in bundle["entry"]]
+
+    # by company name, then oldest first
+    assert found() == [("Alpha", "hl7-fhir-rest"), ("Alpha", "web-page"),
+                       ("Beta", "web-page")]
+    assert found("?organization=beta") == [("Beta", "web-page")]
+    assert found("?organization=Organization/alpha,beta") == found()
+    assert found("?connection-type=web-page") == [
+        ("Alpha", "web-page"), ("Beta", "web-page")]
+    # a code this server does not have matches nothing rather than everything
+    assert found("?connection-type=hl7-fhir-msg") == []
+    assert found("?organization=alpha&connection-type="
+                 "http://terminology.hl7.org/CodeSystem/endpoint-connection-type"
+                 "|hl7-fhir-rest") == [("Alpha", "hl7-fhir-rest")]
+
+
+def test_an_endpoint_is_changed_only_by_the_company_advertising_it(client):
+    mine = register(client, "Mine")
+    theirs = register(client, "Theirs")
+    ep_id = advertise(client, mine, endpoint(
+        extension=[{"url": DESC_EXT, "valueString": "Ask for a token"}])).json()["id"]
+    path = "/fhir/Endpoint/" + ep_id
+
+    assert client.post("/fhir/Endpoint", json=endpoint()).status_code == 401
+    assert client.put(path, json=endpoint()).status_code == 401
+    assert client.delete(path).status_code == 401
+    assert advertise(client, theirs, endpoint("https://evil.example.org"),
+                     ep_id).status_code == 403
+    assert client.delete(path, headers={"Authorization": "Bearer " + theirs}
+                         ).status_code == 403
+    # a refused write wrote nothing
+    kept = client.get(path).json()
+    assert kept["address"] == "https://fhir.example.org/r4"
+    assert kept["extension"][0]["valueString"] == "Ask for a token"
+
+    res = advertise(client, mine, endpoint("https://new.example.org", kind="web-page",
+                                           name="Docs"), ep_id)
+    assert res.status_code == 200
+    # PUT replaces whole: the description it no longer carries is gone
+    assert client.get(path).json()["address"] == "https://new.example.org"
+    assert client.get(path).json()["name"] == "Docs"
+    assert "extension" not in client.get(path).json()
+    assert client.delete(path, headers={"Authorization": "Bearer " + mine}
+                         ).status_code == 204
+    assert client.get(path).status_code == 404
+    assert "endpoint" not in client.get("/fhir/Organization/mine").json()
+    assert client.get("/fhir/Endpoint/%d" % 2 ** 63).status_code == 404
+
+
+def test_a_missing_endpoint_is_404_to_its_would_be_owner_too(client):
+    tok = register(client, "Owner")
+    assert advertise(client, tok, endpoint(), "999").status_code == 404
+    assert client.delete("/fhir/Endpoint/999",
+                         headers={"Authorization": "Bearer " + tok}).status_code == 404
+    # PUT is not create-on-update here: ids are the server's to hand out
+    assert client.get("/fhir/Endpoint").json()["total"] == 0
+
+
+def test_a_put_whose_body_names_another_endpoint_is_refused(client):
+    tok = register(client, "Owner")
+    first = advertise(client, tok, endpoint("https://one.example.org")).json()["id"]
+    second = advertise(client, tok, endpoint("https://two.example.org")).json()["id"]
+    res = advertise(client, tok, endpoint("https://new.example.org", id=second), first)
+    assert res.status_code == 400 and "URL's" in diagnostics(res)
+    assert client.get("/fhir/Endpoint/" + first).json()["address"] == "https://one.example.org"
+    # the matching id is fine
+    assert advertise(client, tok, endpoint("https://new.example.org", id=first),
+                     first).status_code == 200
+
+
+def test_an_endpoint_deleted_mid_update_is_404_not_500(client, monkeypatch):
+    """A colleague's Remove landing between the ownership check and the write."""
+    tok = register(client, "Owner")
+    ep_id = advertise(client, tok, endpoint()).json()["id"]
+    real = app_module.owned_endpoint
+
+    def racing(conn, endpoint_id, team):
+        row = real(conn, endpoint_id, team)
+        other = sqlite3.connect(app_module.db_path(), timeout=0.2)
+        try:
+            other.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+            other.commit()
+        except sqlite3.OperationalError:
+            pass  # held off by the writer's lock, which is the point
+        finally:
+            other.close()
+        return row
+
+    monkeypatch.setattr(app_module, "owned_endpoint", racing)
+    res = advertise(client, tok, endpoint("https://new.example.org"), ep_id)
+    assert res.status_code in (200, 404), res.text
+
+
+def test_an_endpoint_id_is_never_handed_to_the_next_company(client):
+    """Endpoint/N is pasted into other systems; it must not start meaning
+    somebody else's address once its owner deletes it."""
+    x = register(client, "Xenon")
+    advertise(client, x, endpoint())
+    newest = advertise(client, x, endpoint()).json()["id"]
+    assert client.delete("/fhir/Endpoint/" + newest,
+                         headers={"Authorization": "Bearer " + x}).status_code == 204
+    theirs = advertise(client, register(client, "Yttrium"), endpoint()).json()["id"]
+    assert theirs != newest
+    assert client.get("/fhir/Endpoint/" + newest).status_code == 404
+
+
+def test_whoami_lists_the_companys_endpoints_like_every_other_read(client):
+    tok = register(client, "Alpha")
+    beta = register(client, "Beta")
+    ids = [advertise(client, beta, endpoint()).json()["id"] for _ in range(2)]
+    refs = [{"reference": "Endpoint/" + i} for i in ids]
+    me = client.get("/fhir/Organization/$me", headers={"Authorization": "Bearer " + beta})
+    assert me.json()["endpoint"] == refs
+    assert client.get("/fhir/Organization/beta").json()["endpoint"] == refs
+    listed = {e["resource"]["id"]: e["resource"]
+              for e in client.get("/fhir/Organization").json()["entry"]}
+    assert listed["beta"]["endpoint"] == refs and "endpoint" not in listed["alpha"]
+    assert "endpoint" not in client.get(
+        "/fhir/Organization/$me", headers={"Authorization": "Bearer " + tok}).json()
+
+
+def test_an_endpoint_that_fails_to_store_at_registration_takes_the_company_with_it(
+        client, monkeypatch):
+    """Same transaction: otherwise the retry is a 409 for the name."""
+    def broken(conn, team_id, fields):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    real = app_module.insert_endpoint
+    monkeypatch.setattr(app_module, "insert_endpoint", broken)
+    body = as_params(name="Unlucky")
+    body["parameter"].append({"name": "endpoint", "resource": endpoint()})
+    with pytest.raises(sqlite3.OperationalError):
+        client.post("/fhir/$register", json=body)
+    monkeypatch.setattr(app_module, "insert_endpoint", real)
+    assert client.get("/fhir/Organization").json()["total"] == 0
+    assert register(client, "Unlucky")
+
+
+def test_a_name_that_is_taken_gets_no_endpoint_attached(client):
+    register(client, "Acme")
+    body = as_params(name="acme")
+    body["parameter"].append({"name": "endpoint", "resource": endpoint()})
+    assert client.post("/fhir/$register", json=body).status_code == 409
+    assert "endpoint" not in client.get("/fhir/Organization/acme").json()
+    assert client.get("/fhir/Endpoint").json()["total"] == 0
+
+
+@pytest.mark.parametrize("parts, fragment", [
+    # one is dropped otherwise, and the 200 says nothing about which
+    ([{"name": "endpoint", "resource": endpoint()},
+      {"name": "endpoint", "resource": endpoint(kind="web-page")}], "more than once"),
+    ([{"name": "endpoint", "resource": [endpoint()]}], "Endpoint resource"),
+    ([{"name": "endpoint", "resource": None}], "Endpoint resource"),
+    ([{"name": "endpoint", "Resource": endpoint()}], "no value[x] or resource"),
+])
+def test_an_endpoint_part_registration_cannot_use_is_refused(client, parts, fragment):
+    body = as_params(name="Careful")
+    body["parameter"].extend(parts)
+    res = client.post("/fhir/$register", json=body)
+    assert res.status_code == 400 and fragment in diagnostics(res)
+    assert client.get("/fhir/Organization").json()["total"] == 0
+
+
+def test_reset_knows_every_table_the_service_creates(tmp_path, monkeypatch):
+    """A table init_db() makes and reset.py does not clear survives the wipe -
+    and teams.id is reused afterwards, so its rows land on the next company."""
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    app_module.init_db()
+    conn = sqlite3.connect(app_module.db_path())
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name NOT LIKE 'sqlite_%'")}
+    finally:
+        conn.close()
+    assert tables == set(reset.TABLES)
+
+
+@pytest.mark.parametrize("mutate, fragment", [
+    (lambda b: b.update(address="javascript:alert(1)"), "http or https"),
+    (lambda b: b.update(address="ftp://files.example.org/"), "http or https"),
+    (lambda b: b.update(address="/fhir"), "http or https"),
+    (lambda b: b.update(address="https://"), "http or https"),
+    (lambda b: b.update(address="https://[::1"), "http or https"),
+    (lambda b: b.update(address="https://a.example.org/x y"), "http or https"),
+    (lambda b: b.update(address="https://a.example.org/" + "x" * 2000), "2000 characters"),
+    (lambda b: b.pop("address"), "http or https"),
+    (lambda b: b.pop("connectionType"), "connectionType"),
+    (lambda b: b.update(connectionType={"code": "dicom-wado-rs"}), "connectionType"),
+    (lambda b: b.update(connectionType={"code": "hl7-fhir-msg"}), "connectionType"),
+    (lambda b: b["connectionType"].update(system="http://example.org"),
+     "connectionType.system for hl7-fhir-rest is http://terminology.hl7.org"),
+    (lambda b: b.update(description="Ask for a token"), DESC_EXT),
+    # credentials for the address do not belong on a public list
+    (lambda b: b.update(header=["Authorization: Bearer s3cret"]), "public"),
+    (lambda b: b.update(extension=[{"url": DESC_EXT, "valueMarkdown": "x"}]),
+     "one valueString"),
+    (lambda b: b.update(extension=[{"url": DESC_EXT, "valueString": "a"},
+                                   {"url": DESC_EXT, "valueString": "b"}]),
+     "one valueString"),
+    (lambda b: b.update(status="off"), "DELETE"),
+    (lambda b: b.update(extension={"url": DESC_EXT}), "extension"),
+    (lambda b: b.update(resourceType="Organization"), "FHIR Endpoint"),
+])
+@pytest.mark.parametrize("verb", ["post", "put"])
+def test_an_endpoint_this_server_would_mislabel_is_refused(client, mutate, fragment, verb):
+    tok = register(client, "Advertiser")
+    existing = None
+    if verb == "put":
+        existing = advertise(client, tok, endpoint("https://kept.example.org")).json()["id"]
+    body = endpoint()
+    mutate(body)
+    res = advertise(client, tok, body, existing)
+    assert res.status_code == 400
+    assert fragment in diagnostics(res)
+    if existing:
+        # refused means unchanged, not half-written
+        assert client.get("/fhir/Endpoint/" + existing).json()["address"] \
+            == "https://kept.example.org"
+
+
+def test_a_company_advertises_only_so_many_endpoints(client):
+    tok = register(client, "Busy")
+    for _ in range(app_module.MAX_ENDPOINTS):
+        assert advertise(client, tok, endpoint()).status_code == 201
+    assert advertise(client, tok, endpoint()).status_code == 422
+    assert advertise(client, register(client, "Other"), endpoint()).status_code == 201
+
+
+def test_openapi_covers_the_endpoint_endpoints(client):
+    paths = client.get("/openapi.json").json()["paths"]
+    for path, verb in (("/fhir/Endpoint", "post"),
+                       ("/fhir/Endpoint/{endpoint_id}", "put"),
+                       ("/fhir/Endpoint/{endpoint_id}", "delete")):
+        assert paths[path][verb]["security"] == [{"TeamToken": []}], (path, verb)
+    assert "security" not in paths["/fhir/Endpoint"]["get"]
+    example = paths["/fhir/Endpoint"]["post"]["requestBody"]["content"][
+        "application/fhir+json"]["example"]
+    assert app_module.parse_endpoint(example)["kind"] == "hl7-fhir-rest"
+
+
+def test_the_page_spells_the_endpoint_description_as_the_server_does(client):
+    page = client.get("/").text
+    found = re.search(r'const ENDPOINT_DESCRIPTION_EXT\s*=\s*"([^"]+)"', page)
+    assert found and found.group(1) == DESC_EXT
+
+
 def test_screenshots_earn_nothing(client, monkeypatch):
     """Interop stays unscored, so a wall of screenshots cannot be farmed."""
     consume_first_pass(client, monkeypatch)
@@ -3357,6 +3702,8 @@ def practice_data_dir(path):
     conn.execute("CREATE TABLE notifications (id INTEGER PRIMARY KEY, sub INTEGER)")
     conn.execute("INSERT INTO subscriptions (team) VALUES (1)")
     conn.executemany("INSERT INTO notifications (sub) VALUES (?)", [(1,), (1,), (1,)])
+    conn.execute("CREATE TABLE endpoints (id INTEGER PRIMARY KEY, team INTEGER)")
+    conn.executemany("INSERT INTO endpoints (team) VALUES (?)", [(1,), (1,)])
     conn.commit()
     conn.close()
     for rel in ("submissions/acme/1.json", "renderings/acme/shot.png"):
@@ -3372,8 +3719,9 @@ def test_reset_clears_every_table_and_both_trees(tmp_path):
     removed = reset.clear(data)
     # The directories are counted too: a wipe that took forty teams' uploads
     # but no rows must not report itself as "nothing to clear".
-    assert removed == {"notifications": 3, "subscriptions": 1, "renderings": 1,
-                       "submissions": 2, "teams": 1, "team directories": 2}
+    assert removed == {"notifications": 3, "subscriptions": 1, "endpoints": 2,
+                       "renderings": 1, "submissions": 2, "teams": 1,
+                       "team directories": 2}
     conn = sqlite3.connect(os.path.join(data, reset.DB_NAME))
     for table in reset.TABLES:
         assert conn.execute("SELECT count(*) FROM %s" % table).fetchone()[0] == 0

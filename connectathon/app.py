@@ -428,6 +428,20 @@ def init_db() -> None:
                 WHERE kind = 'event-notification';
             CREATE INDEX IF NOT EXISTS notifications_subscription
                 ON notifications (subscription_id);
+            -- Where a company takes documents in directly. kind is the
+            -- connectionType code; see ENDPOINT_KINDS. AUTOINCREMENT for the
+            -- same reason as subscriptions: Endpoint/3 is a URL people paste
+            -- into their own systems, and must not come to mean another
+            -- company's address.
+            CREATE TABLE IF NOT EXISTS endpoints (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                team_id     INTEGER NOT NULL REFERENCES teams(id),
+                updated_at  TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                name        TEXT NOT NULL DEFAULT '',
+                address     TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         # Migrate pre-richness databases in place.
@@ -2145,22 +2159,43 @@ async def image_body(
 TEAM_IDENTIFIER_SYSTEM = "https://nordichackathon2026.blogs.dsv.su.se/fhir/company"
 
 
-def organization_resource(row: sqlite3.Row) -> dict:
-    return {
+def organization_resource(row: sqlite3.Row, endpoints=()) -> dict:
+    resource = {
         "resourceType": "Organization",
         "id": row["slug"],
         "identifier": [{"system": TEAM_IDENTIFIER_SYSTEM, "value": row["slug"]}],
         "active": True,
         "name": row["name"],
     }
+    if endpoints:
+        resource["endpoint"] = [
+            {"reference": "Endpoint/%d" % endpoint_id} for endpoint_id in endpoints
+        ]
+    return resource
+
+
+def endpoints_by_team(conn: sqlite3.Connection) -> dict[int, list[int]]:
+    """team id -> the ids of the Endpoints it advertises, oldest first."""
+    out: dict[int, list[int]] = {}
+    for row in conn.execute("SELECT id, team_id FROM endpoints ORDER BY id"):
+        out.setdefault(row["team_id"], []).append(row["id"])
+    return out
+
+
+def team_endpoints(conn: sqlite3.Connection, team_id: int) -> list[int]:
+    """The ids of the Endpoints one company advertises, oldest first."""
+    return [row["id"] for row in conn.execute(
+        "SELECT id FROM endpoints WHERE team_id = ? ORDER BY id", (team_id,))]
 
 
 async def parameters_body(request: Request) -> dict:
     """A Parameters resource body, flattened to {name: value}.
 
     FHIR operations take their input as Parameters, so that is what the
-    operations here accept. Only the first value[x] of each part is read;
-    repeats and nested parts are not used by any operation on this server.
+    operations here accept. A part's value is its `resource`, or else its
+    first value[x]. No operation here takes a parameter twice, so a repeat is
+    a 400 rather than one of the two being quietly dropped; nested parts are
+    not used.
     """
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
     try:
@@ -2176,10 +2211,24 @@ async def parameters_body(request: Request) -> dict:
     for part in parts if isinstance(parts, list) else []:
         if not isinstance(part, dict) or not isinstance(part.get("name"), str):
             continue
+        if part["name"] in out:
+            raise HTTPException(
+                400, detail="Parameter `%s` is given more than once" % part["name"])
+        # Taken whatever it is, so that a malformed resource reaches the
+        # operation and is refused there rather than vanishing here.
+        if "resource" in part:
+            out[part["name"]] = part["resource"]
+            continue
         for key, value in part.items():
             if key.startswith("value"):
                 out[part["name"]] = value
                 break
+        else:
+            # A miscased "Resource" or a nested `part` would otherwise vanish,
+            # and register would go ahead without it.
+            raise HTTPException(
+                400, detail="Parameter `%s` has no value[x] or resource"
+                            % part["name"])
     return out
 
 
@@ -2190,7 +2239,10 @@ async def parameters_body(request: Request) -> dict:
         "One registration per company. Takes a Parameters resource with a "
         "`name`, and a `code` as well when the server sets REGISTER_CODE. The "
         "token comes back once and is not retrievable afterwards, so share it "
-        "inside the company rather than registering again."
+        "inside the company rather than registering again. An optional "
+        "`endpoint` part carrying an Endpoint resource advertises where your "
+        "system takes documents in, exactly as POST Endpoint would - a bad "
+        "one is a 400 and registers nothing."
     ),
 )
 def register(params: dict = Depends(parameters_body)) -> Response:
@@ -2210,6 +2262,14 @@ def register(params: dict = Depends(parameters_body)) -> Response:
     team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
         raise HTTPException(400, detail="Company name must be 2-40 characters")
+    # Checked before anything is written, and written in the same transaction
+    # as the company: a registration that stored the company and then refused
+    # its endpoint could not be retried, the name being taken by then.
+    endpoint = params.get("endpoint")
+    if "endpoint" in params:
+        if not isinstance(endpoint, dict) or endpoint.get("resourceType") != "Endpoint":
+            raise HTTPException(400, detail="`endpoint` must carry an Endpoint resource")
+        endpoint = parse_endpoint(endpoint)
     token = secrets.token_hex(8)
     with connect() as conn:
         # The slug probe and the insert have to see the same table state, or
@@ -2226,11 +2286,12 @@ def register(params: dict = Depends(parameters_body)) -> Response:
         row = conn.execute(
             "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
         ).fetchone()
+        endpoints = [insert_endpoint(conn, row["id"], endpoint)] if endpoint else []
     return fhir_response(
         parameters(
             [
                 ("token", token),
-                ("organization", organization_resource(row)),
+                ("organization", organization_resource(row, endpoints)),
                 (
                     "note",
                     "One registration per company. Register once and share "
@@ -2261,10 +2322,11 @@ def search_organizations(
         rows = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
         ).fetchall()
+        endpoints = endpoints_by_team(conn)
     return fhir_response(
         searchset(
             [
-                organization_resource(r)
+                organization_resource(r, endpoints.get(r["id"], ()))
                 for r in rows
                 if name_matches(r["name"], name, name_contains, name_exact)
             ]
@@ -2282,7 +2344,9 @@ def search_organizations(
     ),
 )
 def whoami(team: sqlite3.Row = Depends(current_team)) -> Response:
-    return fhir_response(organization_resource(team))
+    with connect() as conn:
+        endpoints = team_endpoints(conn, team["id"])
+    return fhir_response(organization_resource(team, endpoints))
 
 
 @app.get("/fhir/Organization/{slug}",
@@ -2294,9 +2358,10 @@ def read_organization(slug: str) -> Response:
         row = conn.execute(
             "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
         ).fetchone()
-    if row is None:
-        raise HTTPException(404, detail="Unknown company")
-    return fhir_response(organization_resource(row))
+        if row is None:
+            raise HTTPException(404, detail="Unknown company")
+        endpoints = team_endpoints(conn, row["id"])
+    return fhir_response(organization_resource(row, endpoints))
 
 
 @app.post("/fhir/Bundle/$validate",
@@ -3339,6 +3404,313 @@ SERVER_OPERATIONS = [
 ]
 
 
+# ------------------------------------------------------------ endpoints
+
+# The other direction from $exchange. Downloading a partner's document tests
+# whether you can read what they produce; a company whose platform would
+# rather be sent documents says where here - its FHIR base, or a page that
+# explains how to get data in. An Endpoint is only that announcement. Nothing
+# here calls the address: a receiver that wants every passing document pushed
+# at it subscribes, and an address on this list is for people to try by hand.
+ENDPOINT_CONNECTION_SYSTEM = (
+    "http://terminology.hl7.org/CodeSystem/endpoint-connection-type")
+ENDPOINT_PAYLOAD_SYSTEM = "http://terminology.hl7.org/CodeSystem/endpoint-payload-type"
+# R4 has no Endpoint.description; R5 does, and the cross-version extension is
+# how an R4 server carries an R5 element.
+ENDPOINT_DESCRIPTION_EXT = (
+    "http://hl7.org/fhir/5.0/StructureDefinition/extension-Endpoint.description")
+# code -> (system, display). connectionType is extensibly bound in R4 and its
+# value set has nothing for "a page that tells a person what to do", so that
+# one code is coined here.
+ENDPOINT_KINDS = {
+    "hl7-fhir-rest": (ENDPOINT_CONNECTION_SYSTEM, "HL7 FHIR"),
+    "web-page": (CANONICAL_BASE + "/CodeSystem/endpoint-connection-type", "Web page"),
+}
+# Per company: a FHIR base, the page about it, and room for a staging box
+# and a colleague's laptop. Anything past that is a list nobody reads.
+MAX_ENDPOINTS = 5
+MAX_ENDPOINT_NAME_CHARS = 100
+MAX_ADDRESS_CHARS = 2000
+
+ENDPOINT_SELECT = """
+    SELECT e.*, t.name AS team_name, t.slug AS team_slug
+    FROM endpoints e JOIN teams t ON t.id = e.team_id
+"""
+
+
+def parse_endpoint(payload: dict) -> dict:
+    """The columns of an endpoint out of an Endpoint resource, or a 400 that
+    says which element to fix."""
+    status = payload.get("status")
+    if status not in (None, "active"):
+        raise HTTPException(
+            400, detail="status must be active - to stop advertising an "
+                        "endpoint, DELETE it")
+
+    coding = payload.get("connectionType")
+    code = coding.get("code") if isinstance(coding, dict) else None
+    kind = ENDPOINT_KINDS.get(code) if isinstance(code, str) else None
+    if kind is None:
+        raise HTTPException(
+            400, detail="connectionType.code must be one of %s"
+                        % ", ".join(ENDPOINT_KINDS))
+    if coding.get("system") not in (None, kind[0]):
+        raise HTTPException(
+            400, detail="connectionType.system for %s is %s, or leave it out"
+                        % (code, kind[0]))
+
+    address = payload.get("address")
+    try:
+        parts = urllib.parse.urlsplit(address) if isinstance(address, str) else None
+        host = parts.hostname if parts else None
+    except ValueError:  # an unclosed [ in an IPv6 host
+        parts = host = None
+    # The address is drawn as a link on the page, so anything but http(s) -
+    # javascript: above all - is refused here rather than escaped there.
+    if (parts is None or parts.scheme not in ("http", "https") or not host
+            or any(c.isspace() or not c.isprintable() for c in address)):
+        raise HTTPException(
+            400, detail="address must be an absolute http or https URL")
+    if len(address) > MAX_ADDRESS_CHARS:
+        raise HTTPException(
+            400, detail="address is longer than %d characters" % MAX_ADDRESS_CHARS)
+
+    name = payload.get("name")
+    name = " ".join(name.split()) if isinstance(name, str) else ""
+    # Endpoint.header is where a client would put credentials for whoever
+    # calls the address. Nobody here calls it and everybody can read it.
+    if "header" in payload:
+        raise HTTPException(
+            400, detail="Endpoint.header is not kept - this list is public. Say "
+                        "how to authenticate in the %s extension instead"
+                        % ENDPOINT_DESCRIPTION_EXT)
+    # R5 has Endpoint.description; R4 does not, and an R4 parser would drop
+    # it. Saying so beats storing an endpoint without the instructions.
+    if "description" in payload:
+        raise HTTPException(
+            400, detail="Endpoint has no description in R4 - send it as the "
+                        "%s extension's valueString" % ENDPOINT_DESCRIPTION_EXT)
+    descriptions = _extension_values(payload, ENDPOINT_DESCRIPTION_EXT,
+                                     "valueString", "extension")
+    if len(descriptions) > 1 or not all(isinstance(d, str) for d in descriptions):
+        raise HTTPException(
+            400, detail="The description extension takes one valueString")
+    description = descriptions[0].strip() if descriptions else ""
+    return {
+        "kind": code,
+        "name": name[:MAX_ENDPOINT_NAME_CHARS],
+        "address": address,
+        "description": description[:MAX_NOTE_CHARS],
+    }
+
+
+def endpoint_resource(row: sqlite3.Row) -> dict:
+    system, display = ENDPOINT_KINDS[row["kind"]]
+    resource = {
+        "resourceType": "Endpoint",
+        "id": str(row["id"]),
+        "meta": {"lastUpdated": row["updated_at"]},
+        "status": "active",
+        "connectionType": {"system": system, "code": row["kind"],
+                           "display": display},
+        "managingOrganization": {
+            "reference": "Organization/%s" % row["team_slug"],
+            "display": row["team_name"],
+        },
+        # 1..* in R4. A page takes nothing; a FHIR endpoint takes whatever its
+        # description says, which no code here could say better.
+        "payloadType": [{"coding": [
+            {"system": ENDPOINT_PAYLOAD_SYSTEM, "code": "none", "display": "None"}
+            if row["kind"] == "web-page" else
+            {"system": ENDPOINT_PAYLOAD_SYSTEM, "code": "any", "display": "Any"}
+        ]}],
+        "address": row["address"],
+    }
+    if row["name"]:
+        resource["name"] = row["name"]
+    if row["description"]:
+        resource["extension"] = [{"url": ENDPOINT_DESCRIPTION_EXT,
+                                  "valueString": row["description"]}]
+    return resource
+
+
+def insert_endpoint(conn: sqlite3.Connection, team_id: int, fields: dict) -> int:
+    """Store what parse_endpoint() returned; the new endpoint's id."""
+    return conn.execute(
+        "INSERT INTO endpoints (team_id, updated_at, kind, name, address, "
+        "description) VALUES (?, ?, ?, ?, ?, ?)",
+        (team_id, datetime.now(timezone.utc).isoformat(), fields["kind"],
+         fields["name"], fields["address"], fields["description"]),
+    ).lastrowid
+
+
+def fetch_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | None:
+    # An id past what SQLite can hold is no endpoint, rather than an
+    # OverflowError on binding it.
+    if abs(endpoint_id) >= 2 ** 63:
+        return None
+    return conn.execute(ENDPOINT_SELECT + " WHERE e.id = ?", (endpoint_id,)).fetchone()
+
+
+def owned_endpoint(
+    conn: sqlite3.Connection, endpoint_id: int, team: sqlite3.Row
+) -> sqlite3.Row:
+    """The endpoint, if this company is the one advertising it. Unlike a
+    subscription it is public, so somebody else's is a 403 and not a 404."""
+    row = fetch_endpoint(conn, endpoint_id)
+    if row is None:
+        raise HTTPException(404, detail="Unknown Endpoint")
+    if row["team_id"] != team["id"]:
+        raise HTTPException(403, detail="That endpoint belongs to another company")
+    return row
+
+
+async def endpoint_body(
+    request: Request, team: sqlite3.Row = Depends(current_team)
+) -> dict:
+    """The Endpoint resource, read only once the caller is known."""
+    raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Endpoint")
+    try:
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError, RecursionError):
+        raise HTTPException(400, detail="Body is not valid JSON")
+    if not isinstance(payload, dict) or payload.get("resourceType") != "Endpoint":
+        raise HTTPException(400, detail="Body must be a FHIR Endpoint")
+    return payload
+
+
+@app.post("/fhir/Endpoint",
+    tags=["Interop"],
+    status_code=201,
+    summary="Advertise where your system takes documents in",
+    description=(
+        "Tell the other companies how to send data straight to your system, "
+        "to complement them downloading documents from $exchange. "
+        "`connectionType.code` is `hl7-fhir-rest` for a FHIR base or "
+        "`web-page` for a page that explains how; `address` is the http(s) URL, `name` a short "
+        "label, and the R5 Endpoint.description extension is where to say "
+        "what to send and how to authenticate. `managingOrganization` is "
+        "taken from your token. The server never calls the address. 400 for "
+        "an address that is not an http(s) URL, a connectionType other than "
+        "these two or a status other than active; 422 over the per-company "
+        "limit."
+    ),
+)
+def create_endpoint(
+    payload: dict = Depends(endpoint_body),
+    team: sqlite3.Row = Depends(current_team),
+) -> Response:
+    fields = parse_endpoint(payload)
+    with connect() as conn:
+        # The count and the insert see the same table, or two simultaneous
+        # creates both find room for the last one.
+        conn.execute("BEGIN IMMEDIATE")
+        held = conn.execute(
+            "SELECT COUNT(*) FROM endpoints WHERE team_id = ?", (team["id"],)
+        ).fetchone()[0]
+        if held >= MAX_ENDPOINTS:
+            raise HTTPException(
+                422, detail="A company can advertise %d endpoints - delete one, "
+                            "or PUT over it" % MAX_ENDPOINTS)
+        row = fetch_endpoint(conn, insert_endpoint(conn, team["id"], fields))
+    return fhir_response(
+        endpoint_resource(row),
+        status=201,
+        Location="%s/Endpoint/%d" % (FHIR_BASE, row["id"]),
+    )
+
+
+@app.get("/fhir/Endpoint",
+    tags=["Interop"],
+    summary="Where companies take documents in",
+    description=(
+        "Every advertised endpoint, by company name. Open to read: the point "
+        "of one is that the rest of the room finds it. `organization` narrows "
+        "it to one company's slug, `connection-type` to `hl7-fhir-rest` or "
+        "`web-page`; both take a comma-separated list."
+    ),
+)
+def search_endpoints(
+    organization: str | None = None,
+    connection_type: str | None = Query(None, alias="connection-type"),
+) -> Response:
+    # A reference search parameter takes the bare id or Type/id; a token one
+    # may carry its system before a |, which is dropped rather than checked.
+    slugs = {v.removeprefix("Organization/") for v in organization.split(",")} \
+        if organization else None
+    kinds = {v.rpartition("|")[2] for v in connection_type.split(",")} \
+        if connection_type else None
+    with connect() as conn:
+        rows = conn.execute(
+            ENDPOINT_SELECT + " ORDER BY t.name COLLATE NOCASE, e.id"
+        ).fetchall()
+    return fhir_response(searchset([
+        endpoint_resource(r) for r in rows
+        if (slugs is None or r["team_slug"] in slugs)
+        and (kinds is None or r["kind"] in kinds)
+    ]))
+
+
+@app.get("/fhir/Endpoint/{endpoint_id}",
+    tags=["Interop"],
+    summary="One advertised endpoint",
+)
+def read_endpoint(endpoint_id: int) -> Response:
+    with connect() as conn:
+        row = fetch_endpoint(conn, endpoint_id)
+    if row is None:
+        raise HTTPException(404, detail="Unknown Endpoint")
+    return fhir_response(endpoint_resource(row))
+
+
+@app.put("/fhir/Endpoint/{endpoint_id}",
+    tags=["Interop"],
+    summary="Replace an endpoint you advertise",
+    description=(
+        "The body replaces the endpoint whole, as in POST. Only the company "
+        "advertising it may; 403 otherwise."
+    ),
+)
+def update_endpoint(
+    endpoint_id: int,
+    payload: dict = Depends(endpoint_body),
+    team: sqlite3.Row = Depends(current_team),
+) -> Response:
+    if payload.get("id") not in (None, str(endpoint_id)):
+        raise HTTPException(
+            400, detail="The body's id is %r but the URL's is %d"
+                        % (payload["id"], endpoint_id))
+    fields = parse_endpoint(payload)
+    with connect() as conn:
+        # The ownership check and the write see the same row, or a DELETE
+        # landing between them leaves nothing to read back.
+        conn.execute("BEGIN IMMEDIATE")
+        owned_endpoint(conn, endpoint_id, team)
+        conn.execute(
+            "UPDATE endpoints SET updated_at = ?, kind = ?, name = ?, "
+            "address = ?, description = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), fields["kind"],
+             fields["name"], fields["address"], fields["description"],
+             endpoint_id),
+        )
+        return fhir_response(endpoint_resource(fetch_endpoint(conn, endpoint_id)))
+
+
+@app.delete("/fhir/Endpoint/{endpoint_id}",
+    tags=["Interop"],
+    status_code=204,
+    summary="Stop advertising an endpoint",
+    description="Only the company advertising it can remove it; 403 otherwise.",
+)
+def delete_endpoint(
+    endpoint_id: int, team: sqlite3.Row = Depends(current_team)
+) -> Response:
+    with connect() as conn:
+        owned_endpoint(conn, endpoint_id, team)
+        conn.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+    return Response(status_code=204)
+
+
 # ------------------------------------------------------------ subscriptions
 
 # "Tell my platform when a new document lands", so that loading a partner's
@@ -4133,6 +4505,35 @@ def metadata() -> Response:
                         },
                         {"type": "Binary", "interaction": [{"code": "read"}]},
                         {
+                            "type": "Endpoint",
+                            "documentation":
+                                "Where a company takes documents in directly. "
+                                "connectionType is %s; the description rides "
+                                "in %s. Open to read; a company writes only "
+                                "its own." % (
+                                    ", ".join("%s|%s" % (system, code)
+                                              for code, (system, _)
+                                              in ENDPOINT_KINDS.items()),
+                                    ENDPOINT_DESCRIPTION_EXT),
+                            "interaction": [
+                                {"code": "read"},
+                                {"code": "search-type"},
+                                {"code": "create"},
+                                {"code": "update"},
+                                {"code": "delete"},
+                            ],
+                            "searchParam": [
+                                {"name": "organization", "type": "reference",
+                                 "definition": "http://hl7.org/fhir/"
+                                               "SearchParameter/Endpoint-organization",
+                                 "documentation": "The company advertising it"},
+                                {"name": "connection-type", "type": "token",
+                                 "definition": "http://hl7.org/fhir/SearchParameter/"
+                                               "Endpoint-connection-type",
+                                 "documentation": ", ".join(ENDPOINT_KINDS)},
+                            ],
+                        },
+                        {
                             "type": "Subscription",
                             # R4 has no SubscriptionTopic resource to list, so
                             # the backport IG has an R4 server advertise its
@@ -4544,7 +4945,16 @@ h2 { margin: 0 0 14px; font-size: var(--fs-large); }
 /* Their card spans the page now, but a company name, a token and a
    registration code are still short single values - left at 100% they would
    stretch a 16-character field across a metre of screen. */
-#register-card .row, #reg-code-row, #token-box, #token { max-width: 520px; }
+#register-card .row, #reg-code-row, #token-box, #token, #reg-ep { max-width: 520px; }
+#reg-ep select { width: auto; flex: none; }
+#company-view { max-width: 640px; }
+h3.company-sub { margin: 18px 0 4px; font-size: 0.95rem; }
+#my-eps:empty::before { content: "Nothing yet - add an address below.";
+  display: block; margin-top: 8px; color: var(--muted); font-size: 0.86rem; }
+/* A button that reads as a link: switching views is navigation, not an action. */
+button.linkish { background: none; border: 0; padding: 0; font: inherit;
+  color: var(--accent); text-decoration: underline; cursor: pointer; }
+button.linkish:hover { background: none; }
 label { display: block; font-size: 0.83rem; color: var(--muted); margin: 12px 0 4px; }
 input[type=text], textarea {
   width: 100%; padding: 12px; border: 1px solid var(--field-border);
@@ -4610,6 +5020,8 @@ tr.rank-3 td:first-child { box-shadow: inset 3px 0 0 var(--bronze); color: var(-
 .banner .score { float: right; }
 /* The banner carries its scoring breakdown as a title, so say so. */
 .banner[title] { cursor: help; }
+/* Inline text with an explanation in its title. */
+.hint { cursor: help; text-decoration: underline dotted; text-underline-offset: 3px; }
 .spinner { display: none; align-items: center; gap: 10px; margin-top: 14px;
   color: var(--muted); }
 .spinner.on { display: flex; }
@@ -4903,10 +5315,22 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 .io-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
   margin-top: 10px; }
 /* the upload form, folded away until a company says it has tested something */
-.shot-form { margin-top: 12px; padding: 12px 14px; border: 1px dashed var(--border);
-  border-radius: var(--r-card); background: var(--accent-soft); }
-.shot-form textarea { min-height: 64px; font-family: inherit; font-size: 0.86rem; }
+.shot-form, .ep-form { margin-top: 12px; padding: 12px 14px;
+  border: 1px dashed var(--border); border-radius: var(--r-card);
+  background: var(--accent-soft); }
+.shot-form textarea, .ep-form textarea, #reg-ep textarea { min-height: 64px;
+  font-family: inherit; font-size: 0.86rem; }
 .shot-form label { margin-top: 0; }
+/* advertised endpoints: one block per company, one row per address */
+.ep { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 4px; }
+.ep-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+.ep-kind { font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--muted); }
+.ep-addr { font-family: var(--font-mono); font-size: 0.84rem; overflow-wrap: anywhere; }
+.ep-desc { margin: 2px 0 0; font-size: 0.86rem; white-space: pre-wrap;
+  overflow-wrap: anywhere; }
+.ep-form > label:first-of-type { margin-top: 10px; }
 .shot-status { font-size: 0.82rem; margin: 8px 0 0; }
 .shot-status.err { color: var(--fail); }
 /* the gallery: one document, every system that rendered it, side by side */
@@ -4953,7 +5377,9 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   </div>
   <h1>Nordic Hackathon 2026</h1>
   <div class="sub-row">
-    <p class="sub">Submit your European Patient Summary (FHIR R4 Bundle) and get
+    <p class="sub">Submit your European Patient Summary (<span class="hint"
+    title="HL7 Europe publishes the European Patient Summary for FHIR R4 only - there is no R5 edition, and the EHDS implementing act that will settle a FHIR version for Europe is not due until March 2027. R4 is what EPS, IPS and MyHealth@EU build on today.">FHIR
+    R4 Bundle</span>) and get
     it validated against the HL7 EU EPS 1.0.0-ballot profile.</p>
     <a class="spec-link" href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
        target="_blank" rel="noopener">EPS 1.0.0-ballot spec</a>
@@ -5025,20 +5451,80 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <div class="submit-stack">
   <section class="card" id="register-card">
+    <div id="company-view" hidden>
+      <h2>Your company</h2>
+      <p class="muted" style="margin:0">Registered as <strong
+      id="company-name"></strong>. <button type="button" class="linkish"
+      id="reg-another">Register a different company</button></p>
+      <h3 class="company-sub">Where others can send you data</h3>
+      <p class="muted" style="margin:0">Listed on the <a href="#interop">Interop
+      tab</a>, so other companies can send their documents straight to you.</p>
+      <div id="my-eps"></div>
+      <div class="ep-form" id="ep-form">
+        <strong id="ep-form-title">Add an address</strong>
+        <label for="ep-kind">What it is</label>
+        <select id="ep-kind">
+          <option value="hl7-fhir-rest">FHIR server - send documents to it over REST</option>
+          <option value="web-page">Web page - explains how to send data in</option>
+        </select>
+        <label for="ep-address">Address</label>
+        <input type="text" id="ep-address" inputmode="url" autocomplete="off"
+          spellcheck="false" placeholder="https://fhir.example.org/r4">
+        <label for="ep-name">Label (optional)</label>
+        <input type="text" id="ep-name" maxlength="100" placeholder="e.g. Staging server">
+        <label for="ep-desc">How to send to it (optional)</label>
+        <textarea id="ep-desc" maxlength="2000"
+          placeholder="e.g. POST a document Bundle to /Bundle. Ask at our table for a token."></textarea>
+        <div class="io-actions">
+          <button id="ep-save">Add</button>
+          <button class="ghost" id="ep-cancel" hidden>Cancel</button>
+        </div>
+        <p class="shot-status" id="ep-status" hidden></p>
+      </div>
+    </div>
+    <div id="reg-view">
     <h2>Register your company</h2>
     <p class="muted" style="margin:0 0 4px">One registration per company -
     share the token with your colleagues.</p>
     <label for="reg-name">Company name</label>
     <div class="row">
       <input type="text" id="reg-name" maxlength="40" placeholder="e.g. FHIR Starters">
-      <button id="reg-btn">Register</button>
     </div>
     <div id="reg-code-row" hidden>
       <label for="reg-code">Registration code</label>
       <input type="text" id="reg-code" placeholder="from the organisers"
         autocomplete="off" spellcheck="false">
     </div>
+    <div id="reg-ep">
+      <label for="reg-ep-address">Where can others send data to your system?
+      (optional)</label>
+      <p class="muted" style="margin:0 0 6px">A FHIR server address, or a page
+      that explains how. It is listed on the <a href="#interop">Interop tab</a>
+      so other companies can send their documents straight to you.</p>
+      <div class="row">
+        <select id="reg-ep-kind" aria-label="What the address is">
+          <option value="hl7-fhir-rest">FHIR server</option>
+          <option value="web-page">Web page</option>
+        </select>
+        <input type="text" id="reg-ep-address" inputmode="url" autocomplete="off"
+          spellcheck="false" placeholder="https://fhir.example.org/r4">
+      </div>
+      <label for="reg-ep-desc">How to send to it (optional)</label>
+      <textarea id="reg-ep-desc" maxlength="2000"
+        placeholder="e.g. POST a document Bundle to /Bundle. Ask at our table for a token."></textarea>
+    </div>
+    <!-- After the optional fields, so they are seen before the click that
+         sends them. -->
+    <div class="row" style="margin-top:12px"><button id="reg-btn">Register</button></div>
     <div class="error-note" id="reg-error" role="alert"></div>
+    <div id="reg-back-wrap" hidden>
+      <p class="muted" style="margin:10px 0 0">Registering replaces the token
+      saved in this browser <strong id="reg-replace-name"></strong> - keep a
+      copy first: <code id="reg-replace-token"></code></p>
+      <p class="muted" style="margin:6px 0 0"><button type="button"
+      class="linkish" id="reg-back">Back to your company</button></p>
+    </div>
+    </div>
     <div class="token-box" id="token-box">
       <div class="row" style="justify-content:space-between">
         <code id="token-value"></code>
@@ -5055,6 +5541,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <label for="token">Company token</label>
     <input type="text" id="token" placeholder="paste your company token"
       autocomplete="off" spellcheck="false">
+    <p class="shot-status err" id="token-note" role="status" hidden
+      style="margin:4px 0 10px"></p>
     <label for="bundle">FHIR Bundle JSON (paste, or pick a file below)</label>
     <p class="muted" style="margin:-2px 0 6px">Bringing one of the
     <a href="#other-documents">other EHDS document types</a> instead? Send it
@@ -5143,12 +5631,29 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   screenshot below showing how it renders in your system with an optional note.
   This will enable everyone in the hackathon, including the clinicians, to
   appreciate how well your system renders the patient summary data.</p>
+  <p class="muted" style="margin:8px 0 0">It works the other way round too: if
+  your system can take documents in directly, say where on the
+  <a href="#submit">Submit tab</a> and it is listed under
+  <a href="#send-direct">Send to their system</a>, so others can push their
+  documents straight to you.</p>
 </section>
 
 <section class="card">
   <h2>Published documents</h2>
   <p class="muted" id="io-hint" style="margin:0" role="status"></p>
   <div id="io-partners"></div>
+</section>
+
+<section class="card" id="send-direct">
+  <h2>Send to their system</h2>
+  <p class="muted" style="margin:0">Some companies take documents straight
+  into their own system - a FHIR server to POST to, or a page that says how to
+  get data in. Send them yours, then ask how it came out.</p>
+  <p class="muted" id="ep-hint" style="margin:8px 0 0" role="status"></p>
+  <div id="ep-list"></div>
+  <p class="muted" style="margin:14px 0 0">Advertise your own when you
+  register, or add and change them later on the <a href="#submit">Submit
+  tab</a>.</p>
 </section>
 
 <details class="card">
@@ -5420,18 +5925,19 @@ function showTab(name) {
 
 function applyRoute(scroll) {
   const parts = routeParts();
-  const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0] : "leaderboard";
+  /* A hash that is not a tab may be a deep link to a card inside one, such as
+     #other-documents or #send-direct. The card's own tab is shown, a folded
+     card is opened, and it is scrolled into view; anything else falls through
+     to the leaderboard. */
+  const anchor = TABS.indexOf(parts[0]) < 0 && parts[0]
+    ? document.getElementById(parts[0]) : null;
+  const panel = anchor && anchor.closest(".tab-panel");
+  const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0]
+    : panel ? panel.id.replace(/^tab-/, "") : "leaderboard";
   showTab(tab);
-  /* #other-documents is a deep link into a folded card on the leaderboard tab,
-     not a tab of its own - it falls through to leaderboard above. Open it and
-     scroll it into view, or following the link from the submit page lands on a
-     closed summary and reads as a broken anchor. */
-  if (parts[0] === "other-documents") {
-    const fold = $("#other-documents");
-    if (fold) {
-      fold.open = true;
-      fold.scrollIntoView({ block: "start" });
-    }
+  if (panel) {
+    if (anchor.tagName === "DETAILS") anchor.open = true;
+    anchor.scrollIntoView({ block: "start" });
   }
   if (tab !== "clinical") return;
   if (!parts[1]) {
@@ -5462,6 +5968,26 @@ $("#reg-btn").addEventListener("click", async () => {
   try {
     const parts = [{ name: "name", valueString: name }];
     if (code) parts.push({ name: "code", valueString: code });
+    /* Sent with the registration rather than after it: the server stores both
+       or neither, so a mistyped address costs a retry, not the company name. */
+    const epAddress = $("#reg-ep-address").value.trim();
+    const epDesc = $("#reg-ep-desc").value.trim();
+    if (epAddress) {
+      if (!/^https?:\/\/\S+$/i.test(epAddress)) {
+        errBox.textContent = "The address has to be an http:// or https:// URL.";
+        errBox.style.display = "block";
+        return;
+      }
+      const ep = { resourceType: "Endpoint", status: "active",
+                   connectionType: { code: $("#reg-ep-kind").value },
+                   address: epAddress };
+      if (epDesc) ep.extension = [{ url: ENDPOINT_DESCRIPTION_EXT, valueString: epDesc }];
+      parts.push({ name: "endpoint", resource: ep });
+    } else if (epDesc) {
+      errBox.textContent = "Add the address the note is about, or clear the note.";
+      errBox.style.display = "block";
+      return;
+    }
     const res = await fetch("/fhir/$register", {
       method: "POST",
       headers: { "Content-Type": "application/fhir+json" },
@@ -5479,7 +6005,10 @@ $("#reg-btn").addEventListener("click", async () => {
     $("#token-value").textContent = paramOne(data, "token");
     $("#token-box").style.display = "block";
     syncToken(paramOne(data, "token"));
+    for (const id of ["#reg-name", "#reg-code", "#reg-ep-address", "#reg-ep-desc"])
+      $(id).value = "";
     refreshLeaderboard();
+    refreshCompany();
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
     errBox.style.display = "block";
@@ -7044,6 +7573,10 @@ const SUBSCRIPTION_TOPIC =
   "https://nordichackathon2026.blogs.dsv.su.se/fhir/SubscriptionTopic/document-passed";
 const PAYLOAD_CONTENT_EXT = "http://hl7.org/fhir/uv/subscriptions-backport/" +
   "StructureDefinition/backport-payload-content";
+/* ENDPOINT_DESCRIPTION_EXT, likewise: R5's Endpoint.description, carried on
+   R4 as a cross-version extension. */
+const ENDPOINT_DESCRIPTION_EXT =
+  "http://hl7.org/fhir/5.0/StructureDefinition/extension-Endpoint.description";
 function interopCurls() {
   $("#curl-exchange").textContent =
     "# every published document - organizationSlug is the PARTNER_SLUG below,\n" +
@@ -7080,7 +7613,20 @@ function interopCurls() {
     '         "payload": "application/fhir+json",\n' +
     '         "_payload": {"extension": [{\n' +
     '           "url": "' + PAYLOAD_CONTENT_EXT + '",\n' +
-    '           "valueCode": "full-resource"}]}}}\'';
+    '           "valueCode": "full-resource"}]}}}\'\n\n' +
+    "# or have documents sent to you: advertise where your system takes them\n" +
+    "# in - hl7-fhir-rest for a FHIR base, or web-page for a how-to page:\n" +
+    "curl -X POST " + origin + "/fhir/Endpoint \\\n" +
+    "     -H 'Authorization: Bearer TOKEN' \\\n" +
+    "     -H 'Content-Type: application/fhir+json' -d '{\n" +
+    '       "resourceType": "Endpoint", "status": "active",\n' +
+    '       "connectionType": {"code": "hl7-fhir-rest"},\n' +
+    '       "name": "Staging server", "address": "https://YOUR-PLATFORM/fhir",\n' +
+    '       "extension": [{"url": "' + ENDPOINT_DESCRIPTION_EXT + '",\n' +
+    '         "valueString": "POST a document Bundle to /Bundle"}]}\'\n' +
+    "# everyone's advertised endpoints, or one company's:\n" +
+    "curl -s " + origin + "/fhir/Endpoint\n" +
+    "curl -s '" + origin + "/fhir/Endpoint?organization=PARTNER_SLUG'";
 }
 $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
@@ -7165,16 +7711,40 @@ async function shrinkImage(file) {
    Withdraw on your own screenshots and nobody else's. Null when no token is
    saved, which is every clinician reading the wall. */
 let me = null;
+/* "none" with no token, "known", "rejected" when the server does not know the
+   token (a typo, or one from before a practice reset), "unreachable" when it
+   could not be asked. Only "rejected" may send someone to register again. */
+let meState = "none";
+let meToken = "";
+let meAsked = 0;
 async function whoAmI() {
   const token = $("#token").value.trim();
-  if (!token) { me = null; return; }
-  try {
-    const res = await fetch("/fhir/Organization/$me", {
-      headers: { "Authorization": "Bearer " + token },
-    });
-    /* An Organization: `id` is the slug, `name` the company name. */
-    me = res.ok ? await res.json() : null;
-  } catch (e) { me = null; }
+  const ask = ++meAsked;
+  let next = null, state = "none";
+  /* fetch throws before sending a header with characters it cannot carry - a
+     token pasted with smart quotes, say - which would read as the server being
+     down, for ever. Tokens are plain ASCII, so anything else is just wrong. */
+  if (token && !/^[\x21-\x7e]+$/.test(token)) state = "rejected";
+  else if (token) {
+    try {
+      const res = await fetch("/fhir/Organization/$me", {
+        headers: { "Authorization": "Bearer " + token },
+      });
+      /* An Organization: `id` is the slug, `name` the company name. */
+      if (res.ok) { next = await res.json(); state = "known"; }
+      else if (res.status === 401) state = "rejected";
+      else state = "unreachable";
+    } catch (e) { state = "unreachable"; }
+    /* A blip says nothing about the token, so the company it last belonged to
+       stands. */
+    if (state === "unreachable" && meToken === token) next = me;
+  }
+  /* Typing fires several of these; only the answer about the token in the
+     field now counts, whichever order they come back in. */
+  if (ask !== meAsked) return;
+  me = next;
+  meState = state;
+  meToken = token;
 }
 
 /* A DocumentReference, flattened to what the tile draws. author is the company
@@ -7399,11 +7969,297 @@ $("#io-partners").addEventListener("click", (ev) => {
   }
 });
 
+/* ---- advertised endpoints ---- */
+const EP_KINDS = { "hl7-fhir-rest": "FHIR server", "web-page": "How-to page" };
+/* [address, how-to] placeholders per kind, so the example under a web page
+   looks like a web page rather than a FHIR base. Both forms share them. */
+const EP_PLACEHOLDERS = {
+  "hl7-fhir-rest": ["https://fhir.example.org/r4",
+    "e.g. POST a document Bundle to /Bundle. Ask at our table for a token."],
+  "web-page": ["https://developer.yourcompany.com/docs/import-patient-summary",
+    "e.g. Create a sandbox account on the page, then upload the bundle " +
+    "under Import > Patient summary."],
+};
+function epPlaceholders(kind, address, desc) {
+  const [a, d] = EP_PLACEHOLDERS[kind.value] || EP_PLACEHOLDERS["hl7-fhir-rest"];
+  address.placeholder = a;
+  desc.placeholder = d;
+}
+for (const [k, a, d] of [["#ep-kind", "#ep-address", "#ep-desc"],
+                         ["#reg-ep-kind", "#reg-ep-address", "#reg-ep-desc"]]) {
+  $(k).addEventListener("change", () => epPlaceholders($(k), $(a), $(d)));
+}
+const epFormPlaceholders = () =>
+  epPlaceholders($("#ep-kind"), $("#ep-address"), $("#ep-desc"));
+/* An Endpoint, flattened to what a row draws. The description is R5's,
+   carried as an extension; managingOrganization is the company advertising. */
+function epFromResource(r) {
+  const org = r.managingOrganization || {};
+  const ext = (r.extension || []).find((x) => x.url === ENDPOINT_DESCRIPTION_EXT);
+  return { id: r.id, kind: (r.connectionType || {}).code, name: r.name || "",
+           address: r.address || "", description: (ext && ext.valueString) || "",
+           team: org.display, team_slug: String(org.reference || "").split("/").pop() };
+}
+let myEndpoints = {};
+let epEditing = null;
+
+/* editable: the company card's own list, with Edit and Remove. In the
+   Interop list a company's own rows point back there instead. */
+function epRow(e, editable) {
+  const mine = me && me.id === e.team_slug;
+  /* The server takes nothing but http(s), and this checks again rather than
+     trusting that: whatever is in href is what a click runs. */
+  const link = /^https?:\/\//i.test(e.address)
+    ? '<a class="ep-addr" href="' + esc(e.address)
+      + '" target="_blank" rel="noopener noreferrer nofollow">' + esc(e.address) + "</a>"
+    : '<code class="ep-addr">' + esc(e.address) + "</code>";
+  return '<div class="ep" data-ep="' + esc(e.id) + '">'
+    + '<div class="ep-head"><span class="ep-kind">' + esc(EP_KINDS[e.kind] || e.kind)
+    + "</span>" + (e.name ? "<span>" + esc(e.name) + "</span>" : "") + "</div>"
+    + link
+    + (e.description ? '<p class="ep-desc">' + esc(e.description) + "</p>" : "")
+    + (editable ? '<div class="io-actions">'
+        + '<button class="ghost" data-ep-edit="' + esc(e.id) + '">Edit</button>'
+        + '<button class="ghost" data-ep-del="' + esc(e.id) + '">Remove</button></div>'
+      : mine ? '<a class="muted" href="#submit">Change it on the Submit tab</a>' : "")
+    + "</div>";
+}
+
+let epAsked = 0;
+async function loadEndpoints() {
+  const hint = $("#ep-hint");
+  const box = $("#ep-list");
+  /* Two quick removes reload twice; the older answer must not land last and
+     bring back what the second one removed. */
+  const ask = ++epAsked;
+  try {
+    const res = await fetch("/fhir/Endpoint");
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    const eps = ((await res.json()).entry || []).map((x) => epFromResource(x.resource));
+    if (ask !== epAsked) return;
+    myEndpoints = {};
+    /* The server sorts by company, so a company's rows are already together. */
+    const groups = [];
+    for (const e of eps) {
+      if (me && me.id === e.team_slug) myEndpoints[e.id] = e;
+      const last = groups[groups.length - 1];
+      if (last && last.slug === e.team_slug) last.rows.push(e);
+      else groups.push({ slug: e.team_slug, team: e.team, rows: [e] });
+    }
+    hint.textContent = groups.length ? ""
+      : "No company has advertised an endpoint yet.";
+    box.innerHTML = groups.map((g) =>
+      '<div class="io-partner"><strong>' + esc(g.team) + "</strong>"
+      + g.rows.map((e) => epRow(e, false)).join("") + "</div>").join("");
+    $("#my-eps").innerHTML = Object.values(myEndpoints)
+      .map((e) => epRow(e, true)).join("");
+  } catch (e) {
+    if (ask !== epAsked) return;
+    /* Said in both places the list is drawn: an empty company card reads as
+       "nothing advertised yet", and invites adding the same address twice. */
+    hint.textContent = "Could not load the endpoints: " + e.message;
+    box.innerHTML = "";
+    myEndpoints = {};
+    $("#my-eps").innerHTML = '<p class="shot-status err">Could not load your '
+      + "addresses (" + esc(e.message) + ") - reload to try again.</p>";
+  }
+}
+
+function epStatus(text, isError) {
+  const p = $("#ep-status");
+  p.textContent = text;
+  p.classList.toggle("err", !!isError);
+  p.hidden = !text;
+}
+
+function epResetForm() {
+  epEditing = null;
+  $("#ep-kind").value = "hl7-fhir-rest";
+  epFormPlaceholders();
+  $("#ep-address").value = $("#ep-name").value = $("#ep-desc").value = "";
+  $("#ep-form-title").textContent = "Add an address";
+  $("#ep-save").textContent = "Add";
+  $("#ep-cancel").hidden = true;
+}
+
+function epEdit(id) {
+  const e = myEndpoints[id];
+  if (!e) return;
+  epEditing = id;
+  $("#ep-kind").value = e.kind;
+  epFormPlaceholders();
+  $("#ep-address").value = e.address;
+  $("#ep-name").value = e.name;
+  $("#ep-desc").value = e.description;
+  $("#ep-form-title").textContent = "Edit " + (e.name || e.address);
+  $("#ep-save").textContent = "Save changes";
+  $("#ep-cancel").hidden = false;
+  epStatus("");
+  $("#ep-form").scrollIntoView({ block: "nearest", behavior: "smooth" });
+  $("#ep-address").focus();
+}
+
+async function epSave() {
+  const token = $("#token").value.trim();
+  const address = $("#ep-address").value.trim();
+  if (!token) return epStatus("Paste your company token first.", true);
+  if (!/^https?:\/\/\S+$/i.test(address))
+    return epStatus("The address has to be an http:// or https:// URL.", true);
+  const desc = $("#ep-desc").value.trim();
+  const body = { resourceType: "Endpoint", status: "active",
+                 connectionType: { code: $("#ep-kind").value },
+                 address: address };
+  const name = $("#ep-name").value.trim();
+  if (name) body.name = name;
+  if (desc) body.extension = [{ url: ENDPOINT_DESCRIPTION_EXT, valueString: desc }];
+  const btn = $("#ep-save");
+  btn.disabled = true;
+  epStatus(epEditing ? "Saving..." : "Publishing...");
+  try {
+    const res = await fetch("/fhir/Endpoint" + (epEditing ? "/" + epEditing : ""), {
+      method: epEditing ? "PUT" : "POST",
+      headers: { "Authorization": "Bearer " + token,
+                 "Content-Type": "application/fhir+json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 401) {
+      /* The token stopped working while the page was open - a practice reset
+         overnight. Asking again flips the card to registration, which says so. */
+      epStatus("");
+      await refreshCompany();
+      return;
+    }
+    if (res.status === 404 && epEditing) {
+      /* Removed meanwhile, by a colleague or a practice reset. Staying in edit
+         mode would fail every Save the same way. */
+      epResetForm();
+      epStatus("That address no longer exists - add it again if you still need it.", true);
+      await loadEndpoints();
+      return;
+    }
+    if (!res.ok) {
+      epStatus(detailText(data) || ("Could not save (" + res.status + ")"), true);
+      return;
+    }
+    epStatus(epEditing ? "Saved." : "Added - it is listed on the Interop tab.");
+    epResetForm();
+    await loadEndpoints();
+  } catch (e) {
+    epStatus("Network error: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* Removing asks once, by relabelling its own button, as withdrawing a
+   screenshot does. */
+async function epRemove(btn, confirmed) {
+  const id = confirmed ? btn.dataset.epDelok : btn.dataset.epDel;
+  if (!confirmed) {
+    btn.textContent = "Remove - tap to confirm";
+    btn.dataset.epDelok = id;
+    delete btn.dataset.epDel;
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await fetch("/fhir/Endpoint/" + id, {
+      method: "DELETE",
+      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+    });
+    if (res.status === 401) { await refreshCompany(); return; }
+    /* 404 is the outcome asked for, reached some other way. */
+    if (!res.ok && res.status !== 404) {
+      const data = await res.json().catch(() => ({}));
+      btn.disabled = false;
+      return epStatus(detailText(data) || ("Could not remove (" + res.status + ")"), true);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    return epStatus("Network error: " + e.message, true);
+  }
+  if (epEditing === id) epResetForm();
+  epStatus("");
+  await loadEndpoints();
+}
+
+$("#my-eps").addEventListener("click", (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  if (btn.dataset.epEdit) epEdit(btn.dataset.epEdit);
+  else if (btn.dataset.epDel) epRemove(btn, false);
+  else if (btn.dataset.epDelok) epRemove(btn, true);
+});
+$("#ep-save").addEventListener("click", epSave);
+
+/* The register card turns into the company's own card once the page knows
+   whose token it holds: registering again is the rare case, changing where
+   you take data in is the common one. */
+function showCompanyCard(registering) {
+  const known = !!me && !registering;
+  $("#company-view").hidden = !known;
+  $("#reg-view").hidden = known;
+  /* Registering overwrites the saved token. Warn whenever that token may
+     still be good - including when the server could not be asked about it -
+     and offer the way back only when there is a company to go back to. */
+  const saved = $("#token").value.trim();
+  $("#reg-back-wrap").hidden = !saved || meState === "rejected" || (!!me && !registering);
+  $("#reg-back").parentNode.hidden = !me;
+  $("#reg-replace-name").textContent = me ? "for " + me.name : "";
+  $("#reg-replace-token").textContent = saved;
+  if (me) $("#company-name").textContent = me.name;
+  /* The verdict on the token sits under the token field itself, which is
+     often filled from localStorage rather than typed this session. */
+  const note = $("#token-note");
+  note.textContent = meState === "rejected"
+    ? "This token is not one this server knows - check it, or if it is from "
+      + "before a practice reset, register again."
+    : meState === "unreachable" && !me
+    ? "Could not check this token with the server - reload to try again."
+    : "";
+  note.hidden = !note.textContent;
+}
+async function refreshCompany() {
+  const before = me && me.id;
+  await whoAmI();
+  /* An address open for editing belongs to the company it was opened under. */
+  if ((me && me.id) !== before) {
+    epResetForm();
+    epStatus("");
+    /* Not the previous company's rows, and not "Nothing yet" either, until
+       this one's have arrived. */
+    myEndpoints = {};
+    $("#my-eps").innerHTML = '<p class="muted">Loading...</p>';
+  }
+  showCompanyCard(false);
+  await loadEndpoints();
+}
+$("#reg-another").addEventListener("click", () => {
+  showCompanyCard(true);
+  $("#reg-name").focus();
+});
+$("#reg-back").addEventListener("click", () => showCompanyCard(false));
+/* Typing or pasting a token settles on a company once the typing stops. */
+let tokenTimer = null;
+$("#token").addEventListener("input", () => {
+  clearTimeout(tokenTimer);
+  tokenTimer = setTimeout(refreshCompany, 400);
+});
+/* Interop's first visit waits on this rather than asking the same two
+   questions again. */
+const companyLoaded = refreshCompany();
+let interopEntered = false;
+$("#ep-cancel").addEventListener("click", () => { epResetForm(); epStatus(""); });
+
 async function initInterop() {
   interopCurls();
   const hint = $("#io-hint");
   const box = $("#io-partners");
-  await whoAmI();
+  /* The first visit shares the page-load check; later ones ask again, or the
+     list of where to send data is whatever it was when the page opened. */
+  if (interopEntered) { clearTimeout(tokenTimer); await refreshCompany(); }
+  else { interopEntered = true; await companyLoaded; }
   try {
     const res = await fetch("/fhir/$exchange");
     if (!res.ok) return;
@@ -7514,7 +8370,33 @@ SUBSCRIPTION_BODY = {
     },
 }
 
+ENDPOINT_EXAMPLE = {
+    "resourceType": "Endpoint",
+    "status": "active",
+    "connectionType": {"system": ENDPOINT_CONNECTION_SYSTEM,
+                       "code": "hl7-fhir-rest"},
+    "name": "Staging FHIR server",
+    "address": "https://fhir.example.org/r4",
+    "extension": [{
+        "url": ENDPOINT_DESCRIPTION_EXT,
+        "valueString": "POST a document Bundle to /Bundle. Ask at our table "
+                       "for a token.",
+    }],
+}
+ENDPOINT_BODY = {
+    "required": True,
+    "content": {
+        FHIR_JSON: {
+            "schema": {"type": "object", "description": "A FHIR Endpoint."},
+            "example": ENDPOINT_EXAMPLE,
+        },
+        "application/json": {"schema": {"type": "object"}},
+    },
+}
+
 OPENAPI_BODIES = {
+    ("/fhir/Endpoint", "post"): ENDPOINT_BODY,
+    ("/fhir/Endpoint/{endpoint_id}", "put"): ENDPOINT_BODY,
     ("/fhir/$register", "post"): {
         "required": True,
         "content": {
@@ -7626,6 +8508,9 @@ SUBMIT_RESPONSE_HEADERS = {
 
 # Endpoints that read the token. Anything else is open.
 TOKEN_REQUIRED = {
+    ("/fhir/Endpoint", "post"),
+    ("/fhir/Endpoint/{endpoint_id}", "put"),
+    ("/fhir/Endpoint/{endpoint_id}", "delete"),
     ("/fhir/Organization/$me", "get"),
     ("/fhir/Bundle/$validate", "post"),
     ("/fhir/DocumentReference", "post"),

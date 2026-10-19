@@ -106,6 +106,21 @@ RENDERINGS = [
      "document only has name.text."),
 ]
 
+# (company, connectionType code, name, address, description) - the
+# Send-to-their-system card on the interop tab. example.org addresses only:
+# nothing calls them, and nobody should be sent anywhere real from a preview.
+ENDPOINTS = [
+    ("Fabrikam Digital", "hl7-fhir-rest", "Staging FHIR server",
+     "https://fhir.fabrikam.example.org/r4",
+     "POST a document Bundle to /Bundle. No token needed on staging; it is "
+     "wiped every night."),
+    ("Fabrikam Digital", "web-page", "", "https://fabrikam.example.org/hackathon",
+     ""),
+    ("Litware EHR", "web-page", "Import guide", "https://litware.example.org/import",
+     "Upload a patient summary through the import page, or ask at table 7 for "
+     "API access."),
+]
+
 
 def mock_screenshot(seed):
     """A PNG that reads as a screenshot of somebody's summary view at thumbnail
@@ -317,6 +332,23 @@ def main():
         print("screenshot %-26s %s"
               % (producer, "by " + consumer if status == 201
                  else "FAILED (%s)" % why(body, status)))
+
+    for name, kind, label, address, description in ENDPOINTS:
+        if name not in tokens:
+            continue
+        resource = {"resourceType": "Endpoint", "status": "active",
+                    "connectionType": {"code": kind}, "address": address}
+        if label:
+            resource["name"] = label
+        if description:
+            resource["extension"] = [{
+                "url": "http://hl7.org/fhir/5.0/StructureDefinition/"
+                       "extension-Endpoint.description",
+                "valueString": description}]
+        status, body, _ = call(base + "/fhir/Endpoint", "POST",
+                               json.dumps(resource).encode(), tokens[name])
+        print("endpoint   %-26s %s" % (name, kind if status == 201
+                                       else "FAILED (%s)" % why(body, status)))
 
     status, board, _ = call(base + "/fhir/$leaderboard")
     if status == 200:
