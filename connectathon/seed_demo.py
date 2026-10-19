@@ -37,6 +37,7 @@ BUNDLES = {
     "rich": os.path.join(EXAMPLES, "rich-example.json"),
     "arne": os.path.join(SAMPLES, "arne-complex-care.json"),
     "andrea": os.path.join(SAMPLES, "andrea-cross-border.json"),
+    "ville": os.path.join(SAMPLES, "ville-difficult-airway.json"),
     "minor": os.path.join(EXAMPLES, "minor-example.json"),
     "official": os.path.join(EXAMPLES, "official-example.json"),
     "broken": os.path.join(EXAMPLES, "broken-example.json"),
@@ -56,7 +57,7 @@ BUNDLES = {
 PLAN = [
     ("Contoso Interop Lab", ["rich"]),
     ("Fabrikam Digital", ["arne"]),
-    ("Litware EHR", ["andrea"]),
+    ("Litware EHR", ["andrea", "ville"]),
     # Two attempts: a failure followed by a fix, so the attempts column and
     # "best submission wins" behaviour are both visible on one row. Then two
     # other categories, which is what fills the "Also" column and its chips.

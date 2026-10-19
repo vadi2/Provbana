@@ -1171,7 +1171,8 @@ def test_sample_list_is_labelled_synthetic(client):
     res = client.get("/fhir/$samples")
     assert "does not come from any real system" in param_one(res, "disclaimer")
     entries = param_entries(res)
-    assert {s["id"] for s in entries} == {"andrea-cross-border", "arne-complex-care"}
+    assert {s["id"] for s in entries} == {
+        "andrea-cross-border", "arne-complex-care", "ville-difficult-airway"}
     assert all(s["available"] for s in entries)
     assert all(s["name"] and s["tagline"] and s["scenario"] for s in entries)
     # each entry carries the URL its document is fetched from
@@ -1205,6 +1206,75 @@ def test_swedish_sample_is_classified_by_loinc_not_title(client):
     assert len(sections["problem"]["items"]) == 10
     labels = " ".join(i["label"] for i in sections["allergy"]["items"])
     assert "Penicillin" in labels
+
+
+def test_ville_sample_puts_the_alerts_first_with_their_evidence(client):
+    """The difficult-airway scenario lives or dies on the Alerts section: the
+    views must know it as its own category, read the priority from the
+    extension, and surface the author's note - which is where "what to do"
+    is written - rather than file the flags under "other"."""
+    data = client.get("/ui/documents/ville-difficult-airway").json()
+    sections = data["summary"]["sections"]
+    assert sections[0]["kind"] == "alert"
+    assert sections[0]["title"] == "Uppmärksamhetsinformation"
+    alerts = sections[0]["items"]
+    assert [a["category"] for a in alerts] == ["alert"] * 3
+    airway = alerts[0]
+    assert "luftväg" in airway["label"].lower()
+    assert "high priority" in airway["flags"]
+    assert airway["detail"].startswith("high priority; since 2016-03-15")
+    assert "fiberoptisk" in airway["note"]
+    assert airway["date"] == "2016-03-15"
+    assert airway["gaps"] == []
+    # medium priority is not a risk flag
+    assert "high priority" not in alerts[2]["flags"]
+
+
+def test_ville_sample_records_the_last_dose_as_an_administration(client):
+    """'When did he last take it' is a MedicationAdministration next to the
+    statement, dated and labelled as a last dose rather than counted as a
+    second active medicine without a dosage instruction."""
+    data = client.get("/ui/documents/ville-difficult-airway").json()
+    meds = next(s for s in data["summary"]["sections"] if s["kind"] == "medication")
+    last = [i for i in meds["items"] if "last dose" in i["flags"]]
+    assert len(last) == 2
+    assert last[0]["label"].startswith("Humira")
+    assert last[0]["detail"] == "given 2026-10-06; 40 mg subkutant"
+    assert last[0]["date"] == "2026-10-06"
+    assert last[0]["gaps"] == []
+    assert "active" not in last[0]["flags"]
+    active = [i for i in meds["items"] if "active" in i["flags"]]
+    assert len(active) == 4
+
+
+def test_ville_sample_patient_story_is_shown_as_narrative(client):
+    """A section with no entries and no emptyReason is its narrative: the
+    patient story says 'call him Ville', and 'No entries' would hide it."""
+    data = client.get("/ui/documents/ville-difficult-airway").json()
+    story = next(s for s in data["summary"]["sections"] if s["kind"] == "story")
+    assert story["items"] == [] and story["empty_reason"] is None
+    assert story["narrative"].startswith("Ville vill kallas Ville")
+    assert "\n" in story["narrative"] and "<" not in story["narrative"]
+    # sections with entries or a reason keep the old shape
+    allergies = next(s for s in data["summary"]["sections"] if s["kind"] == "allergy")
+    assert allergies["narrative"] is None and allergies["empty_reason"]
+    procedures = next(s for s in data["summary"]["sections"] if s["kind"] == "procedure")
+    link = next(i for i in procedures["items"] if i["label"].startswith("Anestesijournal"))
+    assert "https://journal.karolinska.example" in link["detail"]
+    assert data["summary"]["unreferenced"] == []
+    # the dashboard shows the prose as a card, not only the document view
+    text = client.get("/").text
+    assert "x.narrative" in text and "db-prose" in text
+
+
+def test_samples_label_a_samordningsnummer_as_one(client):
+    """Ville has no personnummer; the number shown must not be called one."""
+    samples = {s["id"]: s for s in param_entries(client.get("/fhir/$samples"))}
+    assert samples["ville-difficult-airway"]["personnummer"] == "20130482-2172"
+    assert samples["ville-difficult-airway"]["identifierLabel"] == "Samordningsnummer"
+    assert samples["arne-complex-care"]["identifierLabel"] == "Personnummer"
+    text = client.get("/").text
+    assert "s.identifierLabel" in text
 
 
 def test_sample_bundle_downloads_as_fhir(client):

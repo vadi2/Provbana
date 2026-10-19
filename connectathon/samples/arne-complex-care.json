@@ -430,7 +430,7 @@
         "id": "6c176c67-1aed-5cda-9a51-7833bc0e1246",
         "text": {
           "status": "generated",
-          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Name</th><td>Arne Bergström</td></tr><tr><th>Gender</th><td>male</td></tr><tr><th>Date of birth</th><td>1943-02-09</td></tr><tr><th>Identifier</th><td>194302096997</td></tr><tr><th>Preferred language</th><td>Swedish</td></tr><tr><th>Address</th><td>Ängsbacken 8 A, Falkenberg, SE</td></tr></table></div>"
+          "div": "<div xmlns=\"http://www.w3.org/1999/xhtml\"><table><tr><th>Name</th><td>Arne Bergström</td></tr><tr><th>Gender</th><td>male</td></tr><tr><th>Date of birth</th><td>1943-02-09</td></tr><tr><th>Identifier</th><td>194302096997</td></tr><tr><th>Preferred language</th><td>Swedish</td></tr><tr><th>Address</th><td>Ängsbacken 8 A, Falkenberg, SE</td></tr><tr><th>Contact</th><td>Mikael Bergström (Emergency Contact), +45 20 00 00 03</td></tr></table></div>"
         }
       }
     },

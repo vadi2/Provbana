@@ -9,6 +9,7 @@ Stdlib sqlite3 + FastAPI, no other runtime deps.
 """
 
 import base64
+import html as html_mod
 import http.client
 import json
 import os
@@ -691,7 +692,8 @@ def team_score(best_primary: int, first_pass: bool, secondary: int) -> int:
 
 # ---------------------------------------------------------------- clinician summary
 
-MEDICATION_TYPES = ("MedicationStatement", "MedicationRequest", "MedicationDispense")
+MEDICATION_TYPES = ("MedicationStatement", "MedicationRequest", "MedicationDispense",
+                    "MedicationAdministration")
 
 # Friendly wording for the standard list-empty-reason codes. Bundles carry the
 # reason as a code ("nilknown"), as display text ("Nil Known") or as both, and
@@ -897,6 +899,58 @@ def _humanize_type(rtype: str) -> str:
     return re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", rtype)
 
 
+FLAG_PRIORITY_EXT = "http://hl7.org/fhir/StructureDefinition/flag-priority"
+NOTE_EXT = "http://hl7.org/fhir/StructureDefinition/note"
+
+
+def _extensions(resource, url) -> list:
+    out = []
+    exts = resource.get("extension")
+    if isinstance(exts, list):
+        for ext in exts:
+            if isinstance(ext, dict) and ext.get("url") == url:
+                out.append(ext)
+    return out
+
+
+def _flag_priority(resource) -> str | None:
+    """PH / PM / PL from the core flag-priority extension, or None."""
+    for ext in _extensions(resource, FLAG_PRIORITY_EXT):
+        code = _concept_coding(ext.get("valueCodeableConcept"))[1]
+        if code:
+            return code.upper()
+    return None
+
+
+def _flag_note(resource) -> str | None:
+    """The EU Core Flag keeps its free text in the core `note` extension,
+    since Flag itself has no note element."""
+    for ext in _extensions(resource, NOTE_EXT):
+        ann = ext.get("valueAnnotation")
+        text = ann.get("text") if isinstance(ann, dict) else None
+        if isinstance(text, str) and text.strip():
+            return " ".join(text.split())
+    return None
+
+
+def _section_narrative(section) -> str | None:
+    """The section's own narrative as plain text, for a section that is its
+    narrative - a patient story has no entries, and "No entries" would be
+    the wrong thing to say about it."""
+    text = section.get("text")
+    div = text.get("div") if isinstance(text, dict) else None
+    if not isinstance(div, str):
+        return None
+    # Paragraph and row ends become line breaks so the prose keeps its shape;
+    # every other tag goes.
+    plain = re.sub(r"</(p|tr|div|li|h[1-6])\s*>", "\n", div, flags=re.I)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = html_mod.unescape(plain)
+    lines = [" ".join(line.split()) for line in plain.splitlines()]
+    plain = "\n".join(line for line in lines if line)
+    return plain or None
+
+
 # Code systems a clinician recognises by name; anything else falls back to the
 # system's host so provenance is still visible.
 CODE_SYSTEM_LABELS = {
@@ -915,11 +969,16 @@ CODE_SYSTEM_LABELS = {
 
 # Clinical grouping shared by every clinician view.
 ITEM_CATEGORIES = {
+    # An alert is what the author wants read before anything else - a
+    # difficult airway, an immunosuppressant - so it is its own category
+    # rather than "other", and the views put it first.
+    "Flag": "alert",
     "AllergyIntolerance": "allergy",
     "Condition": "problem",
     "MedicationStatement": "medication",
     "MedicationRequest": "medication",
     "MedicationDispense": "medication",
+    "MedicationAdministration": "medication",
     "Observation": "result",
     "Procedure": "procedure",
     "Immunization": "immunization",
@@ -938,6 +997,7 @@ ABNORMAL_INTERPRETATIONS = {
 }
 
 EVENT_DATE_FIELDS = {
+    "Flag": ("period",),
     "Condition": ("onsetDateTime", "onsetPeriod", "recordedDate"),
     "AllergyIntolerance": ("onsetDateTime", "recordedDate"),
     "Procedure": ("performedDateTime", "performedPeriod"),
@@ -946,6 +1006,8 @@ EVENT_DATE_FIELDS = {
     "MedicationStatement": ("effectiveDateTime", "effectivePeriod", "dateAsserted"),
     "MedicationRequest": ("authoredOn",),
     "MedicationDispense": ("whenHandedOver", "whenPrepared"),
+    "MedicationAdministration": ("effectiveDateTime", "effectivePeriod"),
+    "DocumentReference": ("date",),
     "CarePlan": ("period", "created"),
     "DeviceUseStatement": ("timingDateTime", "timingPeriod", "recordedOn"),
 }
@@ -1016,6 +1078,8 @@ def _primary_concept(resource, rtype, by_ref):
         if isinstance(categories, list) and categories:
             return categories[0]
         return None
+    if rtype == "DocumentReference":
+        return resource.get("type")
     return resource.get("code")
 
 
@@ -1072,10 +1136,18 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
         if not isinstance(reactions, list) or not reactions:
             gaps.append("no reaction recorded")
     elif category == "medication":
-        if not _dosage_detail(resource):
-            gaps.append("no dose")
-        if status == "active":
-            flags.append("active")
+        if rtype == "MedicationAdministration":
+            # One dose given on a date: it is neither "active" nor missing
+            # a dosage instruction, and the date is the whole point.
+            flags.append("last dose")
+        else:
+            if not _dosage_detail(resource):
+                gaps.append("no dose")
+            if status == "active":
+                flags.append("active")
+    elif category == "alert":
+        if _flag_priority(resource) == "PH":
+            flags.append("high priority")
     elif category == "problem":
         if status == "active":
             flags.append("active")
@@ -1109,7 +1181,10 @@ def _summary_quality(summary) -> dict:
         categories[category] = categories.get(category, 0) + 1
         if item.get("date"):
             dates.append(item["date"])
-    populated = sum(1 for sec in summary["sections"] if sec["items"])
+    # A narrative-only section (a patient story) carries data as surely as
+    # one with entries; it is only coded differently.
+    populated = sum(1 for sec in summary["sections"]
+                    if sec["items"] or sec.get("narrative"))
     return {
         "items": len(items),
         "coded": sum(1 for i in items if i.get("code")),
@@ -1127,6 +1202,8 @@ def _summary_quality(summary) -> dict:
 # IPS/EPS section identity. The LOINC code is the reliable signal - EPS documents
 # are written in the local language, so titles alone cannot be matched.
 SECTION_LOINC_KINDS = {
+    "104605-1": "alert",
+    "81338-6": "story",
     "48765-2": "allergy",
     "10160-0": "medication",
     "11450-4": "problem",
@@ -1141,6 +1218,7 @@ SECTION_LOINC_KINDS = {
 }
 
 SECTION_TITLE_KINDS = (
+    ("alert", "alert|uppm.rksamhet|varning|warnung"),
     ("allergy", "allerg|intoleran"),
     ("medication", "medicat|medikat|medicin|pharma"),
     ("problem", "problem|condition|diagnos|krankheit"),
@@ -1175,9 +1253,38 @@ def _render_resource(resource, by_ref) -> dict:
     rtype = rtype if isinstance(rtype, str) and rtype else "Resource"
     status = resource.get("status") if isinstance(resource.get("status"), str) else None
     detail = None
-    if rtype in MEDICATION_TYPES:
+    if rtype == "MedicationAdministration":
+        label = _medication_name(resource, by_ref)
+        given = _choice_str(resource, "effective")
+        dosage = resource.get("dosage")
+        dose = _first_str(dosage, "text") if isinstance(dosage, dict) else None
+        detail = "; ".join(p for p in (f"given {given}" if given else None, dose) if p) or None
+    elif rtype in MEDICATION_TYPES:
         label = _medication_name(resource, by_ref)
         detail = _dosage_detail(resource)
+    elif rtype == "Flag":
+        label = _cc_display(resource.get("code")) or "Alert"
+        parts = []
+        priority = _flag_priority(resource)
+        if priority:
+            parts.append({"PH": "high priority", "PM": "medium priority",
+                          "PL": "low priority"}.get(priority, priority))
+        since = _period_str(resource.get("period"))
+        if since:
+            parts.append(f"since {since}" if " to " not in since else since)
+        detail = "; ".join(parts) or None
+    elif rtype == "DocumentReference":
+        label = _first_str(resource, "description") or _cc_display(
+            resource.get("type")) or "Document"
+        url = None
+        contents = resource.get("content")
+        if isinstance(contents, list):
+            for content in contents:
+                att = content.get("attachment") if isinstance(content, dict) else None
+                url = _first_str(att, "url") if isinstance(att, dict) else None
+                if url:
+                    break
+        detail = "; ".join(p for p in (_cc_display(resource.get("type")), url) if p) or None
     elif rtype == "AllergyIntolerance":
         label = _cc_display(resource.get("code")) or "Allergy or intolerance"
         status = _cc_display(resource.get("clinicalStatus")) or status
@@ -1291,7 +1398,7 @@ def _render_resource(resource, by_ref) -> dict:
         else:
             label = _humanize_type(rtype)
     item = {"label": label, "detail": detail, "status": status,
-            "note": _note_text(resource)}
+            "note": _note_text(resource) if rtype != "Flag" else _flag_note(resource)}
     _annotate_item(item, resource, rtype, by_ref)
     return item
 
@@ -1441,19 +1548,25 @@ def summarize_bundle(bundle) -> dict:
                         target = _resolve_reference(ref_entry.get("reference"), by_ref)
                         if target is not None:
                             items.append(_render_resource(target, by_ref))
-                empty_reason = None
+                empty_reason = narrative = None
                 if not items:
                     empty_reason = _cc_display(section.get("emptyReason"))
                     if empty_reason:
                         empty_reason = EMPTY_REASON_LABELS.get(
                             _squash(empty_reason), empty_reason
                         )
+                    elif not isinstance(section.get("entry"), list):
+                        # No entries and no reason for the lack: the section's
+                        # content is its narrative (a patient story), so the
+                        # views show that rather than "No entries".
+                        narrative = _section_narrative(section)
                 summary["sections"].append(
                     {
                         "title": title,
                         "kind": _section_kind(section, title),
                         "items": items,
                         "empty_reason": empty_reason,
+                        "narrative": narrative,
                     }
                 )
         # Everything reachable from the Composition (section entries, authors,
@@ -2792,6 +2905,23 @@ SAMPLES = [
         "scenario_url":
             "https://drive.google.com/file/d/11dMseBg1439zSf2v8sRnWHSjrE18ZgLJ/view",
     },
+    {
+        "id": "ville-difficult-airway",
+        "name": "Vilhelm \"Ville\" Söderberg, 13",
+        "tagline": "Difficult airway and immunosuppressed, in a Gothenburg emergency department",
+        "scenario": (
+            "A Stockholm boy with a rare craniofacial syndrome, a known "
+            "difficult airway and juvenile spondyloarthritis on adalimumab and "
+            "methotrexate arrives at Sahlgrenska with a chest infection and "
+            "worsening breathing. The team that has never met him needs the "
+            "airway plan, the last anaesthetic, the last doses and who to "
+            "ring at Karolinska - before anyone reaches for a laryngoscope."
+        ),
+        "language": "Swedish",
+        "scenario_name": "The Ville Scenario",
+        "scenario_url":
+            "https://drive.google.com/file/d/1_PzonjLJ-BjW1sQYdL6YY1dS04T8Kkpp/view",
+    },
 ]
 
 SAMPLE_DISCLAIMER = (
@@ -2819,12 +2949,25 @@ def read_sample_bytes(sample_id: str) -> bytes | None:
 
 
 SE_PERSONNUMMER = "http://electronichealth.se/identifier/personnummer"
+SE_SAMORDNINGSNUMMER = "http://electronichealth.se/identifier/samordningsnummer"
+# The label the page prints in front of the number: a samordningsnummer looks
+# like a personnummer (day + 60) and must not be presented as one.
+SE_IDENTIFIER_LABELS = {
+    SE_PERSONNUMMER: "Personnummer",
+    SE_SAMORDNINGSNUMMER: "Samordningsnummer",
+}
 
 
 def sample_personnummer(raw: bytes | None) -> str | None:
     """The patient's personnummer as it is written on paper, YYYYMMDD-NNNN.
     Read off the bundle rather than kept in SAMPLES, so the page cannot
     disagree with the document it is describing."""
+    return (sample_identifier(raw) or (None, None))[1]
+
+
+def sample_identifier(raw: bytes | None) -> tuple[str, str] | None:
+    """(label, number) of the Swedish identity number in the bundle - a
+    personnummer or, for a patient without one, a samordningsnummer."""
     try:
         entries = json.loads(raw or b"").get("entry", [])
     except (ValueError, AttributeError):
@@ -2835,8 +2978,9 @@ def sample_personnummer(raw: bytes | None) -> str | None:
             continue
         for ident in resource.get("identifier", []):
             value = ident.get("value") or ""
-            if ident.get("system") == SE_PERSONNUMMER and len(value) == 12:
-                return value[:8] + "-" + value[8:]
+            label = SE_IDENTIFIER_LABELS.get(ident.get("system"))
+            if label and len(value) == 12:
+                return (label, value[:8] + "-" + value[8:])
     return None
 
 
@@ -2862,6 +3006,8 @@ def list_samples() -> Response:
                         "name": sample["name"],
                         "personnummer": sample_personnummer(
                             read_sample_bytes(sample["id"])),
+                        "identifierLabel": (sample_identifier(
+                            read_sample_bytes(sample["id"])) or ("", ""))[0] or None,
                         "tagline": sample["tagline"],
                         "scenario": sample["scenario"],
                         "scenarioName": sample["scenario_name"],
@@ -5258,7 +5404,11 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .chip.warn { color: var(--warn); background: var(--warn-bg); }
 .chip.ok { color: var(--pass); background: var(--pass-bg); }
 .chip.gap { color: var(--muted); background: var(--code-bg); border: 1px solid var(--border); }
+.db-note { list-style: none; font-size: 0.8rem; color: var(--muted); margin: 0 0 6px; }
+.cv-narrative p { margin: 2px 0 8px; font-size: 0.9rem; }
+.db-prose p { margin: 4px 0 6px; font-size: 0.82rem; }
 /* category colours, shared by timeline dots and legend */
+.c-alert { --cat: #e3362b; }
 .c-allergy { --cat: #d64545; }
 .c-problem { --cat: #c07a10; }
 .c-medication { --cat: #3f7fd6; }
@@ -6948,7 +7098,8 @@ function renderSampleList(box) {
         + esc(s.id) + '">' + esc(s.name) + "</a></strong>"
         + '<div class="cv-sub">' + esc(s.tagline) + "</div>"
         + (s.personnummer
-            ? '<div class="cv-sub">Personnummer ' + esc(s.personnummer) + "</div>"
+            ? '<div class="cv-sub">' + esc(s.identifierLabel || "Personnummer") + " "
+              + esc(s.personnummer) + "</div>"
             : "")
         + "</td>"
         + "<td>" + esc(s.language) + "</td>"
@@ -7090,12 +7241,12 @@ function cvItemHtml(item) {
 }
 
 /* ---- shared helpers for the clinician renderings ---- */
-const CAT_LABEL = { allergy: "Allergy", problem: "Problem", medication: "Medicine",
-  result: "Result", procedure: "Procedure", immunization: "Vaccination",
-  plan: "Care plan", device: "Device", other: "Other" };
-const CAT_ORDER = ["allergy", "problem", "medication", "result", "procedure",
+const CAT_LABEL = { alert: "Alert", allergy: "Allergy", problem: "Problem",
+  medication: "Medicine", result: "Result", procedure: "Procedure",
+  immunization: "Vaccination", plan: "Care plan", device: "Device", other: "Other" };
+const CAT_ORDER = ["alert", "allergy", "problem", "medication", "result", "procedure",
   "immunization", "device", "plan", "other"];
-const RISK_FLAGS = ["high risk", "severe", "abnormal"];
+const RISK_FLAGS = ["high risk", "high priority", "severe", "abnormal"];
 
 /* Split deliberately: a resource the document never references is not part of
    any section, so counting it under one contradicts that section's own
@@ -7250,6 +7401,7 @@ function viewDashboard(d) {
   const sections = s.sections || [];
   const items = cvSectionItems(s);
   const orphans = cvOrphans(s);
+  const alerts = cvCat(items, "alert");
   const allergies = cvCat(items, "allergy");
   const problems = cvCat(items, "problem");
   const meds = cvCat(items, "medication");
@@ -7270,6 +7422,31 @@ function viewDashboard(d) {
        p && p.birth_date ? "born " + esc(shortDate(p.birth_date)) : null]
       .filter(Boolean).join(" &middot; ")
     + "</div>", p && p.name ? "" : "alert");
+
+  /* The author's own "read this first": a difficult airway, an
+     immunosuppressant. Straight after the patient, before the allergies the
+     reader would otherwise start with, and its note shown in full - the note
+     is where the author says what to do about it. */
+  if (alerts.length) {
+    const urgent = alerts.filter((a) => hasFlag(a, "high priority"));
+    h += dbCard("Alerts",
+      '<div class="db-big">' + alerts.length
+      + (urgent.length ? ' <span class="chip cvc risk">' + urgent.length
+          + " high priority</span>" : "") + "</div>"
+      + dbList(urgent.concat(alerts.filter((a) => urgent.indexOf(a) === -1)), 5,
+          (i) => dbRow(i) + (i.note
+            ? '<li class="db-note">' + esc(i.note) + "</li>" : "")),
+      urgent.length ? "alert" : "");
+  }
+
+  /* A narrative-only section (the patient story: call him Ville, mother
+     knows the airway history) has no entries to count, so it is shown as
+     the prose it is, right after the alerts. */
+  sections.filter((x) => x.narrative).forEach((x) => {
+    h += dbCard(x.title || "Patient story",
+      '<div class="db-prose">' + x.narrative.split("\n")
+        .map((line) => "<p>" + esc(line) + "</p>").join("") + "</div>");
+  });
 
   const high = allergies.filter((a) => hasFlag(a, "high risk"));
   const orphanAllergies = cvCat(orphans, "allergy");
@@ -7362,7 +7539,7 @@ function viewDashboard(d) {
       + " summary categories</div>" + dbList(other, 5, dbRow));
   }
 
-  const empty = sections.filter((x) => !(x.items || []).length);
+  const empty = sections.filter((x) => !(x.items || []).length && !x.narrative);
   h += dbCard("Document coverage",
     '<div class="db-big">' + (sections.length - empty.length) + " / "
     + sections.length + "</div>"
@@ -7422,6 +7599,11 @@ function viewDocument(d) {
     html += '<h3 class="cv-sec">' + esc(sec.title || "Untitled section") + "</h3>";
     if (sec.items && sec.items.length) {
       html += '<ul class="cv-items">' + sec.items.map(cvItemHtml).join("") + "</ul>";
+    } else if (sec.narrative) {
+      // a section that is its narrative (a patient story): the prose is the
+      // content, shown as written
+      html += '<div class="cv-narrative">' + sec.narrative.split("\n")
+        .map((line) => "<p>" + esc(line) + "</p>").join("") + "</div>";
     } else if (sec.empty_reason) {
       html += '<p class="muted" style="margin:2px 0 8px">No entries - '
         + esc(sec.empty_reason) + "</p>";
