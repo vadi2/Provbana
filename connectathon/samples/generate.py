@@ -1598,8 +1598,14 @@ def build_ville():
     # home but change how the ward treats him.
     b.sections.append({
         "title": "Patientberättelse och önskemål",
-        "code": cc(LOINC, "81338-6",
-                   "Patient Goals, preferences, and priorities for care experience"),
+        # LOINC is what the EPS profile fixes; the SNOMED coding beside it is
+        # the closest the terminology has - it names the one preference in
+        # here that is structured anywhere, the preferred name.
+        "code": {"coding": [
+            {"system": LOINC, "code": "81338-6",
+             "display": "Patient Goals, preferences, and priorities for care experience"},
+            {"system": SCT, "code": "408676007", "display": "Patient preferred name"}],
+            "text": "Patientberättelse och önskemål"},
         "text": {"status": "generated", "div": paragraphs([
             "Ville vill kallas Ville, inte Vilhelm.",
             "Han vill att man berättar vad som ska hända innan det händer, "

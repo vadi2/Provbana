@@ -371,9 +371,14 @@
                   "system": "http://loinc.org",
                   "code": "81338-6",
                   "display": "Patient Goals, preferences, and priorities for care experience"
+                },
+                {
+                  "system": "http://snomed.info/sct",
+                  "code": "408676007",
+                  "display": "Patient preferred name"
                 }
               ],
-              "text": "Patient Goals, preferences, and priorities for care experience"
+              "text": "Patientberättelse och önskemål"
             },
             "text": {
               "status": "generated",
