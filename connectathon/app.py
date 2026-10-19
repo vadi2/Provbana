@@ -4942,6 +4942,16 @@ h2 { margin: 0 0 14px; font-size: var(--fs-large); }
    of them reads better with the page's full width. The cards space themselves,
    so this only has to stop them sharing a row. */
 .submit-stack { display: block; }
+/* The two interop pathways side by side, so neither reads as the footnote
+   to the other; they stack where a phone has no room for two columns. */
+.lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 16px; }
+.lane { min-width: 0; background: var(--code-bg); border: 1px solid var(--border);
+  border-radius: var(--r-card); padding: 16px 18px; }
+.lane h3 { margin: 2px 0 6px; font-size: 1.05rem; }
+.lane p.muted { margin: 0 0 8px; }
+.lane-n { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--muted); }
+@media (max-width: 640px) { .lanes { grid-template-columns: 1fr; } }
 /* Their card spans the page now, but a company name, a token and a
    registration code are still short single values - left at 100% they would
    stretch a 16-character field across a metre of screen. */
@@ -5622,20 +5632,31 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <section class="card">
   <h2>Interop testing</h2>
-  <p class="muted" style="margin:0 0 8px">Compliance proves you can produce a
-  valid patient summary, while interoperability testing proves another system
-  can consume it. Every company's best valid submission is published below as
-  its exchange document - take one, load one into your own system and see how
-  well it renders.</p>
-  <p class="muted" style="margin:0">After you've loaded the document, add a
-  screenshot below showing how it renders in your system with an optional note.
-  This will enable everyone in the hackathon, including the clinicians, to
-  appreciate how well your system renders the patient summary data.</p>
-  <p class="muted" style="margin:8px 0 0">It works the other way round too: if
-  your system can take documents in directly, say where on the
-  <a href="#submit">Submit tab</a> and it is listed under
-  <a href="#send-direct">Send to their system</a>, so others can push their
-  documents straight to you.</p>
+  <p class="muted" style="margin:0">There are two pathways to using this
+  platform and you should do both - 1) submit the document(s) for validation,
+  scoring, and clinical view and 2) exchange them with other participants in
+  the Hackathon.</p>
+  <div class="lanes">
+    <div class="lane">
+      <span class="lane-n">Pathway 1 &middot; Validate</span>
+      <h3>Send it to Provbana</h3>
+      <p class="muted">Matchbox checks it against HL7 EU EPS, the leaderboard
+      scores it and the clinical view renders it. Your best valid summary is
+      published below for others to fetch.</p>
+      <p class="muted" style="margin:0"><a href="#submit">Submit a bundle</a></p>
+    </div>
+    <div class="lane">
+      <span class="lane-n">Pathway 2 &middot; Exchange</span>
+      <h3>Send it to each other</h3>
+      <p class="muted">Fetch a partner's published document and load it into
+      your system, or push yours straight to an address they advertise. Then
+      add a screenshot of how it rendered, so everyone - the clinicians
+      included - can see.</p>
+      <p class="muted" style="margin:0"><a href="#io-partners">Published
+      documents</a> &middot; <a href="#send-direct">Send to their system</a>
+      &middot; <a href="#submit">Advertise your address</a></p>
+    </div>
+  </div>
 </section>
 
 <section class="card">
