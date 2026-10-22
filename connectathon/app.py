@@ -6929,7 +6929,8 @@ $("#submit-btn").addEventListener("click", async () => {
       text = "✖ INVALID - fix the " + errors + " error"
         + (errors === 1 ? "" : "s") + " below first";
       why = "Any error or fatal issue scores 0, whatever else the bundle carries."
-        + (isPrimary ? "" : " Checked against the " + docLabel(docType) + " guide.");
+        + (isPrimary ? "" : " Checked against the " + docLabel(docType) + " guide.")
+        + (score ? " " + standing : "");
     }
     banner.title = why;
     /* The category is on the banner whenever it is not the track's own
@@ -6939,7 +6940,10 @@ $("#submit-btn").addEventListener("click", async () => {
     banner.innerHTML = esc(text)
       + (isPrimary ? "" : '<span class="cat-chip" title="Validated against '
           + esc(docLabel(docType)) + '">' + esc(docShort(docType)) + "</span>")
-      + '<span class="score">' + score + " pts</span>";
+      /* A failed bundle shows its own 0: the standing an earlier pass earned,
+         printed beside "INVALID", reads as this bundle's score. It is still
+         in the hover text. */
+      + '<span class="score">' + (pass ? score : 0) + " pts</span>";
     renderIssues(outcome.issue || [], body);
     refreshLeaderboard();
   } catch (e) {

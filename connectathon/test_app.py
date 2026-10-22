@@ -3384,6 +3384,14 @@ def test_the_submit_tab_shows_findings_inside_the_document(client):
     assert "DOC_MAX_LINES" in text                               # a huge bundle stays usable
 
 
+def test_a_failed_bundle_does_not_show_an_earlier_score(client):
+    # X-Score is the standing, which an earlier pass keeps up; beside
+    # "INVALID" it read as this bundle's score. A fail shows its own 0.
+    text = client.get("/").text
+    assert '(pass ? score : 0) + " pts</span>"' in text
+    assert '+ (score ? " " + standing : "")' in text             # standing on hover
+
+
 
 # ---------------------------------------------------------------- backups
 
