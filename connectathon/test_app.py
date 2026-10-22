@@ -3345,8 +3345,9 @@ def test_page_ids_are_unique(client):
     """$() is querySelector, so of two elements sharing an id only the first is
     ever reached. The EHDS document table and the submit tab's embedded view
     once both used doc-body: the first validation wrote the bundle into the
-    leaderboard's table, and the embedded view stayed empty. Ids built in
-    script strings are not seen here - the parser treats script as text."""
+    EHDS table on the leaderboard tab, and the embedded view stayed empty.
+    Ids built in script strings are not seen here - the parser treats script
+    as text."""
     seen = []
 
     class Ids(html.parser.HTMLParser):
@@ -3356,6 +3357,28 @@ def test_page_ids_are_unique(client):
     Ids().feed(client.get("/").text)
     assert "doc-body" in seen and "lb-body" in seen       # the parser read the page
     assert sorted({i for i in seen if seen.count(i) > 1}) == []
+
+
+def test_every_id_the_script_looks_up_is_in_the_page(client):
+    """The other half of a rename: markup changed but a lookup left behind
+    returns null, or - worse - finds whatever still has the old id, and the
+    renamed element is never filled. Only literal ids are checked; the ones
+    in `built` are created by the script itself, after load."""
+    text = client.get("/").text
+    built = {"cv-paste", "cv-paste-go", "cv-pick"}
+    seen = set()
+
+    class Ids(html.parser.HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            seen.update(v for k, v in attrs if k == "id")
+
+    Ids().feed(text)
+    wanted = set(re.findall(r'\$\("#([\w-]+)', text))
+    wanted |= set(re.findall(r'getElementById\("([\w-]+)"\)', text))
+    assert "theme-btn" in wanted                    # the getElementById form is read
+    assert sorted(wanted - seen - built) == []
+    # the pair that once shared doc-body: each still reached by its own id
+    assert {"doc-body", "doc-types-body"} <= wanted
 
 
 def test_the_submit_tab_shows_findings_inside_the_document(client):
