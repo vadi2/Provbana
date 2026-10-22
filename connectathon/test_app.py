@@ -3362,22 +3362,16 @@ def test_page_ids_are_unique(client):
 def test_every_id_the_script_looks_up_is_in_the_page(client):
     """The other half of a rename: markup changed but a lookup left behind
     returns null, or - worse - finds whatever still has the old id, and the
-    renamed element is never filled. Only literal ids are checked; the ones
-    in `built` are created by the script itself, after load."""
+    renamed element is never filled. The first case is checked for every
+    literal lookup, against every literal id - markup the script builds
+    included. The second only shows as a renamed element nothing looks up,
+    so it is pinned for the pair that once shared doc-body."""
     text = client.get("/").text
-    built = {"cv-paste", "cv-paste-go", "cv-pick"}
-    seen = set()
-
-    class Ids(html.parser.HTMLParser):
-        def handle_starttag(self, tag, attrs):
-            seen.update(v for k, v in attrs if k == "id")
-
-    Ids().feed(text)
-    wanted = set(re.findall(r'\$\("#([\w-]+)', text))
+    defined = set(re.findall(r'\bid="([\w-]+)"', text))
+    wanted = set(re.findall(r'\$\("#([\w-]+)"\)', text))
     wanted |= set(re.findall(r'getElementById\("([\w-]+)"\)', text))
-    assert "theme-btn" in wanted                    # the getElementById form is read
-    assert sorted(wanted - seen - built) == []
-    # the pair that once shared doc-body: each still reached by its own id
+    assert sorted(wanted - defined) == []
+    assert "theme-btn" in wanted and "cv-pick" in defined    # both forms are read
     assert {"doc-body", "doc-types-body"} <= wanted
 
 
