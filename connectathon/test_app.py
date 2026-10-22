@@ -38,6 +38,7 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import backup
+import monitor
 import notify
 import reset
 import warm
@@ -121,6 +122,7 @@ def _pin_env(monkeypatch):
     monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 64 * 1024)
     monkeypatch.setattr(app_module, "MAX_SUBSCRIPTIONS", 5)
     monkeypatch.setattr(app_module, "PUBLIC_URL", "")
+    monkeypatch.setattr(app_module, "USAGE_DB", "")
     monkeypatch.delenv("SUBSCRIPTION_ALLOW_PRIVATE", raising=False)
     monkeypatch.setattr(app_module, "SAMPLES_DIR",
                         os.path.join(os.path.dirname(app_module.__file__), "samples"))
@@ -8469,3 +8471,281 @@ def test_a_forwarded_proto_list_uses_its_first_entry(client, hook):
     deliver(client)
     assert hook.statuses()[0]["subscription"]["reference"].startswith(
         "https://testserver/fhir/Subscription/")
+
+
+# ---------------------------------------------------------------- usage log and monitor
+
+
+def usage(client, sql, *args):
+    conn = sqlite3.connect(os.path.join(client.data_dir, "usage.db"))
+    try:
+        return conn.execute(sql, args).fetchall()
+    finally:
+        conn.close()
+
+
+@pytest.fixture()
+def mailbox(monkeypatch):
+    sent = []
+    monkeypatch.setattr(monitor, "send_mail",
+                        lambda subject, body: sent.append((subject, body)) or True)
+    return sent
+
+
+def test_requests_are_counted_by_route_template_and_by_who_sent_them(client):
+    client.get("/fhir/Bundle/1")
+    client.get("/fhir/Bundle/2")
+    client.get("/fhir/$leaderboard", headers={"Sec-Fetch-Site": "same-origin"})
+    client.get("/wp-login.php")
+    rows = usage(client, "SELECT method, route, status, via, count FROM hits ORDER BY route")
+    assert ("GET", "/fhir/Bundle/{bundle_id}", 404, "client", 2) in rows
+    assert ("GET", "/fhir/$leaderboard", 200, "browser", 1) in rows
+    # A scanner's made-up path is one bucket, not a row per guess.
+    assert ("GET", "(no route)", 404, "client", 1) in rows
+    assert not [r for r in rows if "wp-login" in r[1]]
+
+
+def test_visitors_are_hashed_per_day_and_not_stored_as_addresses(client):
+    client.get("/", headers={"Sec-Fetch-Site": "none", "X-Real-IP": "203.0.113.7"})
+    client.get("/fhir/$leaderboard", headers={"Sec-Fetch-Site": "same-origin",
+                                               "X-Real-IP": "203.0.113.7"})
+    client.get("/fhir/$leaderboard", headers={"X-Real-IP": "198.51.100.1"})
+    rows = usage(client, "SELECT via, visitor FROM visitors ORDER BY via")
+    assert [via for via, _ in rows] == ["browser", "client"]
+    assert all("203.0.113" not in v and "198.51" not in v for _, v in rows)
+
+
+def test_crawlers_and_link_checkers_are_hits_but_not_visitors(client):
+    client.get("/", headers={"User-Agent": "Googlebot/2.1"})
+    client.get("/", headers={"User-Agent": "python-requests/2.32"})
+    assert usage(client, "SELECT SUM(count) FROM hits WHERE route = '/'") == [(2,)]
+    assert usage(client, "SELECT COUNT(*) FROM visitors") == [(0,)]
+
+
+def test_the_monitors_own_probe_is_not_counted(client):
+    client.get("/fhir/$status", headers={"User-Agent": monitor.USER_AGENT})
+    assert not os.path.exists(os.path.join(client.data_dir, "usage.db"))
+
+
+def test_registrations_and_submissions_are_kept_as_events(client, monkeypatch):
+    tok = register(client, "Acme Health")
+    assert submit(client, tok, outcome(), monkeypatch).status_code == 200
+    assert submit(client, tok, outcome(errors=2), monkeypatch).status_code == 200
+    rows = usage(client, "SELECT kind, team, detail FROM events ORDER BY id")
+    assert rows[0][:2] == ("register", "Acme Health")
+    subs = [json.loads(r[2]) for r in rows[1:]]
+    assert [(r[0], r[1]) for r in rows[1:]] == [("submission", "acme-health")] * 2
+    assert [(s["doc"], s["passed"], s["errors"]) for s in subs] == [
+        ("eps", True, 0), ("eps", False, 2)]
+
+
+def test_the_events_survive_the_practice_reset(client, monkeypatch):
+    register(client, "Acme Health")
+    reset.clear(client.data_dir)
+    assert usage(client, "SELECT team FROM events") == [("Acme Health",)]
+
+
+def test_a_validator_outage_is_an_error_row_with_matchboxs_complaint(client, monkeypatch):
+    tok = register(client, "Acme Health")
+
+    def down(body, doc=None):
+        raise app_module.MatchboxError("Matchbox timed out after 60s")
+    monkeypatch.setattr(app_module, "validate_with_matchbox", down)
+    res = client.post("/fhir/Bundle/$validate", content=BUNDLE,
+                      headers={"X-Team-Token": tok, "Content-Type": "application/fhir+json"})
+    assert res.status_code == 502
+    assert usage(client, "SELECT source, method, route, status, message FROM errors") == [
+        ("server", "POST", "/fhir/Bundle/$validate", 502, "Matchbox timed out after 60s")]
+
+
+def test_an_unhandled_exception_is_recorded_with_its_traceback(tmp_path, monkeypatch):
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+
+    def explode():
+        raise RuntimeError("the leaderboard query fell over")
+    monkeypatch.setattr(app_module, "_leaderboard_rows", explode)
+    with TestClient(app_module.app, raise_server_exceptions=False) as c:
+        assert c.get("/fhir/$leaderboard").status_code == 500
+    conn = sqlite3.connect(str(tmp_path / "usage.db"))
+    (route, status, message), = conn.execute(
+        "SELECT route, status, message FROM errors").fetchall()
+    conn.close()
+    assert (route, status) == ("/fhir/$leaderboard", 500)
+    assert message.rstrip().endswith("RuntimeError: the leaderboard query fell over")
+
+
+def test_client_errors_are_counted_but_are_not_alerts(client):
+    client.post("/fhir/Bundle/$validate", content=BUNDLE)
+    assert usage(client, "SELECT status FROM hits") == [(401,)]
+    assert usage(client, "SELECT COUNT(*) FROM errors") == [(0,)]
+
+
+def test_a_broken_usage_log_costs_a_row_and_not_the_request(client, monkeypatch, tmp_path):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("")
+    monkeypatch.setattr(app_module, "USAGE_DB", str(blocker / "usage.db"))
+    tok = register(client, "Acme Health")
+    assert submit(client, tok, outcome(), monkeypatch).status_code == 200
+
+
+def test_the_page_reports_its_own_errors(client):
+    res = client.post("/ui/error", json={"message": "x is undefined",
+                                         "stack": "at render (/:1200:5)", "page": "/#tab-interop"})
+    assert res.status_code == 204
+    (source, message), = usage(client, "SELECT source, message FROM errors")
+    assert source == "browser"
+    assert message.splitlines() == ["x is undefined", "at render (/:1200:5)", "/#tab-interop"]
+    assert client.post("/ui/error", content=b"[1]").status_code == 400
+    assert client.post("/ui/error", content=b"x" * 20000).status_code == 413
+
+
+def test_the_page_installs_the_error_reporter_before_its_own_script():
+    page = app_module.INDEX_HTML
+    assert page.index('fetch("/ui/error"') < page.index('"use strict";')
+
+
+def test_error_rows_stop_at_the_daily_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(monitor, "MAX_ERRORS_PER_DAY", 3)
+    path = str(tmp_path / "usage.db")
+    for i in range(5):
+        monitor.record_error(path, "browser", "noise %d" % i)
+    monitor.record_error(path, "server", "real")
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT source, COUNT(*) FROM errors GROUP BY source ORDER BY source"
+                        ).fetchall() == [("browser", 3), ("server", 1)]
+    conn.close()
+
+
+def test_a_long_traceback_keeps_its_end():
+    msg = "frame\n" * 2000 + "ValueError: the real problem"
+    clipped = monitor._clip(msg)
+    assert len(clipped) <= monitor.MAX_MESSAGE_CHARS + 4
+    assert clipped.endswith("ValueError: the real problem")
+
+
+def test_the_first_error_mails_at_once_and_the_rest_wait_for_the_window(tmp_path, mailbox):
+    path = str(tmp_path / "usage.db")
+    t0 = datetime.datetime(2026, 11, 18, 9, 0, tzinfo=UTC)
+    monitor.record_error(path, "server", "boom", method="POST",
+                         route="/fhir/Bundle/$validate", status=502)
+    assert monitor.alert_errors(path, t0)
+    assert mailbox[0][0] == "1 error: 502 /fhir/Bundle/$validate"
+    assert "boom" in mailbox[0][1]
+    # Nothing new: nothing sent.
+    assert not monitor.alert_errors(path, t0 + datetime.timedelta(hours=1))
+    monitor.record_error(path, "server", "boom again", status=502, route="/x")
+    monitor.record_error(path, "browser", "oops")
+    later = t0 + datetime.timedelta(hours=1, minutes=5)
+    assert monitor.alert_errors(path, later)
+    monitor.record_error(path, "server", "and again", status=502, route="/x")
+    assert not monitor.alert_errors(path, later + datetime.timedelta(minutes=5))
+    assert monitor.alert_errors(path, later + datetime.timedelta(seconds=monitor.ALERT_EVERY))
+    assert [s for s, _ in mailbox] == ["1 error: 502 /fhir/Bundle/$validate",
+                                       "2 errors: 502 /x", "1 error: 502 /x"]
+
+
+def test_errors_stay_unalerted_when_the_mail_does_not_go(tmp_path, monkeypatch):
+    path = str(tmp_path / "usage.db")
+    monitor.record_error(path, "server", "boom", status=500)
+    monkeypatch.setattr(monitor, "send_mail", lambda subject, body: False)
+    assert not monitor.alert_errors(path)
+    sent = []
+    monkeypatch.setattr(monitor, "send_mail", lambda s, b: sent.append(s) or True)
+    assert monitor.alert_errors(path)
+    assert sent == ["1 error: 500"]
+
+
+def test_an_outage_is_one_mail_and_its_recovery_another(mailbox, monkeypatch):
+    monkeypatch.setattr(monitor, "HEALTH_FAILURES", 3)
+    health = monitor.Health()
+    t0 = datetime.datetime(2026, 11, 18, 9, 0, tzinfo=UTC)
+    for i in range(6):
+        health.observe("validator is down", t0 + datetime.timedelta(minutes=i))
+    assert [s for s, _ in mailbox] == ["service not healthy: validator is down"]
+    health.observe(None, t0 + datetime.timedelta(minutes=10))
+    health.observe(None, t0 + datetime.timedelta(minutes=11))
+    assert [s for s, _ in mailbox][1:] == ["recovered after 10 min"]
+
+
+def test_a_blip_shorter_than_the_threshold_mails_nothing(mailbox, monkeypatch):
+    monkeypatch.setattr(monitor, "HEALTH_FAILURES", 3)
+    health = monitor.Health()
+    health.observe("validator is down")
+    health.observe("validator is down")
+    health.observe(None)
+    health.observe("validator is down")
+    assert mailbox == []
+
+
+def test_the_probe_reads_matchbox_out_of_status(monkeypatch):
+    def answer(payload):
+        return lambda req, timeout: io.BytesIO(json.dumps(payload).encode())
+    up = {"resourceType": "Parameters", "parameter": [{"name": "matchbox", "valueString": "up"}]}
+    monkeypatch.setattr(monitor.urllib.request, "urlopen", answer(up))
+    assert monitor.probe_status("http://x/") is None
+    degraded = {"resourceType": "Parameters", "parameter": [
+        {"name": "matchbox", "valueString": "degraded"},
+        {"name": "missingIg", "valueString": "hl7se.fhir.base#1.1.0"}]}
+    monkeypatch.setattr(monitor.urllib.request, "urlopen", answer(degraded))
+    assert monitor.probe_status("http://x/") == "validator is degraded (missing hl7se.fhir.base#1.1.0)"
+
+    def refused(req, timeout):
+        raise urllib.error.URLError(ConnectionRefusedError("refused"))
+    monkeypatch.setattr(monitor.urllib.request, "urlopen", refused)
+    assert monitor.probe_status("http://x/").startswith("$status unreachable")
+
+
+def test_the_digest_tells_yesterday_as_it_happened(client, monkeypatch):
+    client.get("/", headers={"Sec-Fetch-Site": "none"})
+    tok = register(client, "Acme Health")
+    submit(client, tok, outcome(), monkeypatch)
+    submit(client, tok, outcome(errors=1), monkeypatch)
+    client.post("/fhir/Bundle/$validate", content=BUNDLE, headers={"X-Team-Token": "wrong"})
+    monkeypatch.setenv("PRACTICE_ENDS", "2026-11-18T03:00:00Z")
+    today = datetime.datetime.now(UTC).date()
+    subject, body = monitor.digest(os.path.join(client.data_dir, "usage.db"), today)
+    assert subject.startswith(today.isoformat() + ": 2 visitors, 2 submissions")
+    assert "Companies registered: 1 - Acme Health" in body
+    assert "Submissions: 2 from 1 company, 1 passed" in body
+    assert "401 POST /fhir/Bundle/$validate" in body
+
+
+def test_the_digest_goes_once_a_day_after_its_hour(tmp_path, mailbox, monkeypatch):
+    monkeypatch.setattr(monitor, "DIGEST_HOUR", 6)
+    path = str(tmp_path / "usage.db")
+    day = datetime.datetime(2026, 10, 20, 5, 59, tzinfo=UTC)
+    assert not monitor.maybe_send_digest(path, day)
+    assert monitor.maybe_send_digest(path, day.replace(hour=6))
+    assert not monitor.maybe_send_digest(path, day.replace(hour=23))
+    assert mailbox[0][0].startswith("2026-10-19: ")
+    assert monitor.maybe_send_digest(path, day + datetime.timedelta(days=1, hours=1))
+    assert mailbox[1][0].startswith("2026-10-20: ")
+
+
+def test_yesterdays_salt_is_gone_once_the_day_is(tmp_path):
+    path = str(tmp_path / "usage.db")
+    monitor.record_request(path, "GET", "/", 200, "browser", "203.0.113.7", "Firefox")
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE salts SET day = '2026-01-01'")
+    conn.commit()
+    monitor.prune(path)
+    assert conn.execute("SELECT COUNT(*) FROM salts").fetchone() == (0,)
+    # The counts stay.
+    assert conn.execute("SELECT COUNT(*) FROM visitors").fetchone() == (1,)
+    conn.close()
+
+
+def test_without_smtp_a_mail_is_logged_not_lost(monkeypatch, capsys):
+    monkeypatch.setattr(monitor, "SMTP_HOST", "")
+    assert monitor.send_mail("test", "hello")
+    assert "hello" in capsys.readouterr().out
+
+
+def test_an_unreachable_smtp_server_is_a_failed_send_not_a_crash(monkeypatch):
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    monkeypatch.setattr(monitor, "SMTP_HOST", "127.0.0.1")
+    monkeypatch.setattr(monitor, "SMTP_PORT", port)
+    monkeypatch.setattr(monitor, "MAIL_TO", "organiser@example.org")
+    assert monitor.send_mail("test", "hello") is False

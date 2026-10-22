@@ -23,6 +23,9 @@ COPY warm.py .
 # And the subscription notifier, which drains the queue the service fills. The
 # service imports it too, for the endpoint check, so it is not optional here.
 COPY notify.py .
+# And the usage log and its mailer: the service imports it to record requests
+# and errors, and the monitor container runs it to send the alerts and digest.
+COPY monitor.py .
 # Only the bundles: generate.py is the authoring tool, not part of the service.
 COPY samples/*.json ./samples/
 

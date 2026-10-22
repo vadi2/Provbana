@@ -325,6 +325,51 @@ rough timing and why the same engines survive far longer on a roomy heap - hence
 reading is inferred from the behaviour rather than read out of Matchbox's source, which
 is why the fix does not depend on it being right.
 
+## Usage and alerts
+
+The service keeps a usage log, `usage.db`, separate from the results database so that
+the nightly practice reset does not wipe it. `monitor.py --loop` runs as its own
+container, reads the log and emails the organiser in three cases:
+
+* **Errors, straight away.** Any 5xx from the service, with the traceback, or with
+  Matchbox's complaint for a 502. Also any JavaScript error the page reports about itself
+  through `POST /ui/error`. The first error is mailed at once. Any more within
+  `ALERT_EVERY` (15 minutes) are batched into the next mail.
+* **The service not healthy.** `$status` does not answer `up` for five checks in a row,
+  one a minute. You get one mail when it goes down and one when it recovers. This is
+  what catches a dead validator when nobody happens to be submitting.
+* **A digest every morning**, at `DIGEST_HOUR` (06:00 UTC), covering the previous UTC
+  day:
+  * people in a browser and integration clients
+  * companies registered
+  * submissions by document type, and how many passed
+  * 4xx per API route, since a run of 401s means a team has lost its token
+  * a seven-day trend
+
+```
+python monitor.py --loop                     # how it runs in compose
+python monitor.py --digest [--day 2026-10-19] # print a day's digest, send nothing
+python monitor.py --test-email               # check the SMTP settings
+```
+
+On the box, the same commands work through
+`docker compose -f docker-compose.prod.yml exec monitor python monitor.py --digest`.
+
+Mail goes out over SMTP, configured by the `SMTP_*` and `MAIL_*` variables in
+`.env.example`. Use port 587, because Hetzner Cloud blocks outbound 25 and 465. Without
+`SMTP_HOST` every message is written to the container's log instead.
+
+What it stores is coarse on purpose:
+
+* Requests are counted per day, route template and status, never per raw path.
+* Visitors are counted as a hash of address and user agent, under a salt that changes
+  daily and is deleted when the day ends.
+* No cookies, and nothing goes to a third party.
+
+A browser counts as one visitor and anything else that calls `/fhir` counts as an
+integration client. The split comes from `Sec-Fetch-Site`, which browsers send and API
+clients do not. Rows older than `USAGE_RETAIN_DAYS` (180) are pruned.
+
 ## Scoring
 
 Any error or fatal validation issue scores the submission **0**. A valid **patient

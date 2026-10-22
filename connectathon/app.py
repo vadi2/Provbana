@@ -40,6 +40,10 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 # construction what notify.py sends. Stdlib only, and importing it connects to
 # nothing.
 import notify
+# The usage log and the organiser's mail - see its docstring. Stdlib only; the
+# recording half is all this process uses, the mailing runs in its own
+# container.
+import monitor
 
 MATCHBOX_URL = os.environ.get(
     "MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir"
@@ -220,6 +224,10 @@ SAMPLES_DIR = os.environ.get(
     "SAMPLES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
 )
 PORT = int(os.environ.get("PORT", "8095"))
+# Who used the service, and what broke - read by monitor.py's loop. Beside
+# DATA_DIR unless told otherwise; the event box points it outside, so a backup
+# restore, which swaps DATA_DIR wholesale, leaves the history alone.
+USAGE_DB = os.environ.get("USAGE_DB", "")
 
 # The submit endpoint holds the client connection for the whole validation, so
 # this is what a participant waits on a wedged Matchbox. A cold validator has
@@ -304,6 +312,22 @@ def _practice_ends() -> str:
 
 
 PRACTICE_ENDS = _practice_ends()
+
+
+def usage_db() -> str:
+    return USAGE_DB or os.path.join(DATA_DIR, "usage.db")
+
+
+def record_usage(fn, *args, **kwargs) -> None:
+    """Call one of monitor's record_* functions, and never fail because of it.
+
+    The usage log is for the organiser. A full disk or a locked usage.db must
+    cost the organiser a row, not a participant their submission.
+    """
+    try:
+        fn(usage_db(), *args, **kwargs)
+    except Exception as exc:
+        print("usage log: %s failed (%r)" % (fn.__name__, exc), flush=True)
 
 
 class MatchboxError(Exception):
@@ -2023,6 +2047,50 @@ app = FastAPI(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
+@app.middleware("http")
+async def count_request(request: Request, call_next):
+    """One hit in the usage log per request, and an error row for every 5xx.
+
+    Outermost, so it sees the status that actually went out - including the
+    500 for an exception nothing handled, which it records with the traceback
+    and lets carry on up to Starlette's own error response.
+    """
+    try:
+        response = await call_next(request)
+    except Exception:
+        await anyio.to_thread.run_sync(
+            _count_request, request, 500, traceback.format_exc()
+        )
+        raise
+    await anyio.to_thread.run_sync(_count_request, request, response.status_code, None)
+    return response
+
+
+def _count_request(request: Request, status: int, trace: str | None) -> None:
+    user_agent = request.headers.get("user-agent", "")
+    if user_agent.startswith(monitor.USER_AGENT):
+        return
+    # The route template, never the raw path: /fhir/Bundle/{bundle_id} is one
+    # row however many bundles there are, and a scanner's thousand made-up
+    # paths are one "(no route)" row rather than a thousand.
+    route = getattr(request.scope.get("route"), "path", None) or "(no route)"
+    method = request.method
+    # Caddy overwrites X-Real-IP with the connecting address, so it cannot be
+    # forged from outside; locally there is no Caddy and the socket says.
+    address = request.headers.get("x-real-ip") or (
+        request.client.host if request.client else ""
+    )
+    # Browsers send Sec-Fetch-Site on every fetch and navigation; curl, Python
+    # and a company's Java stack do not. That one header is what separates the
+    # page's own polling from integration work.
+    via = "browser" if "sec-fetch-site" in request.headers else "client"
+    record_usage(monitor.record_request, method, route, status, via, address, user_agent)
+    if status >= 500:
+        detail = trace or request.scope.get("usage_error_detail") or "(no detail)"
+        record_usage(monitor.record_error, "server", detail,
+                     method=method, route=route, status=status)
+
+
 # ------------------------------------------------------------ FHIR plumbing
 
 FHIR_JSON = "application/fhir+json"
@@ -2169,6 +2237,10 @@ def http_exception_to_outcome(
     own - an unrouted path, a wrong method - are converted too.
     """
     detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+    if exc.status_code >= 500:
+        # For count_request's error row: by the time the response reaches it
+        # the detail is serialised inside an OperationOutcome.
+        _request.scope["usage_error_detail"] = detail
     return fhir_response(
         operation_outcome(exc.status_code, detail),
         status=exc.status_code,
@@ -2400,6 +2472,7 @@ def register(params: dict = Depends(parameters_body)) -> Response:
             "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
         ).fetchone()
         endpoints = [insert_endpoint(conn, row["id"], endpoint)] if endpoint else []
+    record_usage(monitor.record_event, "register", team)
     return fhir_response(
         parameters(
             [
@@ -2633,6 +2706,8 @@ def validate_bundle(
     # leaderboard showing the team total. Reporting the bundle alone made
     # submitting a lab report look like the score had collapsed.
     effective_score = team_score(best, holds_first_pass, secondary)
+    record_usage(monitor.record_event, "submission", team["slug"],
+                 doc=doc["id"], passed=passed, score=score, errors=errors)
     return fhir_response(
         outcome,
         # Content-Location is FHIR's own way of saying "what you just sent is
@@ -4909,6 +4984,27 @@ async def ui_preview(request: Request) -> dict:
     }
 
 
+@app.post("/ui/error", status_code=204, include_in_schema=False)
+async def ui_error(request: Request) -> Response:
+    """A JavaScript error on the page, reported by the page.
+
+    Otherwise only whoever hit it ever knows. Open to anyone, like the page;
+    the body is capped here, and monitor.record_error caps the rows per day,
+    so the most a hostile client can do is fill the day's quota with noise.
+    """
+    report = _loads_or_none(await read_limited_body(request, 16 * 1024, "Error report"))
+    if not isinstance(report, dict):
+        raise HTTPException(400, detail="Not an error report")
+    text = "\n".join(
+        str(report[k])[:2000] for k in ("message", "stack", "page", "agent")
+        if report.get(k)
+    )
+    await anyio.to_thread.run_sync(
+        lambda: record_usage(monitor.record_error, "browser", text)
+    )
+    return Response(status_code=204)
+
+
 @app.get("/favicon.svg", include_in_schema=False)
 def favicon() -> Response:
     return Response(
@@ -4948,6 +5044,32 @@ INDEX_HTML = r"""<!doctype html>
     var t = localStorage.getItem("theme");
     if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
   } catch (e) { /* site data blocked - fall back to the system theme */ }
+})();
+/* Before the page's own script, and in a block of its own, so that a syntax
+   error there is still caught here. The first few per page load go to the
+   server, which mails the organiser; extensions' errors are not ours. */
+(function () {
+  var sent = 0;
+  function report(message, stack) {
+    stack = String(stack || "");
+    if (sent >= 5 || /extension:\/\//.test(stack)) return;
+    sent += 1;
+    try {
+      fetch("/ui/error", {
+        method: "POST", keepalive: true,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: String(message), stack: stack,
+          page: location.pathname + location.hash, agent: navigator.userAgent })
+      }).catch(function () {});
+    } catch (e) { /* nothing left to report it with */ }
+  }
+  window.addEventListener("error", function (e) {
+    report(e.message, (e.error && e.error.stack) || (e.filename + ":" + e.lineno + ":" + e.colno));
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e.reason;
+    report("Unhandled rejection: " + ((r && r.message) || r), r && r.stack);
+  });
 })();
 </script>
 <link rel="preconnect" href="https://fonts.googleapis.com">

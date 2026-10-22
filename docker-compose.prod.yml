@@ -93,6 +93,10 @@ services:
       # Only consulted here to refuse an obviously private endpoint at the
       # door; the notify service is what enforces it. Keep the two the same.
       SUBSCRIPTION_ALLOW_PRIVATE: ${SUBSCRIPTION_ALLOW_PRIVATE:-}
+      # Who used the service and what broke, for the monitor container. Beside
+      # data/ rather than in it: reset.py's nightly wipe never touches it, and
+      # neither does a backup restore, which swaps data/ wholesale.
+      USAGE_DB: /srv/usage/usage.db
     volumes:
       - state:/srv
     depends_on:
@@ -205,6 +209,35 @@ services:
     # Four HTTP calls every twenty minutes. The work is all on the validator's
     # side; this process holds one bundle in memory.
     mem_limit: 512m
+    logging: *logging
+
+  monitor:
+    # Same image and volume again: it reads the usage log the service writes
+    # and mails the organiser - at once when the service errors or $status
+    # stops saying "up", and a digest of the previous day every morning.
+    # monitor.py's docstring has what is stored and what counts as broken.
+    # Without SMTP_HOST it mails nobody and writes each message to its log.
+    build: ./connectathon
+    restart: unless-stopped
+    command: ["python", "monitor.py", "--loop"]
+    environment:
+      USAGE_DB: /srv/usage/usage.db
+      # $$ is compose's escape for a literal $.
+      STATUS_URL: http://app:8095/fhir/$$status
+      SITE_ADDRESS: ${SITE_ADDRESS:-hackathon2026.vadimperetok.in}
+      PRACTICE_ENDS: ${PRACTICE_ENDS:-}
+      MAIL_TO: ${MAIL_TO:-}
+      MAIL_FROM: ${MAIL_FROM:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      DIGEST_HOUR: ${DIGEST_HOUR:-6}
+    volumes:
+      - state:/srv
+    depends_on:
+      - app
+    mem_limit: 256m
     logging: *logging
 
   caddy:
