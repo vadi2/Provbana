@@ -13,6 +13,7 @@ import base64
 import datetime
 import errno
 import io
+import html.parser
 import http.client
 import http.server
 import json
@@ -3338,6 +3339,23 @@ def test_a_single_finding_is_asked_about_in_the_singular(client):
     # the same count on the banner and in the prompt: no "merged" note
     got = run_explain(client, EXPLAIN_GROUPS, "error", 2)
     assert "The 2 errors:\n\n1. " in got["prompt"]
+
+
+def test_page_ids_are_unique(client):
+    """$() is querySelector, so of two elements sharing an id only the first is
+    ever reached. The EHDS document table and the submit tab's embedded view
+    once both used doc-body: the first validation wrote the bundle into the
+    leaderboard's table, and the embedded view stayed empty. Ids built in
+    script strings are not seen here - the parser treats script as text."""
+    seen = []
+
+    class Ids(html.parser.HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            seen.extend(v for k, v in attrs if k == "id")
+
+    Ids().feed(client.get("/").text)
+    assert "doc-body" in seen and "lb-body" in seen       # the parser read the page
+    assert sorted({i for i in seen if seen.count(i) > 1}) == []
 
 
 def test_the_submit_tab_shows_findings_inside_the_document(client):

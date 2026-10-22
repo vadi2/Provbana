@@ -5600,7 +5600,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
         <th scope="col">EHDS category</th><th scope="col">Guide</th>
         <th scope="col">Maturity</th>
       </tr></thead>
-      <tbody id="doc-body"></tbody>
+      <tbody id="doc-types-body"></tbody>
     </table>
     </div>
 </details>
@@ -5997,7 +5997,7 @@ async function loadDocuments() {
   /* Category, guide and maturity only. How a bundle is recognised, and whether
      Matchbox holds each package, are still on $documents for anyone who needs
      them - they were more detail than this card is for. */
-  $("#doc-body").innerHTML = others.map((d) =>
+  $("#doc-types-body").innerHTML = others.map((d) =>
     "<tr><td>" + esc(d.ehdsCategory) + "</td>"
       + '<td><a href="' + esc(d.spec) + '" target="_blank" rel="noopener">'
       + esc(d.label) + "</a> <span class=\"cat-chip\">" + esc(d.abbreviation)
