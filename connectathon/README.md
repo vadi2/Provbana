@@ -48,11 +48,7 @@ profile the event scores against; the other document types carry their own),
 backstop for an interop screenshot; the UI downscales before it uploads, so this is
 not the expected size), `MATCHBOX_TIMEOUT` (60 s - how long a submitting client waits
 on a wedged validator), `REGISTER_CODE` (unset = registration is open; set it to
-require a `code` parameter on `/fhir/$register`), `PUBLIC_URL` (unset - scheme and host
-this server is reached at, which [subscription](#subscriptions) notifications write
-their references against; unset, each subscription uses the address it was created,
-or last `PUT`, through), `MAX_SUBSCRIPTIONS` (5 per company), `SUBSCRIPTION_ALLOW_PRIVATE` (unset -
-see [what it will not call](#what-it-will-not-call)).
+require a `code` parameter on `/fhir/$register`).
 `DATA_DIR` must be writable by the user running the service; it holds
 `connectathon.db`, the raw submission audit log and `renderings/` (the uploaded
 screenshots, one directory per uploading company).
@@ -182,12 +178,10 @@ picked a snapshot from before the submissions you are trying to save.
 **3. Stop the service, then restore.** Stopping it first is not optional: the
 rename below is atomic, but a running service keeps writing into the directory
 it already has open, and those writes would land in the set-aside copy instead
-of the restored one. The same goes for the [notifier](#running-the-notifier), whose
-lock on `notify.lock` moves away with the directory: left running, it would not
-stop a second one from starting on the restored data.
+of the restored one.
 
 ```
-# Ctrl-C the service and the notifier (and the --loop backup, if it is in the same terminal)
+# Ctrl-C the service (and the --loop backup, if it is in the same terminal)
 .venv/bin/python backup.py --restore LATEST --yes
 ```
 
@@ -264,7 +258,7 @@ python reset.py --loop       # daily until PRACTICE_ENDS, then idle (how it runs
 python reset.py --yes        # wipe once, now
 ```
 
-A wipe clears the `notifications`, `subscriptions`, `renderings`, `submissions` and
+A wipe clears the `endpoints`, `renderings`, `submissions` and
 `teams` tables in that order - child
 rows first, so no row is ever left pointing at one that has gone - inside a single
 transaction, and then removes the per-team directories beside them once that transaction
@@ -486,8 +480,7 @@ curl localhost:8095/fhir/metadata
 ```
 
 Endpoints that write authenticate with `Authorization: Bearer TOKEN` (or
-`X-Team-Token: TOKEN`). Reads are open, except of a [Subscription](#subscriptions),
-which is its owner's alone. A missing or unknown token is **401**.
+`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**.
 
 Anything the server computes rather than stores - a ranking, a health check, a token -
 comes back as a `Parameters` resource. That is FHIR's answer for exactly this, and it
@@ -716,229 +709,6 @@ URL's on `PUT`. `payloadType` is set by the server: `any` for a FHIR base, `none
 page. **403** on changing somebody else's, **404** for one that does not exist,
 **422** past five per company. The name has its whitespace collapsed and is trimmed to
 100 characters, the description to 2000.
-
-### Subscriptions
-
-Polling `$exchange` finds new documents; a subscription is told about them. A platform
-registers a URL, and every time a document passes validation the server POSTs a
-notification there - so loading partners' documents into your own system can be
-something it does by itself, as they come in, for the whole event.
-
-These are topic-based subscriptions as the [Subscriptions R5 Backport
-IG](https://hl7.org/fhir/uv/subscriptions-backport/) defines them for an R4 server, not
-R4's own criteria-as-a-search. A submission passing is not the result of any search this
-server has - the same reason `$submissions` is an operation - and a topic is exactly a
-named event that is not one. There is one topic, and `metadata` advertises it:
-
-```
-https://nordichackathon2026.blogs.dsv.su.se/fhir/SubscriptionTopic/document-passed
-```
-
-It fires when a submission **passes**, from any company and of any [document
-type](#document-types). A failing submission raises nothing: it is an attempt, not a
-document, and a platform ingesting whatever it is told about should not be fed what the
-validator rejected. Your own passing submissions notify you too, which is how you test
-your endpoint without waiting for anybody - subscribe, submit a [sample](#samples),
-watch it arrive.
-
-```
-curl -X POST localhost:8095/fhir/Subscription -H 'Authorization: Bearer TOKEN' \
-     -H 'Content-Type: application/fhir+json' -d '{
-  "resourceType": "Subscription",
-  "status": "requested",
-  "reason": "Ingest partner documents as they are published",
-  "criteria": "https://nordichackathon2026.blogs.dsv.su.se/fhir/SubscriptionTopic/document-passed",
-  "_criteria": {"extension": [{
-    "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-filter-criteria",
-    "valueString": "Bundle?document-type=eps"}]},
-  "channel": {
-    "type": "rest-hook",
-    "endpoint": "https://platform.example.org/fhir-notifications",
-    "payload": "application/fhir+json",
-    "_payload": {"extension": [{
-      "url": "http://hl7.org/fhir/uv/subscriptions-backport/StructureDefinition/backport-payload-content",
-      "valueCode": "full-resource"}]},
-    "header": ["Authorization: Bearer A-SECRET-OF-YOUR-OWN"]
-  }
-}'
-```
-
-| Element | What it does |
-|---|---|
-| `criteria` | The topic canonical above. Anything else is **400**. |
-| `_criteria` filter extensions | Optional, repeatable, ANDed. `Bundle?organization=SLUG` for one company's documents, `Bundle?document-type=eps,laboratory` for some categories (ids from [`$documents`](#document-types-1)); commas are ORed and `&` ANDs parameters, as in a search - so two companies is `organization=a,b`, and `organization=a&organization=b` matches nothing. The `Bundle?` may be left off. A parameter the topic does not have is **400** rather than ignored - a filter that silently matches everything sends you the room's documents when you asked for one company's. |
-| `channel.type` | `rest-hook`. It is the only channel. |
-| `channel.endpoint` | Where to POST. `http` or `https`, reachable from this server - see [below](#what-it-will-not-call). Printable ASCII: percent-encode the path, and write an international host name in its `xn--` form. |
-| `channel._payload` content extension | `empty` (something happened), `id-only` (where the document is, and whose) or `full-resource` (the document itself, in the notification). Without the extension it is `id-only` - or `empty`, if there is no `channel.payload` either, that being how R4 asks for a notification with nothing in it. It is always echoed back. |
-| `channel.header` | Up to 10 headers sent with every notification, which is how your endpoint knows a POST is really from here. Put a secret of your own in one - *not* your company token. Printable ASCII (and tab). |
-| `end` | Optional. Nothing is sent after it - what was still queued included - and the subscription turns `off`. |
-
-It comes back **201** and `requested` (or `off`, if that is what the body said). The server then sends a **handshake** to the
-endpoint - the same Bundle as a notification, with nothing in it - and the first 2xx
-turns the subscription `active`, normally within a second or two. No 2xx after three
-tries within about a minute and it turns `off`, with the reason in `Subscription.error`.
-
-What arrives is a `history` Bundle. Its first entry is always a `Parameters` resource -
-the backport's R4 stand-in for R5's SubscriptionStatus - and with `full-resource` the
-second is the document (with `id-only`, the same entry without its `resource`). Abridged - `"..."` stands for the ids, profiles, timestamp and
-`request`/`response` that are there too:
-
-```
-{"resourceType": "Bundle", "type": "history", "...": "...", "entry": [
-  {"resource": {"resourceType": "Parameters", "...": "...", "parameter": [
-     {"name": "subscription", "valueReference": {"reference": "https://HOST/fhir/Subscription/3"}},
-     {"name": "topic", "valueCanonical": "https://.../SubscriptionTopic/document-passed"},
-     {"name": "status", "valueCode": "active"},
-     {"name": "type", "valueCode": "event-notification"},
-     {"name": "events-since-subscription-start", "valueString": "7"},
-     {"name": "notification-event", "part": [
-        {"name": "event-number", "valueString": "7"},
-        {"name": "timestamp", "valueInstant": "2026-11-18T10:02:11.482113+00:00"},
-        {"name": "focus", "valueReference": {"reference": "https://HOST/fhir/Bundle/41", "type": "Bundle"}},
-        {"name": "additional-context", "valueReference": {
-           "reference": "https://HOST/fhir/Organization/aland-halsa", "type": "Organization",
-           "display": "Åland Hälsa"}}]}]}, "...": "..."},
-  {"fullUrl": "https://HOST/fhir/Bundle/41", "resource": {"resourceType": "Bundle", "type": "document", "...": "..."},
-   "...": "..."}
-]}
-```
-
-`focus` is the document, `additional-context` whose it is - the Bundle itself does not
-say. The embedded copy carries this server's id (`41`) as its `Bundle.id`, because an
-entry whose id contradicts its fullUrl is one a receiving server may refuse; the
-submitter's exact bytes, their own id included, are what `focus` serves.
-
-Answer with any 2xx, quickly - ten seconds is the budget for the whole exchange, on the
-clock, however the answer is paced - and do the ingesting afterwards. A 2xx means *I have
-it*, not *I like it*: a platform that answers 422 because a partner's document failed its
-own validation has told this server the delivery failed, which will be retried for 43
-minutes with everything else queued behind it, and then turn the subscription `off`.
-
-`event-number` counts up by one per subscription, and `events-since-subscription-start`
-on an event is that same number. A gap means you missed one - this server writes a
-notification off, and says so in its log and in `Subscription.error`, when the fault is
-its own and did not pass within a few minutes of retrying - and [`$submissions`](#submission) has everything you
-were not told about. The reverse does not hold: nothing is counted while a subscription
-is `off` or still `requested`, so the documents that passed meanwhile leave no gap.
-(After the server gave up there is one all the same: the event it gave up on, and
-whatever was queued behind it, had their numbers already.) Either way, after an outage
-read `$submissions`. Delivery is at-least-once: an endpoint that takes a notification
-and then answers late, or not with a 2xx, is sent it again on the retry, and the same
-`event-number` twice is the same event.
-
-```
-# yours only - a subscription is nobody else's business, so every call needs the token
-curl localhost:8095/fhir/Subscription -H 'Authorization: Bearer TOKEN'
-curl localhost:8095/fhir/Subscription/3 -H 'Authorization: Bearer TOKEN'
-curl 'localhost:8095/fhir/Subscription/3/$status' -H 'Authorization: Bearer TOKEN'
-# replace it - new endpoint, new filters - which also re-handshakes; this is how an
-# `off` subscription is brought back. "status": "off" parks it instead. What was still
-# queued for the old one is dropped, not sent to the new: a gap in the event numbers
-curl -X PUT localhost:8095/fhir/Subscription/3 -H 'Authorization: Bearer TOKEN' \
-     -H 'Content-Type: application/fhir+json' --data-binary @subscription.json
-curl -X DELETE localhost:8095/fhir/Subscription/3 -H 'Authorization: Bearer TOKEN'
-```
-
-| `status` | Means |
-|---|---|
-| `requested` | Created; the handshake has not been answered yet. |
-| `active` | Delivering. |
-| `error` | The last delivery failed and is being retried - six tries over about 43 minutes, in order, so a newer document never overtakes an older one. Still subscribed; the next success makes it `active` again. |
-| `off` | Gave up after those tries - or the handshake's three, or the four this server gives itself to send a handshake at all - reached its `end`, or was parked. Nothing is queued for it. `PUT` it to start again. |
-
-**400** for a body this server cannot honour - wrong topic, unknown filter, a channel
-that is not `rest-hook`, an endpoint it will not call; the message says which. **404**
-for a subscription that does not exist *or is another company's*. **422** at
-`MAX_SUBSCRIPTIONS` per company. The daily [practice reset](#practice-resets) removes
-subscriptions along with the companies that own them, so until the event a subscription
-lasts a day.
-
-Not implemented: heartbeats, `$events`, websocket and email channels, and the
-backport's `max-count` and `timeout` extensions - each notification carries one event.
-
-#### Running the notifier
-
-The service only *queues* notifications, in the same transaction as the submission they
-are about. `notify.py` sends them, as a process of its own - in
-`docker-compose.prod.yml` it is the `notify` container. Bare metal, start it beside the
-service or nothing is ever delivered and every subscription stays `requested`:
-
-```
-DATA_DIR=./data .venv/bin/python notify.py --loop
-```
-
-```
-python notify.py --loop      # deliver as they are queued (how it runs in compose)
-python notify.py --once      # deliver what is due; non-zero if anything failed or is still queued
-python notify.py --status    # every subscription: owner, state, events, what is queued
-```
-
-One notifier per data directory, and it sees to that itself (a lock on
-`data/notify.lock`): `--once` beside a running `--loop` says so and exits, and a
-container replacing another waits for it to go. Two would each send what the other has
-in flight.
-
-It logs one line per attempt, naming the endpoint's host and never its path or headers -
-both are places people keep secrets. `NOTIFY_POLL` (1 s) is how often it looks at the
-queue and `NOTIFY_TIMEOUT` (10 s) the budget for one attempt, resolving the name
-included - the endpoint gets what the resolver leaves, never less than half. (The retry
-counts and minutes quoted in this section are `BACKOFF`, `HANDSHAKE_BACKOFF` and
-`TRANSIENT_BACKOFF` in `notify.py`; change those and change this.) It does not wait
-for a slow endpoint before looking again, so one company's tarpit is that company's
-problem. Its own faults are logged at length (`CANNOT READ`, `BUG` with a traceback,
-`NOT SENT, our trouble`, `DATABASE TROUBLE`, `COULD NOT BE WRITTEN DOWN`) and not
-charged to the subscriber: what may pass - a resolver that is not answering, a volume
-that will not read, no route out of this box - is tried four times over two and a half
-minutes, and only then, or at once for a document that is gone, is that one
-notification written off. A resolver that stays broken therefore costs subscribers
-events, not subscriptions - except a handshake, which has nothing to move on to: a
-subscription whose handshake this server could not send in those four tries turns
-`off`, with `Subscription.error` saying to `PUT` it again. The log line to look for is
-`could not be looked up`.
-
-Separate for the reason `backup.py` and `warm.py` are, and for a better one: a
-submission must never wait on, or fail because of, some other company's endpoint - and
-this is the only code here that connects to an address a participant typed.
-
-#### What it will not call
-
-`channel.endpoint` is a request this server makes on a participant's say-so, from a box
-that sits beside an unauthenticated Matchbox and, on a cloud host, a metadata service.
-So:
-
-- Only **public** addresses. Loopback, RFC 1918, CGNAT, link-local and the rest are
-  refused - at `POST` when the endpoint is an IP literal or a `localhost` name, and at
-  delivery for whatever a hostname resolves to, *every* address of it.
-- The name is resolved **once** and the connection is made to the address that was
-  vetted, so a DNS answer that changes between the check and the connect changes
-  nothing. TLS is still verified against the name.
-- **No redirects.** A 3xx is a failed delivery whose error says to subscribe with the
-  real URL.
-- An IPv4 address inside an IPv6 one - mapped, compatible, translated, NAT64 on its
-  well-known prefixes, 6to4, Teredo, ISATAP - is vetted as the address it wraps, and `2130706433`, `0x7f.1` and `127.1` as the `127.0.0.1` they are.
-- In production the `notify` container is on a Docker network of its own, on which
-  Matchbox and the service do not exist: `http://matchbox:8080/` does not resolve, and
-  the only way back to either is this site's public address, through Caddy, with at most
-  the access anybody on the internet has. That is the layer underneath, for the day one
-  of the checks above has a hole in it.
-
-`SUBSCRIPTION_ALLOW_PRIVATE=1` lifts the first rule, and is for running the event on a
-venue LAN where every participant's laptop *is* a private address. Set it on both the
-service and the notifier. Link-local stays refused regardless, and so do the cloud
-metadata services that are not link-local (Azure's `168.63.129.16`, AWS's
-`fd00:ec2::254`, Alibaba's, Oracle's) - but that is a list, and a list is not a
-guarantee: never set it on a box that is on the public internet. For local development
-it is what lets you subscribe `http://127.0.0.1:9000/hook`.
-
-What is left: with registration open, anyone can make this server POST to a public URL
-of their choosing. The handshake *is* such a POST - up to three of them, within the
-first minute, to a URL that has proved nothing yet - and a `PUT` buys three more to a new
-one, as often as it is sent. Events follow only once that URL has answered a handshake with a 2xx. The
-body is this server's to write but not wholly: up to 10 headers are the subscriber's, and
-a `full-resource` notification of the subscriber's own submission carries a document they
-wrote. `MAX_SUBSCRIPTIONS` bounds a company, not a person who can register another. It
-adds up to a slow, noisy way of sending somebody a POST they did not ask for - and
-`REGISTER_CODE` closes it, which is what it is for.
 
 ### Leaderboard
 

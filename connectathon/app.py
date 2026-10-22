@@ -35,11 +35,6 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
-# The delivery daemon, imported for the endpoint check and the shape of a
-# subscription status - so what the service accepts and describes is by
-# construction what notify.py sends. Stdlib only, and importing it connects to
-# nothing.
-import notify
 # The usage log and the organiser's mail - see its docstring. Stdlib only; the
 # recording half is all this process uses, the mailing runs in its own
 # container.
@@ -266,21 +261,6 @@ SECONDARY_CATEGORY_POINTS = 15
 # endpoint stays open, which is what you want on a closed event network.
 REGISTER_CODE = os.environ.get("REGISTER_CODE", "")
 
-# Where this server is reached from outside, scheme and host - the prod compose
-# file derives it from SITE_ADDRESS. A notification is read by another machine
-# long after the request that caused it has gone, so every reference in one has
-# to be absolute, and "/fhir/Bundle/12" is not. Unset, the base is taken from
-# the request that created the subscription - or last PUT it - instead, which
-# is right on a venue LAN where the server is an IP address nobody configured
-# anywhere.
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
-
-# Per company. Every subscription is an HTTP call this server makes for each
-# passing submission in the room, and registration may well be open, so the
-# fan-out is bounded by something other than good manners. A platform needs
-# one; five leaves room for a staging box and a colleague's laptop.
-MAX_SUBSCRIPTIONS = int(os.environ.get("MAX_SUBSCRIPTIONS", "5"))
-
 # While the service is up for practice ahead of the event, reset.py empties the
 # leaderboard daily and this is when that stops - see its docstring, which owns
 # the semantics. The page reads it to say so, and stops saying so by itself at
@@ -384,80 +364,11 @@ def init_db() -> None:
                 doc_type  TEXT NOT NULL DEFAULT 'eps',
                 filename  TEXT NOT NULL
             );
-            -- status is the FHIR one: requested | active | error | off.
-            -- filters and headers are JSON lists of strings, kept as the
-            -- subscriber wrote them so the resource reads back as it was sent.
-            -- base_url is the absolute /fhir base its notifications are
-            -- written against; events is events-since-subscription-start.
-            -- AUTOINCREMENT on both tables: SQLite otherwise hands the id of a
-            -- deleted top row to the next insert, and Subscription/7 must
-            -- never come to mean another company's subscription.
-            -- The CHECKs spell out what two programs' worth of SQL otherwise
-            -- only agree on by being careful: a status written as 'Active'
-            -- is a subscription that is quietly never notified again.
-            CREATE TABLE IF NOT EXISTS subscriptions (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                team_id    INTEGER NOT NULL REFERENCES teams(id),
-                created_at TEXT NOT NULL,
-                status     TEXT NOT NULL CHECK (status IN
-                               ('requested', 'active', 'error', 'off')),
-                topic      TEXT NOT NULL,
-                filters    TEXT NOT NULL DEFAULT '[]',
-                reason     TEXT NOT NULL DEFAULT '',
-                end_ts     TEXT,
-                endpoint   TEXT NOT NULL,
-                headers    TEXT NOT NULL DEFAULT '[]',
-                content    TEXT NOT NULL CHECK (content IN
-                               ('empty', 'id-only', 'full-resource')),
-                base_url   TEXT NOT NULL,
-                events     INTEGER NOT NULL DEFAULT 0 CHECK (events >= 0),
-                error      TEXT NOT NULL DEFAULT ''
-            );
-            -- The outbox notify.py drains. kind is handshake or
-            -- event-notification; state is pending | delivered | failed.
-            -- Here it is what notify.py's bookkeeping rests on: a PUT deletes
-            -- what is pending and queues a new handshake, and a reused id
-            -- would let the old handshake's late result land on the new one.
-            -- attempts counts the tries the endpoint failed, faults the ones
-            -- this server could not make (see notify.py's Outcome).
-            -- next_attempt is compared as text, which only works in the one
-            -- spelling notify.stamp() writes - anything else, and the
-            -- comparison is off by whatever the spelling differs by. The
-            -- GLOB below is what makes that impossible.
-            CREATE TABLE IF NOT EXISTS notifications (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                subscription_id INTEGER NOT NULL
-                                REFERENCES subscriptions(id) ON DELETE CASCADE,
-                kind            TEXT NOT NULL CHECK (kind IN
-                                    ('handshake', 'event-notification')),
-                event_number    INTEGER NOT NULL DEFAULT 0,
-                submission_id   INTEGER REFERENCES submissions(id),
-                ts              TEXT NOT NULL,
-                state           TEXT NOT NULL DEFAULT 'pending' CHECK (state IN
-                                    ('pending', 'delivered', 'failed')),
-                attempts        INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-                faults          INTEGER NOT NULL DEFAULT 0 CHECK (faults >= 0),
-                next_attempt    TEXT NOT NULL CHECK (next_attempt GLOB
-                    '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9][0-9][0-9][0-9]+00:00'),
-                error           TEXT NOT NULL DEFAULT '',
-                CHECK (CASE kind WHEN 'handshake'
-                       THEN submission_id IS NULL AND event_number = 0
-                       ELSE submission_id IS NOT NULL AND event_number > 0 END)
-            );
-            CREATE INDEX IF NOT EXISTS notifications_pending
-                ON notifications (state, id);
-            -- What deleting a subscription cascades through, and what no two
-            -- events of one subscription may share.
-            CREATE UNIQUE INDEX IF NOT EXISTS notifications_event
-                ON notifications (subscription_id, event_number)
-                WHERE kind = 'event-notification';
-            CREATE INDEX IF NOT EXISTS notifications_subscription
-                ON notifications (subscription_id);
             -- Where a company takes documents in directly. kind is the
-            -- connectionType code; see ENDPOINT_KINDS. AUTOINCREMENT for the
-            -- same reason as subscriptions: Endpoint/3 is a URL people paste
-            -- into their own systems, and must not come to mean another
-            -- company's address.
+            -- connectionType code; see ENDPOINT_KINDS. AUTOINCREMENT: SQLite
+            -- otherwise hands the id of a deleted top row to the next insert,
+            -- and Endpoint/3 is a URL people paste into their own systems, so
+            -- must not come to mean another company's address.
             CREATE TABLE IF NOT EXISTS endpoints (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 team_id     INTEGER NOT NULL REFERENCES teams(id),
@@ -2664,13 +2575,6 @@ def validate_bundle(
             ),
         )
         submission_id = cur.lastrowid
-        # Queued with the submission, in its transaction: a crash between the
-        # two cannot produce a notification without its submission. The other
-        # way round happens only by enqueue_notifications' own choice - see
-        # its docstring. Only queued - the calling is notify.py's, and nothing
-        # here waits on anybody's endpoint.
-        if passed:
-            enqueue_notifications(conn, submission_id, team["slug"], doc["id"], now)
         # Read back inside the same transaction as the insert, so both include
         # this submission and two attempts landing together cannot miss each
         # other.
@@ -3631,8 +3535,7 @@ SERVER_OPERATIONS = [
 # whether you can read what they produce; a company whose platform would
 # rather be sent documents says where here - its FHIR base, or a page that
 # explains how to get data in. An Endpoint is only that announcement. Nothing
-# here calls the address: a receiver that wants every passing document pushed
-# at it subscribes, and an address on this list is for people to try by hand.
+# here calls the address: it is for people to try by hand.
 ENDPOINT_CONNECTION_SYSTEM = (
     "http://terminology.hl7.org/CodeSystem/endpoint-connection-type")
 ENDPOINT_PAYLOAD_SYSTEM = "http://terminology.hl7.org/CodeSystem/endpoint-payload-type"
@@ -3772,12 +3675,31 @@ def fetch_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | 
         return None
     return conn.execute(ENDPOINT_SELECT + " WHERE e.id = ?", (endpoint_id,)).fetchone()
 
+def _extension_values(element, url: str, key: str, name: str) -> list:
+    """Every value of one extension on an element.
+
+    An element that is there but is not the shape of one - the `extension`
+    wrapper forgotten, so it is a bare list - is a 400 and not "no
+    extensions": read leniently, a value written that way would be silently
+    dropped. An extension with some other url is somebody else's and passes
+    over.
+    """
+    if element is None:
+        return []
+    extensions = element.get("extension", []) if isinstance(element, dict) else None
+    if not isinstance(extensions, list) \
+            or not all(isinstance(ext, dict) for ext in extensions):
+        raise HTTPException(
+            400, detail="%s must be an element with an extension list, e.g. "
+                        "{\"extension\": [{\"url\": \"%s\", ...}]}" % (name, url))
+    return [ext.get(key) for ext in extensions if ext.get("url") == url]
+
 
 def owned_endpoint(
     conn: sqlite3.Connection, endpoint_id: int, team: sqlite3.Row
 ) -> sqlite3.Row:
-    """The endpoint, if this company is the one advertising it. Unlike a
-    subscription it is public, so somebody else's is a 403 and not a 404."""
+    """The endpoint, if this company is the one advertising it. It is public,
+    so somebody else's is a 403 and not a 404."""
     row = fetch_endpoint(conn, endpoint_id)
     if row is None:
         raise HTTPException(404, detail="Unknown Endpoint")
@@ -3932,653 +3854,6 @@ def delete_endpoint(
     return Response(status_code=204)
 
 
-# ------------------------------------------------------------ subscriptions
-
-# "Tell my platform when a new document lands", so that loading a partner's
-# document into your own system stops being something a person does by hand.
-# Topic-based, as the Subscriptions R5 Backport IG defines it for an R4 server,
-# rather than R4's own criteria-as-a-search: there is no search here that
-# "a bundle just passed validation" could be the result of - the README makes
-# the same argument for why $submissions is an operation - and a topic is
-# exactly a named event that is not one.
-#
-# This half only records subscriptions and queues notifications. notify.py
-# sends them, from its own process; see its docstring for why, and for what it
-# refuses to call.
-#
-# One topic: a submission passed validation. Failing submissions raise nothing.
-# They are attempts rather than documents, and a platform that auto-ingests
-# whatever it is told about should not be fed the ones the validator rejected.
-# A company is notified of its own passing submissions too, which is the whole
-# of how a team tests its endpoint without waiting for somebody else to submit.
-SUBSCRIPTION_TOPIC = CANONICAL_BASE + "/SubscriptionTopic/document-passed"
-
-# Filter parameter -> what a submission's value for it is. The topic's
-# canFilterBy, in R5 terms.
-SUBSCRIPTION_FILTERS = {
-    "organization": "the submitting company's slug, as in Organization/{slug}",
-    "document-type": "a document category id from $documents: "
-                     + ", ".join(d["id"] for d in EHDS_DOCUMENTS),
-}
-PAYLOAD_CONTENTS = ("empty", "id-only", "full-resource")
-MAX_SUBSCRIPTION_HEADERS = 10
-MAX_HEADER_CHARS = 1000
-# RFC 9110's token, then printable ASCII. CR and LF are the ones that matter -
-# a header value carrying a newline is a second header, or a second request -
-# and fullmatch() rather than `$`, which is satisfied just before a final
-# newline. Nothing past ASCII either: http.client sends Latin-1 as bytes few
-# receivers read back as what was typed, cannot put the rest on the wire at
-# all, and says so only at delivery, to a subscriber who was told 201.
-HEADER_LINE = re.compile(r"([!#$%&'*+.^_`|~0-9A-Za-z-]+):[ \t]*([ -~\t]*)")
-# Headers that describe the request notify.py builds, not the subscriber's
-# credentials. Overriding them only produces a request that is wrong.
-RESERVED_HEADERS = {"host", "content-length", "content-type",
-                    "transfer-encoding", "connection"}
-
-
-def public_base(request: Request) -> str:
-    """The absolute /fhir base that references in a notification are written
-    against: PUBLIC_URL when it is set, else how this request reached us."""
-    if PUBLIC_URL:
-        return PUBLIC_URL + FHIR_BASE
-    # Caddy says which scheme the participant used; uvicorn only believes that
-    # header from localhost, so it is read here. It is the caller's to forge,
-    # and all forging it achieves is broken links in the caller's own
-    # notifications.
-    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    if proto not in ("http", "https"):
-        proto = request.url.scheme
-    host = request.headers.get("host", "")
-    if not re.fullmatch(r"[A-Za-z0-9.\-\[\]:]{1,255}", host):
-        host = request.url.netloc
-    return "%s://%s%s" % (proto, host, FHIR_BASE)
-
-
-def parse_filter(text, stored: bool = False) -> list[tuple[str, list[str]]]:
-    """One backport-filter-criteria string as [(parameter, [accepted values])].
-
-    `Bundle?organization=acme&document-type=eps,laboratory`, or the same
-    without the `Bundle?`. Parameters are ANDed and the commas inside one are
-    ORed, as in a FHIR search - a parameter given twice included, which is why
-    this is a list and not a dict: `organization=a&organization=b` asks for a
-    document that is both companies', and gets none. An unknown parameter is
-    refused rather than ignored: a filter that silently matches everything is
-    a subscriber who asked for one company's documents and is sent the room's.
-
-    `stored` is for a filter that passed all of this once, on the way in, and
-    is being read back: a document-type that has since been retired is then
-    dropped from its list rather than refused. `eps,retired` goes on matching
-    eps, and `retired` alone matches nothing - which is "only these" still.
-    """
-    if not isinstance(text, str) or not text.strip():
-        raise HTTPException(400, detail="A filter criteria must be a string like "
-                                        "Bundle?organization=SLUG")
-    rtype, sep, query = text.strip().partition("?")
-    if not sep:
-        rtype, query = "Bundle", rtype
-    if rtype != "Bundle":
-        raise HTTPException(
-            400, detail="Filters apply to the Bundle this topic is about, not "
-                        "to %s" % rtype)
-    wanted: list[tuple[str, list[str]]] = []
-    for pair in query.split("&"):
-        name, _, value = pair.partition("=")
-        name = urllib.parse.unquote(name.strip())
-        if name not in SUBSCRIPTION_FILTERS:
-            raise HTTPException(
-                400, detail="Unknown filter parameter %r - this topic filters "
-                            "by %s" % (name, " and ".join(SUBSCRIPTION_FILTERS)))
-        values = [urllib.parse.unquote(v.strip()) for v in value.split(",")]
-        if name == "organization":
-            # A reference is how FHIR would say it, and the slug is what people
-            # have on hand. Same company either way.
-            values = [v.rsplit("Organization/", 1)[-1] for v in values]
-        values = [v for v in values if v]
-        if not values:
-            raise HTTPException(400, detail="Filter parameter %r has no value" % name)
-        if name == "document-type" and stored:
-            values = [v for v in values if v in DOCUMENTS_BY_ID]
-        elif name == "document-type":
-            unknown = [v for v in values if v not in DOCUMENTS_BY_ID]
-            if unknown:
-                raise HTTPException(
-                    400, detail="Unknown document-type %r - one of %s"
-                                % (unknown[0], ", ".join(DOCUMENTS_BY_ID)))
-        wanted.append((name, values))
-    return wanted
-
-
-class StaleFilter(Exception):
-    """A stored filter that no longer parses. Stored filters were parsed once
-    already, on the way in, so this is one the rules have since changed under.
-    Whatever it asked for, it was "only these", and the honest reading is then
-    "not this" - but said to the caller, which knows whose subscription it is,
-    rather than swallowed as a plain False: from the owner's side a filter that
-    matches nothing is a room that has gone quiet, and nothing else would tell
-    them why."""
-
-    def __init__(self, filters: list[str], detail: str):
-        super().__init__("a stored filter no longer parses, and matches "
-                         "nothing: %r (%s)" % (filters, detail))
-
-
-def filters_match(filters: list[str], team_slug: str, doc_id: str) -> bool:
-    actual = {"organization": team_slug, "document-type": doc_id}
-    try:
-        return all(
-            actual[name] in values
-            for text in filters
-            for name, values in parse_filter(text, stored=True)
-        )
-    except HTTPException as exc:
-        raise StaleFilter(filters, exc.detail)
-
-
-def _matches(conn: sqlite3.Connection, sub: sqlite3.Row, team_slug: str,
-             doc_id: str) -> bool:
-    """filters_match for one stored subscription, with a stale filter logged
-    under its subscription's id and written to Subscription.error, once, so
-    that its owner reading the resource finds out why nothing arrives. Not a
-    gap in the count: nothing says this document would have matched. The
-    status is left alone - the subscription is fine, the filter is what
-    changed - and the next delivery, after a PUT, clears the note."""
-    try:
-        return filters_match(json.loads(sub["filters"]), team_slug, doc_id)
-    except StaleFilter as exc:
-        print("Subscription/%d: %s" % (sub["id"], exc), flush=True)
-        conn.execute(
-            "UPDATE subscriptions SET error = ? WHERE id = ? AND error = ''",
-            ("%s - PUT the subscription with a current filter" % exc, sub["id"]))
-        return False
-
-
-def _extension_values(element, url: str, key: str, name: str) -> list:
-    """Every value of one extension on an element (or a primitive's `_` twin).
-
-    An element that is there but is not the shape of one - the `extension`
-    wrapper forgotten, so `_criteria` is a bare list - is a 400 and not "no
-    extensions": read leniently, a filter written that way silently matches
-    everything, which is the one thing parse_filter exists to prevent. An
-    extension with some other url is somebody else's and passes over.
-    """
-    if element is None:
-        return []
-    extensions = element.get("extension", []) if isinstance(element, dict) else None
-    if not isinstance(extensions, list) \
-            or not all(isinstance(ext, dict) for ext in extensions):
-        raise HTTPException(
-            400, detail="%s must be an element with an extension list, e.g. "
-                        "{\"extension\": [{\"url\": \"%s\", ...}]}" % (name, url))
-    return [ext.get(key) for ext in extensions if ext.get("url") == url]
-
-
-def parse_subscription(payload: dict) -> dict:
-    """The columns of a subscription out of a Subscription resource, or a 400
-    that says which element to fix."""
-    if payload.get("criteria") != SUBSCRIPTION_TOPIC:
-        raise HTTPException(
-            400, detail="criteria must be the canonical of a topic this server "
-                        "has, and it has one: %s" % SUBSCRIPTION_TOPIC)
-    filters = _extension_values(payload.get("_criteria"), notify.FILTER_CRITERIA_EXT,
-                                "valueString", "_criteria")
-    for text in filters:
-        parse_filter(text)
-
-    channel = payload.get("channel")
-    if not isinstance(channel, dict) or channel.get("type") != "rest-hook":
-        raise HTTPException(400, detail="channel.type must be rest-hook - it is "
-                                        "the only channel this server has")
-    try:
-        notify.check_endpoint(channel.get("endpoint"))
-    except notify.EndpointError as exc:
-        raise HTTPException(400, detail=str(exc))
-
-    mime = channel.get("payload")
-    if mime is not None and mime not in (FHIR_JSON, "application/json"):
-        raise HTTPException(400, detail="channel.payload must be %s" % FHIR_JSON)
-    contents = _extension_values(channel.get("_payload"), notify.PAYLOAD_CONTENT_EXT,
-                                 "valueCode", "channel._payload")
-    # No channel.payload at all is R4's way of asking for a notification with
-    # nothing in it, so that is `empty`. A payload type with no content
-    # extension is id-only: enough to fetch the document with, without
-    # deciding on a subscriber's behalf that it wants every bundle in the room
-    # pushed at it whole. R4's own reading of a payload type with nothing else
-    # said would be the full resource, so the answer is echoed back explicitly
-    # rather than left for anyone to infer.
-    content = contents[0] if contents else ("id-only" if mime else "empty")
-    if content not in PAYLOAD_CONTENTS:
-        raise HTTPException(400, detail="Payload content must be one of %s"
-                                        % ", ".join(PAYLOAD_CONTENTS))
-
-    headers = channel.get("header", [])
-    if not isinstance(headers, list):
-        raise HTTPException(400, detail="channel.header must be a list of "
-                                        "\"Name: value\" strings")
-    if len(headers) > MAX_SUBSCRIPTION_HEADERS:
-        raise HTTPException(400, detail="channel.header takes at most %d headers"
-                                        % MAX_SUBSCRIPTION_HEADERS)
-    for line in headers:
-        match = HEADER_LINE.fullmatch(line) if isinstance(line, str) else None
-        if match is None or len(line) > MAX_HEADER_CHARS:
-            raise HTTPException(
-                400, detail="Each channel.header must read \"Name: value\"")
-        if match.group(1).lower() in RESERVED_HEADERS:
-            raise HTTPException(
-                400, detail="channel.header cannot set %s" % match.group(1))
-    names = [line.partition(":")[0].lower() for line in headers]
-    if len(set(names)) != len(names):
-        # notify.post() sends one value per name, the last. Echoing two back
-        # and sending one is a 401 at the subscriber's end that nothing here
-        # explains.
-        raise HTTPException(
-            400, detail="channel.header names each header once - put the "
-                        "values of a repeated one in one line, comma-separated")
-
-    end_ts = None
-    if payload.get("end") is not None:
-        try:
-            raw = payload["end"]
-            end = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z")
-                                         else raw)
-            if end.tzinfo is None:
-                raise ValueError
-            # Here, because year 9999 west of Greenwich parses and then has
-            # no UTC to be converted to.
-            end_ts = notify.stamp(end)
-        except (TypeError, ValueError, AttributeError, OverflowError):
-            raise HTTPException(400, detail="end must be an instant with a "
-                                            "timezone, e.g. 2026-11-20T17:00:00Z")
-        if end <= datetime.now(timezone.utc):
-            raise HTTPException(400, detail="end is already in the past")
-
-    reason = payload.get("reason")
-    return {
-        # `off` is how a client parks a subscription without deleting it.
-        # Anything else is a request to be activated, whatever it says: only a
-        # handshake the endpoint answered makes a subscription `active`.
-        "status": "off" if payload.get("status") == "off" else "requested",
-        "filters": json.dumps(filters),
-        "reason": reason.strip()[:MAX_NOTE_CHARS] if isinstance(reason, str) else "",
-        "end_ts": end_ts,
-        "endpoint": channel["endpoint"],
-        "headers": json.dumps(headers),
-        "content": content,
-    }
-
-
-def subscription_resource(row: sqlite3.Row) -> dict:
-    resource = {
-        "resourceType": "Subscription",
-        "id": str(row["id"]),
-        "meta": {"profile": [notify.SUBSCRIPTION_PROFILE]},
-        "status": row["status"],
-        "reason": row["reason"] or "Notify of documents that pass validation",
-        "criteria": row["topic"],
-        "channel": {
-            "type": "rest-hook",
-            "endpoint": row["endpoint"],
-            "payload": FHIR_JSON,
-            "_payload": {"extension": [
-                {"url": notify.PAYLOAD_CONTENT_EXT, "valueCode": row["content"]}
-            ]},
-        },
-    }
-    filters = json.loads(row["filters"])
-    if filters:
-        resource["_criteria"] = {"extension": [
-            {"url": notify.FILTER_CRITERIA_EXT, "valueString": text}
-            for text in filters
-        ]}
-    headers = json.loads(row["headers"])
-    if headers:
-        resource["channel"]["header"] = headers
-    if row["end_ts"]:
-        resource["end"] = row["end_ts"]
-    if row["error"]:
-        resource["error"] = row["error"]
-    return resource
-
-
-def owned_subscription(
-    conn: sqlite3.Connection, subscription_id: int, team: sqlite3.Row
-) -> sqlite3.Row:
-    """The subscription, if it is this company's. Somebody else's is a 404 and
-    not a 403: unlike a screenshot a subscription is nobody else's business,
-    down to whether it exists."""
-    # An id past what SQLite can hold is no subscription either, and binding
-    # it is an OverflowError rather than no row.
-    row = None if abs(subscription_id) >= 2 ** 63 else conn.execute(
-        "SELECT * FROM subscriptions WHERE id = ? AND team_id = ?",
-        (subscription_id, team["id"]),
-    ).fetchone()
-    if row is None:
-        raise HTTPException(
-            404, detail="Unknown Subscription - or not one of this company's")
-    return row
-
-
-def queue_handshake(conn: sqlite3.Connection, subscription_id: int,
-                    now: datetime) -> None:
-    conn.execute(
-        "INSERT INTO notifications (subscription_id, kind, ts, next_attempt) "
-        "VALUES (?, 'handshake', ?, ?)",
-        (subscription_id, notify.stamp(now), notify.stamp(now)),
-    )
-
-
-def enqueue_notifications(conn: sqlite3.Connection, submission_id: int,
-                          team_slug: str, doc_id: str, now: datetime) -> int:
-    """Queue one notification per subscription this submission matches.
-
-    Runs inside the submission's own transaction, behind savepoints: whatever
-    goes wrong in here is rolled back and swallowed. A team's submission is
-    worth more than somebody else's notification of it, and a 500 after the
-    validator has already answered would throw the submission away. One
-    savepoint per subscription, so that one bad row costs its owner a
-    notification and nobody else theirs. The one exception is a failure that
-    took the whole transaction with it (a full disk, an I/O error): that is
-    re-raised, so the caller does not answer 200 for a submission that is no
-    longer there.
-    """
-    queued = 0
-    stamp = notify.stamp(now)
-    in_transaction = conn.in_transaction
-    try:
-        subs = conn.execute(
-            "SELECT id, filters, end_ts FROM subscriptions "
-            "WHERE status IN ('active', 'error')"
-        ).fetchall()
-    except sqlite3.Error:
-        print("could not queue notifications for submission %d:\n%s"
-              % (submission_id, traceback.format_exc()), flush=True)
-        subs = []       # and on to the check below, which this may have tripped
-    for sub in subs:
-        try:
-            conn.execute("SAVEPOINT notification")
-            try:
-                if sub["end_ts"] and sub["end_ts"] <= stamp:
-                    conn.execute(
-                        "UPDATE subscriptions SET status = 'off', error = ? "
-                        "WHERE id = ?",
-                        ("Ended at %s, as the subscription asked" % sub["end_ts"],
-                         sub["id"]),
-                    )
-                elif _matches(conn, sub, team_slug, doc_id):
-                    conn.execute(
-                        "UPDATE subscriptions SET events = events + 1 WHERE id = ?",
-                        (sub["id"],),
-                    )
-                    conn.execute(
-                        "INSERT INTO notifications (subscription_id, kind, "
-                        "event_number, submission_id, ts, next_attempt) "
-                        "SELECT id, 'event-notification', events, ?, ?, ? "
-                        "FROM subscriptions WHERE id = ?",
-                        (submission_id, stamp, stamp, sub["id"]),
-                    )
-                    queued += 1
-            except Exception:
-                conn.execute("ROLLBACK TO notification")
-                raise
-            finally:
-                conn.execute("RELEASE notification")
-        except Exception:
-            print("could not queue the notification of submission %d for "
-                  "Subscription/%d:\n%s"
-                  % (submission_id, sub["id"], traceback.format_exc()), flush=True)
-            if in_transaction and not conn.in_transaction:
-                # The whole transaction went, submission and all (see below).
-                # Another savepoint now would open a transaction of its own
-                # and commit a gap in every remaining subscriber's count for
-                # a document that does not exist.
-                break
-            _leave_a_gap(conn, sub["id"])
-    if in_transaction and not conn.in_transaction:
-        # Some failures (a full disk, an I/O error) make SQLite roll back the
-        # whole transaction and not just the statement. The submission went
-        # with it, and this is the one failure in here that may not be
-        # swallowed: the caller is about to say 200, here is your Bundle id.
-        raise sqlite3.OperationalError(
-            "the submission's transaction was rolled back while queueing "
-            "its notifications")
-    return queued
-
-
-def _leave_a_gap(conn: sqlite3.Connection, subscription_id: int) -> None:
-    """Count the event that could not be queued. The subscriber is told that a
-    gap in the event numbers is how it notices a miss, and an event that was
-    never numbered leaves none. If this cannot be written either, so be it -
-    beyond saying so. Only inside the submission's transaction: outside one
-    this would commit by itself, a gap for a submission that is not there."""
-    if not conn.in_transaction:
-        print("and could not count it as a gap for Subscription/%d either: the "
-              "submission's transaction is gone" % subscription_id, flush=True)
-        return
-    try:
-        conn.execute("SAVEPOINT gap")
-        try:
-            conn.execute("UPDATE subscriptions SET events = events + 1 "
-                         "WHERE id = ? AND status IN ('active', 'error')",
-                         (subscription_id,))
-        except Exception:
-            conn.execute("ROLLBACK TO gap")
-            raise
-        finally:
-            conn.execute("RELEASE gap")
-    except Exception as exc:
-        print("and could not count it as a gap for Subscription/%d either: %s"
-              % (subscription_id, exc), flush=True)
-
-
-async def subscription_body(
-    request: Request, team: sqlite3.Row = Depends(current_team)
-) -> dict:
-    """The Subscription resource, read only once the caller is known."""
-    raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Subscription")
-    try:
-        payload = json.loads(raw)
-    except (ValueError, UnicodeDecodeError, RecursionError):
-        raise HTTPException(400, detail="Body is not valid JSON")
-    if not isinstance(payload, dict) or payload.get("resourceType") != "Subscription":
-        raise HTTPException(400, detail="Body must be a FHIR Subscription")
-    return payload
-
-
-@app.post("/fhir/Subscription",
-    tags=["Subscriptions"],
-    status_code=201,
-    summary="Be notified when a document passes validation",
-    description=(
-        "A topic-based subscription, as the Subscriptions R5 Backport IG "
-        "defines it for R4. `criteria` is the topic canonical - there is one, "
-        "and `metadata` names it - `channel.type` is `rest-hook` and "
-        "`channel.endpoint` is the URL to POST to. Narrow it with "
-        "backport-filter-criteria extensions on `_criteria` "
-        "(`Bundle?organization=SLUG`, `Bundle?document-type=eps,laboratory`) "
-        "and choose what arrives with backport-payload-content on "
-        "`channel._payload`: `empty`, `id-only` (the default when "
-        "`channel.payload` is given; without it, `empty`) or "
-        "`full-resource`. It comes back `requested` (or `off`, if the body said so); the server then sends a "
-        "handshake to the endpoint and the subscription turns `active` once "
-        "that is answered with a 2xx. 400 for an endpoint this server will not "
-        "call, 422 over the per-company limit."
-    ),
-)
-def create_subscription(
-    request: Request,
-    payload: dict = Depends(subscription_body),
-    team: sqlite3.Row = Depends(current_team),
-) -> Response:
-    fields = parse_subscription(payload)
-    now = datetime.now(timezone.utc)
-    with connect() as conn:
-        # The count and the insert see the same table, or two simultaneous
-        # creates both find room for the last one.
-        conn.execute("BEGIN IMMEDIATE")
-        held = conn.execute(
-            "SELECT COUNT(*) FROM subscriptions WHERE team_id = ?", (team["id"],)
-        ).fetchone()[0]
-        if held >= MAX_SUBSCRIPTIONS:
-            raise HTTPException(
-                422, detail="A company can hold %d subscriptions - delete one, "
-                            "or PUT over it" % MAX_SUBSCRIPTIONS)
-        cur = conn.execute(
-            "INSERT INTO subscriptions (team_id, created_at, status, topic, "
-            "filters, reason, end_ts, endpoint, headers, content, base_url) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (team["id"], now.isoformat(), fields["status"], SUBSCRIPTION_TOPIC,
-             fields["filters"], fields["reason"], fields["end_ts"],
-             fields["endpoint"], fields["headers"], fields["content"],
-             public_base(request)),
-        )
-        if fields["status"] == "requested":
-            queue_handshake(conn, cur.lastrowid, now)
-        row = owned_subscription(conn, cur.lastrowid, team)
-    return fhir_response(
-        subscription_resource(row),
-        status=201,
-        Location="%s/Subscription/%d" % (FHIR_BASE, row["id"]),
-    )
-
-
-@app.get("/fhir/Subscription",
-    tags=["Subscriptions"],
-    summary="This company's subscriptions",
-    description=(
-        "A searchset of the calling company's own subscriptions, and nobody "
-        "else's: a subscription carries an endpoint and whatever credentials "
-        "its owner put in `channel.header`. `status` and `url` narrow it."
-    ),
-)
-def search_subscriptions(
-    status: str | None = None,
-    url: str | None = None,
-    team: sqlite3.Row = Depends(current_team),
-) -> Response:
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT * FROM subscriptions WHERE team_id = ? ORDER BY id", (team["id"],)
-        ).fetchall()
-    statuses = status.split(",") if status else None
-    return fhir_response(
-        searchset(
-            [
-                subscription_resource(r)
-                for r in rows
-                if (statuses is None or r["status"] in statuses)
-                and (url is None or r["endpoint"] == url)
-            ]
-        )
-    )
-
-
-@app.get("/fhir/Subscription/{subscription_id}",
-    tags=["Subscriptions"],
-    summary="One of this company's subscriptions",
-    description=(
-        "`status` is where to look after creating one: `requested` until the "
-        "handshake is answered, then `active`. `error` means a delivery failed "
-        "and is being retried, `off` that the server gave up, the "
-        "subscription ended or its owner parked it - and `Subscription.error` "
-        "says which: the last failed attempt's message, that it ended, or that "
-        "the server gave up and to PUT it again (a parked one has none)."
-    ),
-)
-def read_subscription(
-    subscription_id: int, team: sqlite3.Row = Depends(current_team)
-) -> Response:
-    with connect() as conn:
-        return fhir_response(
-            subscription_resource(owned_subscription(conn, subscription_id, team))
-        )
-
-
-@app.get("/fhir/Subscription/{subscription_id}/$status",
-    tags=["Subscriptions"],
-    summary="A subscription's status and event count",
-    description=(
-        "The backport IG's $status: a searchset holding the same Parameters "
-        "resource that opens every notification, with type `query-status`. "
-        "`events-since-subscription-start` is what to compare against the last "
-        "`event-number` you received to find out whether you missed any."
-    ),
-)
-def subscription_status(
-    subscription_id: int, team: sqlite3.Row = Depends(current_team)
-) -> Response:
-    with connect() as conn:
-        row = owned_subscription(conn, subscription_id, team)
-    params = notify.status_parameters(row, "query-status")
-    return fhir_response({
-        "resourceType": "Bundle",
-        "type": "searchset",
-        "total": 1,
-        "entry": [{
-            "fullUrl": "urn:uuid:" + params["id"],
-            "resource": params,
-            "search": {"mode": "match"},
-        }],
-    })
-
-
-@app.put("/fhir/Subscription/{subscription_id}",
-    tags=["Subscriptions"],
-    summary="Replace a subscription, and shake hands again",
-    description=(
-        "The body replaces the subscription whole, anything still queued for "
-        "the old one is dropped, and the new one starts `requested` with a "
-        "fresh handshake - so this is also how a subscription the server "
-        "turned `off` is brought back. Send `status: off` to park one without "
-        "deleting it."
-    ),
-)
-def update_subscription(
-    request: Request,
-    subscription_id: int,
-    payload: dict = Depends(subscription_body),
-    team: sqlite3.Row = Depends(current_team),
-) -> Response:
-    fields = parse_subscription(payload)
-    now = datetime.now(timezone.utc)
-    with connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        owned_subscription(conn, subscription_id, team)
-        # The event count carries on rather than starting again: it is what a
-        # subscriber detects gaps with, and a counter that goes backwards reads
-        # as one.
-        conn.execute(
-            "UPDATE subscriptions SET status = ?, filters = ?, reason = ?, "
-            "end_ts = ?, endpoint = ?, headers = ?, content = ?, base_url = ?, "
-            "error = '' WHERE id = ?",
-            (fields["status"], fields["filters"], fields["reason"],
-             fields["end_ts"], fields["endpoint"], fields["headers"],
-             fields["content"], public_base(request), subscription_id),
-        )
-        conn.execute(
-            "DELETE FROM notifications WHERE subscription_id = ? "
-            "AND state = 'pending'", (subscription_id,),
-        )
-        if fields["status"] == "requested":
-            queue_handshake(conn, subscription_id, now)
-        return fhir_response(
-            subscription_resource(owned_subscription(conn, subscription_id, team))
-        )
-
-
-@app.delete("/fhir/Subscription/{subscription_id}",
-    tags=["Subscriptions"],
-    status_code=204,
-    summary="Stop being notified",
-)
-def delete_subscription(
-    subscription_id: int, team: sqlite3.Row = Depends(current_team)
-) -> Response:
-    with connect() as conn:
-        owned_subscription(conn, subscription_id, team)
-        # The queue goes with it, by the foreign key's ON DELETE CASCADE.
-        conn.execute("DELETE FROM subscriptions WHERE id = ?", (subscription_id,))
-    return Response(status_code=204)
-
-
 def matchbox_status() -> tuple[str, list[str]]:
     """(state, missing packages) - `up`, `degraded` or `down`."""
     matchbox = "down"
@@ -4631,12 +3906,6 @@ def metadata() -> Response:
             },
             "fhirVersion": "4.0.1",
             "format": [FHIR_JSON, "json"],
-            # Subscriptions are the one part of this server built to somebody
-            # else's conformance statement rather than its own.
-            "instantiates": [
-                "http://hl7.org/fhir/uv/subscriptions-backport/"
-                "CapabilityStatement/backport-subscription-server-r4"
-            ],
             "rest": [
                 {
                     "mode": "server",
@@ -4645,8 +3914,7 @@ def metadata() -> Response:
                             "Submitting, and anything that writes, needs the "
                             "token from $register, sent as "
                             "`Authorization: Bearer TOKEN` or "
-                            "`X-Team-Token: TOKEN`. Reads are open, except of "
-                            "a Subscription, which is its owner's alone."
+                            "`X-Team-Token: TOKEN`. Reads are open."
                         )
                     },
                     "resource": [
@@ -4752,56 +4020,6 @@ def metadata() -> Response:
                                  "definition": "http://hl7.org/fhir/SearchParameter/"
                                                "Endpoint-connection-type",
                                  "documentation": ", ".join(ENDPOINT_KINDS)},
-                            ],
-                        },
-                        {
-                            "type": "Subscription",
-                            # R4 has no SubscriptionTopic resource to list, so
-                            # the backport IG has an R4 server advertise its
-                            # topics here instead.
-                            "extension": [{
-                                "url": notify.BACKPORT + "capabilitystatement-"
-                                       "subscriptiontopic-canonical",
-                                "valueCanonical": SUBSCRIPTION_TOPIC,
-                            }],
-                            "supportedProfile": [notify.SUBSCRIPTION_PROFILE],
-                            "documentation":
-                                "Topic-based, rest-hook only. The one topic "
-                                "fires when a submission passes validation; "
-                                "filter it by %s. Payload content empty, "
-                                "id-only (the default, given a channel.payload) or "
-                                "full-resource. A "
-                                "company sees and changes only its own."
-                                % " and ".join(SUBSCRIPTION_FILTERS),
-                            "interaction": [
-                                {"code": "read"},
-                                {"code": "search-type"},
-                                {"code": "create"},
-                                {"code": "update"},
-                                {"code": "delete"},
-                            ],
-                            "searchParam": [
-                                {"name": "url", "type": "uri",
-                                 "definition": "http://hl7.org/fhir/"
-                                               "SearchParameter/Subscription-url",
-                                 "documentation": "The endpoint, exactly"},
-                                {"name": "status", "type": "token",
-                                 "definition": "http://hl7.org/fhir/"
-                                               "SearchParameter/Subscription-status",
-                                 "documentation":
-                                     "requested, active, error or off"},
-                            ],
-                            "operation": [
-                                {
-                                    "name": "status",
-                                    "definition":
-                                        "http://hl7.org/fhir/uv/subscriptions-"
-                                        "backport/OperationDefinition/"
-                                        "backport-subscription-status",
-                                    "documentation":
-                                        "Status and event count of one "
-                                        "subscription.",
-                                },
                             ],
                         },
                     ],
@@ -7895,15 +7113,9 @@ function renderPreviewBox(box) {
 $("#cv-file").addEventListener("change", () => previewFile($("#cv-file").files[0]));
 
 /* ---- interop testing ---- */
-/* The same two strings as SUBSCRIPTION_TOPIC and notify.PAYLOAD_CONTENT_EXT.
-   This page is served as written, so they are spelled out twice; a test holds
-   the copies together. */
-const SUBSCRIPTION_TOPIC =
-  "https://nordichackathon2026.blogs.dsv.su.se/fhir/SubscriptionTopic/document-passed";
-const PAYLOAD_CONTENT_EXT = "http://hl7.org/fhir/uv/subscriptions-backport/" +
-  "StructureDefinition/backport-payload-content";
-/* ENDPOINT_DESCRIPTION_EXT, likewise: R5's Endpoint.description, carried on
-   R4 as a cross-version extension. */
+/* The same string as ENDPOINT_DESCRIPTION_EXT: R5's Endpoint.description,
+   carried on R4 as a cross-version extension. This page is served as
+   written, so it is spelled out twice; a test holds the copies together. */
 const ENDPOINT_DESCRIPTION_EXT =
   "http://hl7.org/fhir/5.0/StructureDefinition/extension-Endpoint.description";
 function interopCurls() {
@@ -7928,21 +7140,6 @@ function interopCurls() {
     '                                   "data": "\'\"$(base64 -w0 shot.png)\"\'"}}]}\'\n' +
     "# every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
-    "# or be told, instead of asking: every document that passes from now on\n" +
-    "# is POSTed to your endpoint as it comes in. Leave the _payload part out\n" +
-    "# to get a link to the document rather than the document:\n" +
-    "curl -X POST " + origin + "/fhir/Subscription \\\n" +
-    "     -H 'Authorization: Bearer TOKEN' \\\n" +
-    "     -H 'Content-Type: application/fhir+json' -d '{\n" +
-    '       "resourceType": "Subscription", "status": "requested",\n' +
-    '       "reason": "Ingest partner documents",\n' +
-    '       "criteria": "' + SUBSCRIPTION_TOPIC + '",\n' +
-    '       "channel": {"type": "rest-hook",\n' +
-    '         "endpoint": "https://YOUR-PLATFORM/notifications",\n' +
-    '         "payload": "application/fhir+json",\n' +
-    '         "_payload": {"extension": [{\n' +
-    '           "url": "' + PAYLOAD_CONTENT_EXT + '",\n' +
-    '           "valueCode": "full-resource"}]}}}\'\n\n' +
     "# or have documents sent to you: advertise where your system takes them\n" +
     "# in - hl7-fhir-rest for a FHIR base, or web-page for a how-to page:\n" +
     "curl -X POST " + origin + "/fhir/Endpoint \\\n" +
@@ -8663,42 +7860,6 @@ applyRoute(false);
 # them. The shapes are described here instead. Handwriting the whole document
 # would be a second source of truth that drifts; this patches only the parts
 # the framework cannot see.
-SUBSCRIPTION_BODY = {
-    "required": True,
-    "content": {
-        FHIR_JSON: {
-            "schema": {
-                "type": "object",
-                "description": (
-                    "A FHIR R4 Subscription conforming to the Subscriptions R5 "
-                    "Backport IG's backport-subscription profile."
-                ),
-            },
-            "example": {
-                "resourceType": "Subscription",
-                "status": "requested",
-                "reason": "Ingest partner documents as they are published",
-                "criteria": SUBSCRIPTION_TOPIC,
-                "_criteria": {"extension": [{
-                    "url": notify.FILTER_CRITERIA_EXT,
-                    "valueString": "Bundle?document-type=eps",
-                }]},
-                "channel": {
-                    "type": "rest-hook",
-                    "endpoint": "https://platform.example.org/fhir-notifications",
-                    "payload": FHIR_JSON,
-                    "_payload": {"extension": [{
-                        "url": notify.PAYLOAD_CONTENT_EXT,
-                        "valueCode": "full-resource",
-                    }]},
-                    "header": ["Authorization: Bearer YOUR-OWN-SECRET"],
-                },
-            },
-        },
-        "application/json": {"schema": {"type": "object"}},
-    },
-}
-
 ENDPOINT_EXAMPLE = {
     "resourceType": "Endpoint",
     "status": "active",
@@ -8786,8 +7947,6 @@ OPENAPI_BODIES = {
             "application/json": {"schema": {"type": "object"}},
         },
     },
-    ("/fhir/Subscription", "post"): SUBSCRIPTION_BODY,
-    ("/fhir/Subscription/{subscription_id}", "put"): SUBSCRIPTION_BODY,
     ("/fhir/DocumentReference/{rendering_id}", "put"): {
         "required": True,
         "content": {
@@ -8845,12 +8004,6 @@ TOKEN_REQUIRED = {
     ("/fhir/DocumentReference", "post"),
     ("/fhir/DocumentReference/{rendering_id}", "put"),
     ("/fhir/DocumentReference/{rendering_id}", "delete"),
-    ("/fhir/Subscription", "post"),
-    ("/fhir/Subscription", "get"),
-    ("/fhir/Subscription/{subscription_id}", "get"),
-    ("/fhir/Subscription/{subscription_id}", "put"),
-    ("/fhir/Subscription/{subscription_id}", "delete"),
-    ("/fhir/Subscription/{subscription_id}/$status", "get"),
 }
 
 

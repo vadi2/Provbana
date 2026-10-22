@@ -37,17 +37,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA = os.environ.get("DATA_DIR") or os.path.join(HERE, "data")
 
 DB_NAME = "connectathon.db"
-# Child rows first: notifications reference subscriptions and submissions,
-# renderings reference submissions, and those in turn reference teams, so deleting
-# in this order never leaves a row pointing at one that has gone. Subscriptions
-# go with the teams because a subscription is its team's: the token that could
-# change or delete it stops existing in the same wipe, and one left behind
-# would go on calling an endpoint nobody can turn off any more. Advertised
-# endpoints (the endpoints table) go too: once the token is gone nobody could
-# change or remove them, and the next company to be given that team id would
-# find them listed as its own.
-TABLES = ("notifications", "subscriptions", "endpoints", "renderings",
-          "submissions", "teams")
+# Child rows first: renderings reference submissions, and those in turn
+# reference teams, so deleting in this order never leaves a row pointing at one
+# that has gone. Advertised endpoints (the endpoints table) go with the teams:
+# once the token is gone nobody could change or remove them, and the next
+# company to be given that team id would find them listed as its own.
+TABLES = ("endpoints", "renderings", "submissions", "teams")
 # Each holds one directory per team slug. The trees themselves stay: app.py
 # creates submissions/ at boot and renderings/ on the first upload, both with
 # exist_ok=True, so removing them would be survivable but pointless churn.
@@ -235,7 +230,7 @@ def main() -> int:
                     help="print the schedule and what is currently stored")
     ap.add_argument("--yes", action="store_true",
                     help="required to wipe once, now - this deletes every team, "
-                         "submission, screenshot and subscription")
+                         "submission, screenshot and endpoint")
     ap.add_argument("--data-dir", default=DEFAULT_DATA)
     args = ap.parse_args()
 
@@ -269,7 +264,7 @@ def main() -> int:
         return run_loop(args.data_dir, ends)
 
     if not args.yes:
-        print("This deletes every team, submission, screenshot and subscription in %s.\n"
+        print("This deletes every team, submission, screenshot and endpoint in %s.\n"
               "Re-run with --yes if that is what you want, or --status to see "
               "what is scheduled." % args.data_dir, file=sys.stderr)
         return 2
