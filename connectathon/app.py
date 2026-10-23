@@ -2005,10 +2005,25 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
 # ------------------------------------------------------------ FHIR plumbing
 
 FHIR_JSON = "application/fhir+json"
-# The service's own canonical base, used in CapabilityStatement and in the
-# fullUrls of any searchset. Relative URLs would be ambiguous the moment a
-# response is saved to disk or passed to a second tool.
+# The path the FHIR API hangs off. CapabilityStatement and the fullUrls of a
+# searchset need the base absolute - a relative URL is ambiguous the moment a
+# response is saved to disk or passed to a second tool, and R4 forbids one in
+# fullUrl - so those take fhir_base(), which puts the origin in front.
 FHIR_BASE = "/fhir"
+
+
+def fhir_base(request: Request) -> str:
+    """The absolute FHIR base, as the client reached it.
+
+    Taken from the request rather than configured, so localhost and the public
+    name both answer with themselves. Caddy terminates TLS and says so in
+    X-Forwarded-Proto; uvicorn believes that header only from 127.0.0.1, and
+    Caddy is another container, so it is read here.
+    """
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    if proto not in ("http", "https"):
+        proto = request.url.scheme
+    return str(request.base_url.replace(scheme=proto)).rstrip("/") + FHIR_BASE
 
 # HTTP status -> the OperationOutcome issue code FHIR asks for. Anything not
 # listed falls back to "processing", the spec's own catch-all, so an
@@ -2111,29 +2126,39 @@ def parameters(pairs) -> dict:
     element *is* the null, and emitting one is invalid.
 
     A list value repeats the parameter, which is how FHIR expresses
-    multiplicity - it has no array type.
+    multiplicity - it has no array type. With nothing to say there is no
+    `parameter` at all: FHIR forbids an empty array as it forbids a null.
     """
-    return {"resourceType": "Parameters", "parameter": _named_params(pairs)}
+    resource = {"resourceType": "Parameters"}
+    named = _named_params(pairs)
+    if named:
+        resource["parameter"] = named
+    return resource
 
 
-def searchset(resources: list, total: int | None = None) -> dict:
+def searchset(request: Request, resources: list, total: int | None = None) -> dict:
     """A searchset Bundle, which is how FHIR returns a list of resources.
 
     `total` defaults to the number carried, which is right whenever the whole
-    result is in one page - this server never pages, so it always is.
+    result is in one page - this server never pages, so it always is. No
+    match is no `entry`, never an empty one, which FHIR forbids.
     """
-    return {
+    bundle = {
         "resourceType": "Bundle",
         "type": "searchset",
         "total": len(resources) if total is None else total,
-        "entry": [
+    }
+    if resources:
+        base = fhir_base(request)
+        bundle["entry"] = [
             {
-                "fullUrl": "%s/%s/%s" % (FHIR_BASE, r["resourceType"], r["id"]),
+                "fullUrl": "%s/%s/%s" % (base, r["resourceType"], r["id"]),
                 "resource": r,
+                "search": {"mode": "match"},
             }
             for r in resources
-        ],
-    }
+        ]
+    return bundle
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -2425,6 +2450,7 @@ def register(params: dict = Depends(parameters_body)) -> Response:
     ),
 )
 def search_organizations(
+    request: Request,
     name: list[str] | None = Query(None),
     name_contains: list[str] | None = Query(None, alias="name:contains"),
     name_exact: list[str] | None = Query(None, alias="name:exact"),
@@ -2436,6 +2462,7 @@ def search_organizations(
         endpoints = endpoints_by_team(conn)
     return fhir_response(
         searchset(
+            request,
             [
                 organization_resource(r, endpoints.get(r["id"], ()))
                 for r in rows
@@ -3422,6 +3449,7 @@ def add_rendering(
     ),
 )
 def list_renderings(
+    request: Request,
     related: str | None = None,
     custodian: str | None = None,
     author: str | None = None,
@@ -3432,7 +3460,7 @@ def list_renderings(
         # one nobody has screenshotted, not a malformed search.
         sub_id = row_id(related)
         if sub_id is None:
-            return fhir_response(searchset([]))
+            return fhir_response(searchset(request, []))
         where.append("r.submission_id = ?")
         params.append(sub_id)
     if custodian:
@@ -3447,7 +3475,7 @@ def list_renderings(
     sql += " ORDER BY r.ts DESC, r.id DESC"
     with connect() as conn:
         rows = [documentreference_resource(row) for row in conn.execute(sql, params)]
-    return fhir_response(searchset(rows))
+    return fhir_response(searchset(request, rows))
 
 
 @app.get("/fhir/DocumentReference/{rendering_id}",
@@ -3822,6 +3850,7 @@ def create_endpoint(
     ),
 )
 def search_endpoints(
+    request: Request,
     organization: str | None = None,
     connection_type: str | None = Query(None, alias="connection-type"),
 ) -> Response:
@@ -3835,7 +3864,7 @@ def search_endpoints(
         rows = conn.execute(
             ENDPOINT_SELECT + " ORDER BY t.name COLLATE NOCASE, e.id"
         ).fetchall()
-    return fhir_response(searchset([
+    return fhir_response(searchset(request, [
         endpoint_resource(r) for r in rows
         if (slugs is None or r["team_slug"] in slugs)
         and (kinds is None or r["kind"] in kinds)
@@ -3939,7 +3968,7 @@ def matchbox_status() -> tuple[str, list[str]]:
         "being told any of it."
     ),
 )
-def metadata() -> Response:
+def metadata(request: Request) -> Response:
     return fhir_response(
         {
             "resourceType": "CapabilityStatement",
@@ -3950,7 +3979,7 @@ def metadata() -> Response:
             "software": {"name": app.title, "version": APP_VERSION},
             "implementation": {
                 "description": "Nordic Hackathon 2026 EPS validation service",
-                "url": FHIR_BASE,
+                "url": fhir_base(request),
             },
             "fhirVersion": "4.0.1",
             "format": [FHIR_JSON, "json"],

@@ -1904,6 +1904,43 @@ def test_metadata_describes_the_whole_api(client):
     assert [o["name"] for o in bundles["operation"]] == ["validate"]
 
 
+def test_searchset_full_urls_and_the_base_are_absolute(client, monkeypatch):
+    """R4 requires an absolute fullUrl; '/fhir/Organization/x' fails it."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    add_shot(client, tok_c, "producer")
+    advertise(client, tok_c, endpoint())
+    for path, first in (("/fhir/Organization", "Organization/consumer"),
+                        ("/fhir/Endpoint", "Endpoint/1"),
+                        ("/fhir/DocumentReference", "DocumentReference/1")):
+        entry = client.get(path).json()["entry"][0]
+        assert entry["fullUrl"] == "http://testserver/fhir/" + first, path
+        assert entry["search"] == {"mode": "match"}
+    assert client.get("/fhir/metadata").json()["implementation"]["url"] \
+        == "http://testserver/fhir"
+    # behind Caddy the TLS is Caddy's, and only its header says so
+    behind = {"X-Forwarded-Proto": "https", "Host": "hack.example"}
+    assert client.get("/fhir/Endpoint", headers=behind).json()["entry"][0][
+        "fullUrl"] == "https://hack.example/fhir/Endpoint/1"
+    assert client.get("/fhir/metadata", headers=behind).json()[
+        "implementation"]["url"] == "https://hack.example/fhir"
+    # anything but a scheme the URL can carry is not taken at its word
+    odd = {"X-Forwarded-Proto": "javascript"}
+    assert client.get("/fhir/metadata", headers=odd).json()[
+        "implementation"]["url"] == "http://testserver/fhir"
+
+
+def test_nothing_found_omits_the_array_rather_than_sending_it_empty(client):
+    """FHIR forbids an empty array: no match is no `entry`, no result no
+    `parameter`."""
+    for path in ("/fhir/Organization?name=zzz", "/fhir/Endpoint",
+                 "/fhir/DocumentReference"):
+        body = client.get(path).json()
+        assert body["total"] == 0 and "entry" not in body, path
+    body = client.get("/fhir/$submissions?organization=nope").json()
+    assert body == {"resourceType": "Parameters"}
+    assert app_module.parameters([("gone", None)]) == {"resourceType": "Parameters"}
+
+
 def test_every_error_is_an_operation_outcome(client, monkeypatch):
     """FHIR has one way to say what went wrong, and a client that can read a
     validation failure must not need a second parser for a 404."""
@@ -1968,8 +2005,8 @@ def test_organizations_are_searchable_by_name(client):
 
     def names(query):
         body = client.get("/fhir/Organization?" + query).json()
-        assert body["total"] == len(body["entry"])
-        return [e["resource"]["name"] for e in body["entry"]]
+        assert body["total"] == len(body.get("entry", []))
+        return [e["resource"]["name"] for e in body.get("entry", [])]
 
     assert names("name=aland") == ["Åland Hälsa"]          # case and accents
     assert names("name=health") == []                      # start of the name
@@ -1995,7 +2032,7 @@ def test_a_name_search_in_another_script_does_not_match_everyone(client):
 
     def names(query):
         body = client.get("/fhir/Organization", params=query).json()
-        return [e["resource"]["name"] for e in body["entry"]]
+        return [e["resource"]["name"] for e in body.get("entry", [])]
 
     assert names({"name": "日本"}) == ["日本ヘルス"]
     assert names({"name": "中国"}) == []
@@ -2962,7 +2999,8 @@ def test_endpoints_are_searched_by_company_and_kind(client):
         bundle = client.get("/fhir/Endpoint" + query).json()
         assert bundle["type"] == "searchset"
         return [(e["resource"]["managingOrganization"]["display"],
-                 e["resource"]["connectionType"]["code"]) for e in bundle["entry"]]
+                 e["resource"]["connectionType"]["code"])
+                for e in bundle.get("entry", [])]
 
     # by company name, then oldest first
     assert found() == [("Alpha", "hl7-fhir-rest"), ("Alpha", "web-page"),
