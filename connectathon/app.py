@@ -1475,7 +1475,9 @@ def summarize_bundle(bundle) -> dict:
     own 'resourceType/id'. Clinical resources not reachable from the
     Composition (directly via sections or transitively via references such as
     medicationReference) are listed under "unreferenced" as a data-quality
-    hint.
+    hint. A bundle that is not a document (an MPD prescription is a
+    collection) has no Composition to reach anything from, so its clinical
+    entries make up one "Entries" section instead.
     """
     summary: dict = {
         "patient": None,
@@ -1594,6 +1596,18 @@ def summarize_bundle(bundle) -> dict:
                     seen.add(id(target))
                     reachable.add(id(target))
                     queue.append(target)
+    elif bundle.get("type") != "document":
+        # A collection - a prescription travels as one - has no Composition for
+        # its entries to be orphaned from. Its clinical entries are its
+        # content; the rest (the prescriber, the RequestGroup tying the orders
+        # together) are their context, as an author is a document's.
+        items = [_render_resource(e["resource"], by_ref) for e in entries
+                 if e["resource"].get("resourceType") in ITEM_CATEGORIES]
+        if items:
+            summary["sections"].append({"title": "Entries", "kind": "other",
+                                        "items": items, "empty_reason": None,
+                                        "narrative": None})
+        reachable = {id(e["resource"]) for e in entries}
     for entry in entries:
         resource = entry["resource"]
         if resource.get("resourceType") in ("Composition", "Patient"):
@@ -1655,12 +1669,15 @@ def _meta_profiles(resource) -> list[str]:
         return []
     meta = resource.get("meta")
     claimed = meta.get("profile") if isinstance(meta, dict) else None
-    return [c.split("|", 1)[0] for c in claimed or [] if isinstance(c, str)]
+    if not isinstance(claimed, list):
+        return []
+    return [c.split("|", 1)[0] for c in claimed if isinstance(c, str)]
 
 
 def _composition_type_codes(bundle: dict) -> set[str]:
     """LOINC codes on the first Composition's type, for identifying a document."""
-    for entry in bundle.get("entry") or []:
+    entries = bundle.get("entry")
+    for entry in entries if isinstance(entries, list) else []:
         resource = entry.get("resource") if isinstance(entry, dict) else None
         if not isinstance(resource, dict):
             continue
@@ -1670,7 +1687,7 @@ def _composition_type_codes(bundle: dict) -> set[str]:
         codings = ctype.get("coding") if isinstance(ctype, dict) else None
         return {
             c["code"]
-            for c in codings or []
+            for c in (codings if isinstance(codings, list) else [])
             if isinstance(c, dict)
             and isinstance(c.get("code"), str)
             and c.get("system") == "http://loinc.org"
@@ -4219,6 +4236,7 @@ def ui_document(doc_id: str) -> dict:
         raw = read_sample_bytes(doc_id)
         if raw is None:
             raise HTTPException(404, detail="Unknown sample")
+        bundle = _loads_or_none(raw)
         return {
             "id": meta["id"],
             "team": meta["name"],
@@ -4230,7 +4248,10 @@ def ui_document(doc_id: str) -> dict:
             "score": None,
             "bundle_readable": True,
             "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
-            "summary": safe_summary(_loads_or_none(raw)),
+            # What the views may expect of it: a lab report or a prescription
+            # has no allergy section to be missing.
+            "doc_type": detect_document(bundle)["id"],
+            "summary": safe_summary(bundle),
         }
     if not doc_id.isdigit():
         raise HTTPException(404, detail="Unknown document")
@@ -4253,6 +4274,7 @@ def ui_document(doc_id: str) -> dict:
         # The stored verdict stands even when the file no longer parses, so say
         # so explicitly: an empty summary otherwise reads as an empty document.
         "bundle_readable": bundle is not None,
+        "doc_type": row["doc_type"],
         "summary": safe_summary(bundle),
     }
 
@@ -4275,6 +4297,7 @@ async def ui_preview(request: Request) -> dict:
         "ts": None,
         "preview": True,
         "bundle_readable": True,
+        "doc_type": detect_document(bundle)["id"],
         "summary": safe_summary(bundle),
     }
 
@@ -6896,12 +6919,16 @@ function viewDashboard(d) {
           : '<div class="db-sub">Positively asserted by the author - safe to'
             + " rely on.</div>");
     aCls = orphanAllergies.length ? "alert" : "good";
+  } else if (d.doc_type && d.doc_type !== "eps") {
+    /* Only a patient summary has to say something about allergies; flagging a
+       lab report or a prescription for its silence flags it for what it is. */
+    aBody = null;
   } else {
     aBody = '<div class="db-big">Unknown</div><div class="db-sub">Neither an allergy'
       + " nor a statement that none is known.</div>";
     aCls = "alert";
   }
-  h += dbCard("Allergies and intolerances", aBody, aCls);
+  if (aBody) h += dbCard("Allergies and intolerances", aBody, aCls);
 
   const active = problems.filter((x) => hasFlag(x, "active"));
   h += dbCard("Problems",
@@ -7092,8 +7119,11 @@ function renderClinicalDoc(d) {
       + " time; nothing under it was read from the file.</div>";
   }
   html += cvModesHtml();
-  html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
-  html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
+  // what kind of document this is, in the title when it has none of its own
+  html += "<h2>" + esc(comp.title || docLabel(d.doc_type || "eps")) + "</h2>";
+  html += '<p class="muted" style="margin:2px 0 0">'
+    + (comp.title && d.doc_type ? esc(docLabel(d.doc_type)) + " &middot; " : "")
+    + esc(d.team)
     + (d.preview
         ? " of " + esc(d.filename || "pasted JSON")
           + " &middot; not uploaded, validated or scored"

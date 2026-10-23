@@ -910,6 +910,50 @@ def test_submission_detail_and_raw_bundle(client, monkeypatch):
     assert raw.json()["resourceType"] == "Bundle"
 
 
+def test_the_clinical_view_knows_what_kind_of_document_it_shows(client, monkeypatch):
+    """A prescription is not a patient summary: the views need the type to stop
+    flagging it for the allergy section only a summary has to carry."""
+    token = register(client, "Alpha")
+    with open(os.path.join(os.path.dirname(__file__), "examples", "mpd-example.json"),
+              "rb") as fh:
+        mpd = fh.read()
+    submit(client, token, outcome(), monkeypatch, body=mpd)
+    sub_id = param_entries(client.get("/fhir/$submissions"))[0]["id"]
+    detail = client.get(f"/ui/documents/{sub_id}").json()
+    assert detail["doc_type"] == "mpd"
+    assert client.post("/ui/preview", content=mpd).json()["doc_type"] == "mpd"
+    assert client.post("/ui/preview", content=CLINICAL_BODY).json()["doc_type"] == "eps"
+    assert client.get("/ui/documents/arne-complex-care").json()["doc_type"] == "eps"
+    # a collection has no Composition to orphan its entries from: the three
+    # orders are its content, the prescriber and RequestGroup their context
+    summary = detail["summary"]
+    assert [(s["title"], len(s["items"])) for s in summary["sections"]] == [("Entries", 3)]
+    assert summary["unreferenced"] == []
+    text = client.get("/").text
+    assert 'esc(comp.title || docLabel(d.doc_type || "eps"))' in text
+    assert '} else if (d.doc_type && d.doc_type !== "eps") {' in text
+    assert "if (aBody) h += dbCard(" in text
+
+
+def test_a_document_bundle_without_a_composition_still_reports_orphans():
+    """Only a bundle that is not a document reads as a list of entries; a
+    document that lost its Composition is broken, and says so."""
+    s = app_module.summarize_bundle({"resourceType": "Bundle", "type": "document",
+                                     "entry": [{"resource": {"resourceType": "Condition"}}]})
+    assert s["sections"] == [] and len(s["unreferenced"]) == 1
+
+
+@pytest.mark.parametrize("bundle", [
+    {"resourceType": "Bundle", "meta": {"profile": 5}},
+    {"resourceType": "Bundle", "entry": 5},
+    {"resourceType": "Bundle", "entry": [{"resource": {
+        "resourceType": "Composition", "type": {"coding": 5}}}]},
+])
+def test_document_detection_survives_malformed_fields(client, bundle):
+    assert app_module.detect_document(bundle)["id"] == "eps"
+    assert client.post("/ui/preview", json=bundle).status_code == 200
+
+
 def test_submission_404s(client, monkeypatch):
     assert client.get("/ui/documents/999").status_code == 404
     assert client.get("/fhir/Bundle/999").status_code == 404
