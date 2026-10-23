@@ -2797,6 +2797,72 @@ def test_renderings_are_readable_without_a_token(client, monkeypatch):
                           headers=headers).status_code == 200
 
 
+CURLS_HARNESS = r"""
+const out = {};
+const $ = () => out;
+const origin = "http://localhost:8095";
+interopCurls();
+console.log(out.textContent);
+"""
+
+
+@pytest.mark.skipif(any(shutil.which(t) is None
+                        for t in ("node", "bash", "jq", "base64")),
+                    reason="needs node, bash, jq and coreutils base64")
+def test_the_documented_screenshot_uploads_take_a_real_screenshot(
+        client, monkeypatch, tmp_path):
+    """Linux caps a single command-line argument at 128KiB. A command that
+    pastes the base64 image into one fails with "Argument list too long" for
+    anything bigger than a thumbnail, so both the tab's example and the
+    README's are run here, as written, on an image over that cap."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    js = page_script(client)
+    parts = [js[js.index("const ENDPOINT_DESCRIPTION_EXT"):
+                js.index("function interopCurls(")]]
+    start = js.index("function interopCurls(")
+    parts.append(js[start:js.index("\n}", start) + 2])
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + CURLS_HARNESS],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    def block(text, first, after):
+        """The lines from the comment `first` up to the comment `after`."""
+        start = text.index(first)
+        return text[start:text.index(after, start)]
+
+    tab = block(proc.stdout, "# publish a screenshot",
+                "# every screenshot of one document")
+    readme_path = os.path.join(os.path.dirname(app_module.__file__), "README.md")
+    with open(readme_path, encoding="utf-8") as fh:
+        readme = block(fh.read(), "# publish a screenshot of a partner's document",
+                       "# every screenshot, or just")
+
+    image = png_bytes() + b"\x00" * 200_000
+    (tmp_path / "shot.png").write_bytes(image)
+    # A real executable rather than a shell function: the limit is enforced
+    # when the shell execs a program, which a function would never reach.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text('#!/bin/sh\ncat > "$BODY_OUT"\n')
+    (bindir / "curl").chmod(0o755)
+    for name, snippet in (("tab", tab), ("README", readme)):
+        script = "set -eo pipefail\n" + snippet.replace("TOKEN", tok_c) \
+            .replace("PARTNER_SLUG", "producer").replace("COMPANY_SLUG", "producer")
+        body_out = tmp_path / ("%s.json" % name)
+        run = subprocess.run(
+            ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+            timeout=60, env=dict(os.environ, BODY_OUT=str(body_out),
+                                 PATH="%s:%s" % (bindir, os.environ["PATH"])))
+        assert run.returncode == 0, (name, run.stderr)
+        res = client.post("/fhir/DocumentReference",
+                          content=body_out.read_bytes(),
+                          headers={"X-Team-Token": tok_c,
+                                   "Content-Type": "application/fhir+json"})
+        assert res.status_code == 201, (name, res.text)
+        assert res.json()["description"] == "Allergies came through empty"
+        assert client.get(res.json()["content"][0]["attachment"]["url"]).content \
+            == image
+
+
 # ------------------------------------------------------------ endpoints
 
 DESC_EXT = app_module.ENDPOINT_DESCRIPTION_EXT

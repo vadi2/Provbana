@@ -7165,15 +7165,17 @@ function interopCurls() {
     "curl -s " + origin + "/fhir/Organization/PARTNER_SLUG/\\$document"
       + " -o partner-eps.json\n\n" +
     "# publish a screenshot of how it came out in your system - the image goes\n" +
-    "# in the attachment, base64-encoded:\n" +
-    "curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
+    "# in the attachment, base64-encoded, and is piped in: a real screenshot is\n" +
+    "# too big to pass on the command line:\n" +
+    "{ printf '%s' '{\"resourceType\": \"DocumentReference\", \"status\": \"current\",\n" +
+    '    "description": "Allergies came through empty",\n' +
+    '    "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
+    '    "content": [{"attachment": {"contentType": "image/png", "data": "\'\n' +
+    "  base64 -w0 shot.png\n" +
+    "  printf '%s' '\"}}]}'\n" +
+    "} | curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
     "     -H 'Authorization: Bearer TOKEN' \\\n" +
-    "     -H 'Content-Type: application/fhir+json' -d '{\n" +
-    '       "resourceType": "DocumentReference", "status": "current",\n' +
-    '       "description": "Allergies came through empty",\n' +
-    '       "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
-    '       "content": [{"attachment": {"contentType": "image/png",\n' +
-    '                                   "data": "\'\"$(base64 -w0 shot.png)\"\'"}}]}\'\n' +
+    "     -H 'Content-Type: application/fhir+json' --data-binary @-\n" +
     "# every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
     "# or have documents sent to you: advertise where your system takes them\n" +
