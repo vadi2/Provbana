@@ -2356,7 +2356,12 @@ def register(params: dict = Depends(parameters_body)) -> Response:
             400, detail="Parameters must carry a `name` with the company name"
         )
     # Collapse runs of whitespace so "Acme  Health" is the same company as
-    # "Acme Health" rather than a way around the one-registration rule.
+    # "Acme Health" rather than a way around the one-registration rule. The
+    # same goes for what cannot be seen at all: a decomposed "Å" is composed,
+    # and invisible format characters (zero-width spaces and joiners, BOMs)
+    # are dropped, or a name of nothing but those would list as a blank row.
+    team = "".join(c for c in unicodedata.normalize("NFC", team)
+                   if unicodedata.category(c) != "Cf")
     team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
         raise HTTPException(400, detail="Company name must be 2-40 characters")

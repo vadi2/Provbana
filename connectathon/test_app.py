@@ -2233,6 +2233,24 @@ def test_register_collapses_whitespace_and_dedupes_on_it(client):
         assert register_res(client, clash).status_code == 409, clash
 
 
+def test_register_dedupes_on_what_the_name_looks_like(client):
+    """Two names that render the same are one company, and a name nobody can
+    see is no name at all."""
+    res = register_res(client, "Åland Hälsa")
+    assert res.status_code == 200
+    for clash in ("Åland Hälsa",            # decomposed
+                  "Åland Hälsa​",        # trailing zero-width space
+                  "﻿Åland‍ Hälsa"):  # BOM, zero-width joiner
+        assert register_res(client, clash).status_code == 409, repr(clash)
+    res = register_res(client, "Hälsa⁠ Co")
+    assert res.status_code == 200
+    assert param_one(res, "organization")["name"] == "Hälsa Co"
+    for blank in ("​​", "​‌⁠", "A​"):
+        res = register_res(client, blank)
+        assert res.status_code == 400, repr(blank)
+        assert diagnostics(res) == "Company name must be 2-40 characters"
+
+
 def test_register_rejects_non_string_and_missing_names(client):
     bodies = [
         {"resourceType": "Parameters",

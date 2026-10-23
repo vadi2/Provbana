@@ -501,8 +501,9 @@ curl -X POST 'localhost:8095/fhir/$register' -H 'Content-Type: application/fhir+
 
 Answers `Parameters` with a `token` and the company as an `Organization`. **400** if the
 name is not 2-40 characters, **403** if `REGISTER_CODE` is set and the `code` parameter
-is wrong or missing, **409** if the name is taken (whitespace-normalised;
-case-insensitive for ASCII letters only).
+is wrong or missing, **409** if the name is taken (whitespace-normalised, NFC-composed
+and with invisible format characters such as zero-width spaces dropped, before both
+checks; case-insensitive for ASCII letters only).
 
 If your system can take documents in directly, say where in the same call: an
 `endpoint` part carrying an [Endpoint](#advertising-where-your-system-takes-documents-in)
