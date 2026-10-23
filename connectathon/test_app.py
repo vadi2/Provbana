@@ -5533,6 +5533,10 @@ def mpd_collection(*resources):
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "MedicationRequest",
                      "meta": {"profile": [MPD_REQUEST + "|1"]}})),
+    # Claims a profile, but not an MPD one: base R4 is all it is held to.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest", "meta": {"profile": [
+         "http://hl7.org/fhir/StructureDefinition/MedicationRequest"]}})),
     # Only a Medication claims MPD: there is no prescription or dispense at all.
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "Medication", "meta": {"profile": [
