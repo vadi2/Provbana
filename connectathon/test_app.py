@@ -1468,6 +1468,61 @@ def test_a_body_that_is_not_parameters_is_rejected(client):
         assert diagnostics(res) == "Body must be a FHIR Parameters resource"
 
 
+LONE = "\\ud800"   # the JSON escape of a lone UTF-16 surrogate, as sent
+
+
+def test_a_lone_surrogate_is_a_400_on_every_json_body(client, monkeypatch):
+    """json.loads takes the escape, but the str it makes is no Unicode text:
+    whatever encodes it first - SQLite, compare_digest - used to raise a 500."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    headers = {"Content-Type": "application/fhir+json"}
+    auth = dict(headers, Authorization="Bearer " + tok_c)
+    ep = '{"resourceType": "Endpoint", "status": "active", "connectionType": ' \
+         '{"code": "web-page"}, "address": "https://x.example", "name": "%s"}' % LONE
+    shot = add_shot(client, tok_c, "producer").json()["id"]
+    calls = []
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body, doc=None: calls.append(body))
+    for path, method, body, hdrs in (
+        ("/fhir/$register", "POST", '{"resourceType": "Parameters", "parameter": '
+         '[{"name": "name", "valueString": "%sbad"}]}' % LONE, headers),
+        ("/fhir/$register", "POST", '{"resourceType": "Parameters", "parameter": '
+         '[{"name": "name", "valueString": "Surr"}, {"name": "endpoint", '
+         '"resource": %s}]}' % ep, headers),
+        ("/fhir/Endpoint", "POST", ep, auth),
+        ("/fhir/DocumentReference", "POST", '{"resourceType": "DocumentReference", '
+         '"custodian": {"reference": "Organization/%s"}}' % LONE, auth),
+        ("/fhir/DocumentReference/" + shot, "PUT", '{"resourceType": '
+         '"DocumentReference", "description": "%s"}' % LONE, auth),
+        ("/fhir/Bundle/$validate", "POST", '{"resourceType": "Bundle", "entry": '
+         '[{"resource": {"resourceType": "Composition", "title": "%s"}}]}' % LONE,
+         auth),
+    ):
+        res = client.request(method, path, content=body, headers=hdrs)
+        assert res.status_code == 400, (path, res.text)
+        assert diagnostics(res) == "Body is not valid JSON"
+    assert calls == []          # refused before it reached the validator
+    assert [e["resource"]["id"]
+            for e in client.get("/fhir/Organization").json()["entry"]] \
+        == ["consumer", "producer"]
+    # a pair of surrogates is one real character and goes through
+    res = client.post("/fhir/$register", headers=headers, content=(
+        '{"resourceType": "Parameters", "parameter": '
+        '[{"name": "name", "valueString": "Pair \\ud83d\\ude00 Co"}]}'))
+    assert res.status_code == 200
+    assert param_one(res, "organization")["name"] == "Pair \U0001F600 Co"
+
+
+def test_a_lone_surrogate_in_the_code_is_refused_before_it_is_compared(
+        client, monkeypatch):
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
+    res = client.post("/fhir/$register", headers={
+        "Content-Type": "application/fhir+json"}, content=(
+        '{"resourceType": "Parameters", "parameter": [{"name": "name", '
+        '"valueString": "Surr"}, {"name": "code", "valueString": "%s"}]}' % LONE))
+    assert res.status_code == 400
+
+
 # ------------------------------------------------------------ registration code
 
 def test_registration_is_open_by_default(client):
@@ -1503,6 +1558,12 @@ def test_a_document_that_no_longer_parses_says_so(client, monkeypatch):
     assert data["pass"] is True
     assert data["bundle_readable"] is False
     assert data["summary"]["sections"] == []
+    # one stored before lone surrogates were refused reads the same way,
+    # rather than as a 500 once the response is encoded
+    with open(stored, "wb") as fh:
+        fh.write(b'{"resourceType": "Bundle", "id": "\\ud800"}')
+    res = client.get("/ui/documents/%d" % sub["id"])
+    assert res.status_code == 200 and res.json()["bundle_readable"] is False
 
 
 # ----------------------------------------------------------- matchbox client

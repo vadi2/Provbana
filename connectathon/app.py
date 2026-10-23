@@ -2180,6 +2180,20 @@ def validation_error_to_outcome(
     )
 
 
+def loads_json(raw: bytes):
+    """json.loads, refusing a lone UTF-16 surrogate as the ValueError every
+    caller already reads as "not valid JSON".
+
+    json.loads turns the escape "\\ud800" into a str that is no Unicode text,
+    and the first thing to encode it - SQLite, compare_digest, the response -
+    raises a 500 long after the parse said yes. Encoding it once here is what
+    finds one, wherever in the document it is.
+    """
+    payload = json.loads(raw)
+    json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return payload
+
+
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
     """Read the body, refusing anything over `limit` before it is all resident.
 
@@ -2295,7 +2309,7 @@ async def parameters_body(request: Request) -> dict:
     """
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "Parameters":
@@ -2499,7 +2513,7 @@ def validate_bundle(
                 % ", ".join(d["profile"] for d in EHDS_DOCUMENTS),
             )
     try:
-        bundle = json.loads(body)
+        bundle = loads_json(body)
     except (ValueError, UnicodeDecodeError, RecursionError):
         # RecursionError: json rejects deeply nested input by blowing the stack,
         # which is still the client's bad payload, not a server fault.
@@ -2768,7 +2782,7 @@ def leaderboard() -> Response:
 
 def _loads_or_none(raw: bytes):
     try:
-        return json.loads(raw)
+        return loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
 
@@ -3272,7 +3286,7 @@ async def docref_body(
     """The uploaded DocumentReference, read only once the uploader is known."""
     raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "DocumentReference":
@@ -3748,7 +3762,7 @@ async def endpoint_body(
     """The Endpoint resource, read only once the caller is known."""
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Endpoint")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "Endpoint":
