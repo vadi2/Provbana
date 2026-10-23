@@ -3399,6 +3399,29 @@ def test_a_refused_file_takes_the_previous_bundle_with_it(client):
     assert "return refuse(" in handler and 'refuse("Could not read the file: "' in handler
 
 
+@needs_node
+def test_a_file_just_over_the_limit_is_not_said_to_be_the_limit(client):
+    """Both sizes were rounded to tenths alike, so anything up to about 50 KB
+    over 5 MB was refused as "5.0 MB; the limit is 5 MB"."""
+    js = page_script(client)
+    start = js.index("function tooBigMessage(")
+    fn = js[start:js.index("\n}", start) + 2]
+    limit = 5 * 1048576
+    cases = [[limit + 1, limit], [5249983, limit], [5450745, limit],
+             [limit + 1048576 // 2 + 1, limit + 1048576 // 2]]
+    proc = subprocess.run(
+        ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
+         ".readFileSync(0, 'utf8')).map(([s, l]) => tooBigMessage(s, l))));"],
+        input=json.dumps(cases), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "That file is 5.1 MB; the limit is 5 MB.",
+        "That file is 5.1 MB; the limit is 5 MB.",
+        "That file is 5.2 MB; the limit is 5 MB.",
+        "That file is 5.6 MB; the limit is 5.5 MB.",
+    ]
+
+
 
 # ---------------------------------------------------------------- backups
 

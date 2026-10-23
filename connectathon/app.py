@@ -6158,6 +6158,15 @@ async function checkValidator() {
 }
 checkValidator();
 
+/* The file rounded up and the limit down, so the two never print as the same
+   number: rounded alike, a file a byte over 5 MB read "That file is 5.0 MB;
+   the limit is 5 MB." */
+function tooBigMessage(size, limit) {
+  const tenths = (n, round) => round(n * 10 / 1048576) / 10;
+  return "That file is " + tenths(size, Math.ceil).toFixed(1) + " MB; the limit is "
+    + tenths(limit, Math.floor) + " MB.";
+}
+
 $("#file").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
   if (!f) return;
@@ -6170,10 +6179,7 @@ $("#file").addEventListener("change", async (ev) => {
     errBox.textContent = message;
     errBox.style.display = "block";
   };
-  if (f.size > maxBundleBytes) {
-    return refuse("That file is " + (f.size / 1048576).toFixed(1) + " MB; the limit is "
-      + Math.round(maxBundleBytes / 1048576) + " MB.");
-  }
+  if (f.size > maxBundleBytes) return refuse(tooBigMessage(f.size, maxBundleBytes));
   try {
     $("#bundle").value = await f.text();
     errBox.style.display = "none";
