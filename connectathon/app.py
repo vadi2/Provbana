@@ -3214,12 +3214,11 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
     opened - `subject` cannot be used for that, because R4 restricts it to a
     Patient or similar and the thing being rendered here is a document.
     """
-    return {
+    resource = {
         "resourceType": "DocumentReference",
         "id": str(row["id"]),
         "status": "current",
         "date": row["ts"],
-        "description": row["note"] or None,
         "author": [{
             "reference": "Organization/%s" % row["consumer_slug"],
             "display": row["consumer_name"],
@@ -3238,6 +3237,10 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
             "related": [{"reference": "Bundle/%d" % row["submission_id"]}]
         },
     }
+    # FHIR JSON has no null: a screenshot without a note has no description.
+    if row["note"]:
+        resource["description"] = row["note"]
+    return resource
 
 
 def fetch_rendering(conn: sqlite3.Connection, rendering_id: int) -> sqlite3.Row | None:

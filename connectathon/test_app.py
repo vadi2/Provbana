@@ -2708,6 +2708,29 @@ def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
         == "clearer take"
 
 
+def test_a_screenshot_without_a_note_has_no_description(client, monkeypatch):
+    """FHIR JSON has no null, so an absent note is an absent element - in the
+    upload's answer, the read, the search, and after a note is blanked."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = add_shot(client, tok_c, "producer")
+    sid = res.json()["id"]
+    put = client.put("/fhir/DocumentReference/%s" % sid,
+                     json={"resourceType": "DocumentReference", "description": "  "},
+                     headers={"X-Team-Token": tok_c})
+    for answer in (res, client.get("/fhir/DocumentReference/%s" % sid),
+                   client.get("/fhir/DocumentReference"), put):
+        assert answer.status_code in (200, 201)
+        assert "null" not in answer.text, answer.text
+    assert "description" not in put.json()
+    # and a body read back from the server can be written back to it
+    read = client.get("/fhir/DocumentReference/%s" % sid).json()
+    read["description"] = "Allergies came through empty"
+    again = client.put("/fhir/DocumentReference/%s" % sid, json=read,
+                       headers={"X-Team-Token": tok_c})
+    assert again.status_code == 200
+    assert again.json()["description"] == "Allergies came through empty"
+
+
 def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     tok_d = register(client, "Third")
