@@ -4272,6 +4272,32 @@ def test_the_mpd_claim_check_leaves_other_categories_alone():
         assert app_module.require_entry_profile_claims(oc, body, doc) is oc
 
 
+def test_naming_a_versioned_profile_settles_the_category_too(client, monkeypatch):
+    """A canonical with its version is still that canonical, and a version in
+    meta.profile is already read that way - ?profile= must agree."""
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]
+    token = register(client, "Alpha")
+    seen = {}
+
+    def capture(body, doc=None):
+        seen["doc"] = doc
+        return outcome()
+
+    monkeypatch.setattr(app_module, "validate_with_matchbox", capture)
+    res = client.post("/fhir/Bundle/$validate",
+                      params={"profile": lab["profile"] + "|2.0.0"},
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 200, res.text
+    assert res.headers["X-Document-Type"] == "laboratory"
+    # Matchbox is still asked for the profile it has, not the pinned string.
+    assert seen["doc"]["profile"] == lab["profile"]
+    # The version does not make an unscored profile acceptable.
+    res = client.post("/fhir/Bundle/$validate",
+                      params={"profile": "http://example.org/easy|" + lab["profile"]},
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 400
+
+
 def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):
     """Honouring an arbitrary profile would let a team pick one their bundle
     already satisfies and score full marks on it."""

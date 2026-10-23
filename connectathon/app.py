@@ -2576,10 +2576,13 @@ def validate_bundle(
     # on it, so the accepted values are exactly the ones this event scores
     # against - one per EHDS category. Naming one settles the category outright,
     # which is the escape hatch for a document detect_document() reads wrongly.
+    # A version suffix is dropped, as _meta_profiles() drops it from a claim:
+    # a team that pins the version still means the same profile.
     requested = None
     if profile is not None:
         requested = next(
-            (d for d in EHDS_DOCUMENTS if d["profile"] == profile), None
+            (d for d in EHDS_DOCUMENTS if d["profile"] == profile.split("|", 1)[0]),
+            None,
         )
         if requested is None:
             raise HTTPException(
