@@ -3441,10 +3441,10 @@ def list_renderings(
     # A reference search parameter takes the bare id or Type/id, as on
     # Endpoint's organization, and a comma between values means either.
     if related:
-        match("r.submission_id", [
-            int(v) for v in (v.removeprefix("Bundle/") for v in related.split(","))
-            if v.isascii() and v.isdigit()
-        ])
+        ids = (int(v) for v in (v.removeprefix("Bundle/") for v in related.split(","))
+               if v.isascii() and v.isdigit())
+        # SQLite integers stop at 2**63 - 1, and binding a bigger one raises.
+        match("r.submission_id", [i for i in ids if i < 2 ** 63])
     if custodian:
         match("p.slug", [v.removeprefix("Organization/") for v in custodian.split(",")])
     if author:

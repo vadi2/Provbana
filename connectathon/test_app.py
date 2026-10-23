@@ -2677,6 +2677,8 @@ def test_renderings_search_takes_references_as_the_resources_carry_them(
     # an id that cannot be a Bundle matches nothing rather than being refused
     assert notes("related=Bundle/abc") == []
     assert notes("related=abc,Bundle/%d" % doc["third"]) == ["consumer on third"]
+    # and one past what SQLite can store is not an error either
+    assert notes("related=Bundle/%d" % 2 ** 63) == []
 
 
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
