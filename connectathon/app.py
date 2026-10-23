@@ -5490,6 +5490,18 @@ function applyRoute(scroll) {
 
 window.addEventListener("hashchange", () => applyRoute(true));
 
+/* A link to the hash already in the address bar fires no hashchange, so a card
+   folded after following one would not open again from it. Those clicks are
+   routed here instead; a modified click (new tab or window) is the browser's. */
+document.addEventListener("click", (ev) => {
+  if (ev.defaultPrevented || ev.button !== 0
+      || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+  const link = ev.target.closest('a[href^="#"]');
+  if (!link || link.target || link.hash !== location.hash) return;
+  ev.preventDefault();
+  applyRoute(true);
+});
+
 /* The tab link remembers the document you were reading, so a trip to the
    leaderboard and back does not throw your place away. Anything that rewrites
    a #clinical hash without a hashchange has to call this itself. */

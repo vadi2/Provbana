@@ -1129,6 +1129,21 @@ def test_index_keeps_a_deep_linked_card_in_view_while_the_tab_loads(client):
             in text)
 
 
+def test_index_reapplies_a_link_to_the_hash_already_shown(client):
+    """Following #other-documents, folding the card and following the link
+    again left it folded: the hash had not changed, so no hashchange fired and
+    applyRoute, which opens the card, never ran."""
+    text = client.get("/").text
+    handler = text[text.index('document.addEventListener("click", (ev) => {\n'
+                              "  if (ev.defaultPrevented"):]
+    handler = handler[:handler.index("\n});\n")]
+    assert "link.hash !== location.hash) return;" in handler
+    assert "ev.preventDefault();\n  applyRoute(true);" in handler
+    # new-tab and new-window clicks stay with the browser
+    for key in ("metaKey", "ctrlKey", "shiftKey", "altKey"):
+        assert "ev." + key in handler
+
+
 def test_index_hides_identifier_assigning_authorities(client):
     """The OID behind a patient identifier is plumbing. The API still carries
     it - machines need it - but no reader is shown it."""
