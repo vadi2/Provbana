@@ -328,6 +328,21 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# AUTOINCREMENT for the reason endpoints has it: without it SQLite hands the id
+# of a withdrawn top row to the next upload, and Binary/N is served as immutable,
+# so anyone who saw the withdrawn screenshot would keep seeing it under the new
+# one's note - and a link already shared would come to mean another picture.
+RENDERINGS_COLUMNS = """(
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
+                submission_id INTEGER NOT NULL REFERENCES submissions(id),
+                ts            TEXT NOT NULL,
+                note          TEXT NOT NULL DEFAULT '',
+                filename      TEXT NOT NULL,
+                mime          TEXT NOT NULL
+            )"""
+
+
 def init_db() -> None:
     os.makedirs(os.path.join(DATA_DIR, "submissions"), exist_ok=True)
     with connect() as conn:
@@ -341,15 +356,7 @@ def init_db() -> None:
                 first_pass  INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS renderings (
-                id            INTEGER PRIMARY KEY,
-                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
-                submission_id INTEGER NOT NULL REFERENCES submissions(id),
-                ts            TEXT NOT NULL,
-                note          TEXT NOT NULL DEFAULT '',
-                filename      TEXT NOT NULL,
-                mime          TEXT NOT NULL
-            );
+            CREATE TABLE IF NOT EXISTS renderings %s;
             CREATE TABLE IF NOT EXISTS submissions (
                 id        INTEGER PRIMARY KEY,
                 team_id   INTEGER NOT NULL REFERENCES teams(id),
@@ -379,7 +386,35 @@ def init_db() -> None:
                 description TEXT NOT NULL DEFAULT ''
             );
             """
+            % RENDERINGS_COLUMNS
         )
+        # SQLite cannot add AUTOINCREMENT to an existing table, so a database
+        # from before it has its renderings copied into a rebuilt one. Ids are
+        # kept, and the copy seeds the sequence from the highest of them.
+        # Foreign keys are off for the copy, as SQLite's own rebuild recipe
+        # says: a row pointing at a long-gone submission must not stop the
+        # service from starting.
+        renderings_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'renderings'"
+        ).fetchone()[0]
+        if "AUTOINCREMENT" not in renderings_sql:
+            conn.executescript(
+                """
+                PRAGMA foreign_keys = OFF;
+                BEGIN;
+                CREATE TABLE renderings_new %s;
+                INSERT INTO renderings_new
+                    (id, consumer_id, submission_id, ts, note, filename, mime)
+                    SELECT id, consumer_id, submission_id, ts, note, filename, mime
+                    FROM renderings;
+                DROP TABLE renderings;
+                ALTER TABLE renderings_new RENAME TO renderings;
+                COMMIT;
+                PRAGMA foreign_keys = ON;
+                """
+                % RENDERINGS_COLUMNS
+            )
         # Migrate pre-richness databases in place.
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(submissions)")}
         for col in ("sections", "resources"):
@@ -3446,7 +3481,8 @@ def rendering_image(rendering_id: int) -> Response:
             # Already compressed. GZipMiddleware goes by size alone, so saying
             # the encoding out loud is what stops it spending CPU for nothing.
             "Content-Encoding": "identity",
-            # The bytes behind an id never change, only ever disappear.
+            # The bytes behind an id never change, only ever disappear: ids
+            # are AUTOINCREMENT, so a withdrawn one is never handed out again.
             "Cache-Control": "public, max-age=31536000, immutable",
         },
     )

@@ -2730,6 +2730,62 @@ def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
                          headers={"X-Team-Token": tok_c}).status_code == 404
 
 
+def test_a_withdrawn_screenshot_id_is_never_handed_out_again(client, monkeypatch):
+    """Binary/N is cached as immutable. If the next upload took over a withdrawn
+    top id, a browser that had seen the withdrawn picture would keep showing it
+    under the new one's note."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    first = add_shot(client, tok_c, "producer", note="wrong one").json()["id"]
+    assert client.delete("/fhir/DocumentReference/%s" % first,
+                         headers={"X-Team-Token": tok_c}).status_code == 204
+    second = add_shot(client, tok_c, "producer", note="right one").json()["id"]
+    assert int(second) > int(first)
+    assert client.get("/fhir/Binary/%s" % first).status_code == 404
+
+
+def test_an_old_database_stops_reusing_rendering_ids(tmp_path, monkeypatch):
+    """CREATE TABLE IF NOT EXISTS leaves an existing renderings table alone, so
+    one from before AUTOINCREMENT has to be rebuilt in place, keeping its rows."""
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    with sqlite3.connect(os.path.join(str(tmp_path), "connectathon.db")) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT, slug TEXT,
+                token TEXT, first_pass INTEGER DEFAULT 0, created_at TEXT);
+            CREATE TABLE submissions (id INTEGER PRIMARY KEY, team_id INTEGER,
+                ts TEXT, pass INTEGER, errors INTEGER, warnings INTEGER,
+                infos INTEGER, score INTEGER, sections INTEGER, resources INTEGER,
+                doc_type TEXT, filename TEXT);
+            CREATE TABLE renderings (id INTEGER PRIMARY KEY, consumer_id INTEGER
+                NOT NULL REFERENCES teams(id), submission_id INTEGER NOT NULL
+                REFERENCES submissions(id), ts TEXT NOT NULL, note TEXT NOT NULL
+                DEFAULT '', filename TEXT NOT NULL, mime TEXT NOT NULL);
+            INSERT INTO teams VALUES (1, 'Old', 'old', 'tok', 0, '2026-01-01');
+            INSERT INTO submissions VALUES
+                (1, 1, '2026-01-01', 1, 0, 0, 0, 60, 1, 5, 'eps', 'a.json');
+            INSERT INTO renderings VALUES
+                (3, 1, 1, '2026-01-01', 'kept', 'a.png', 'image/png');
+            -- one whose submission has gone must not stop the service starting
+            INSERT INTO renderings VALUES
+                (5, 1, 9, '2026-01-02', 'orphan', 'b.png', 'image/png');
+            """
+        )
+    app_module.init_db()
+    app_module.init_db()      # and a second start leaves the rebuilt table alone
+    with app_module.connect() as conn:
+        assert "AUTOINCREMENT" in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'renderings'").fetchone()[0]
+        assert [tuple(r) for r in conn.execute(
+            "SELECT id, note FROM renderings ORDER BY id")] \
+            == [(3, "kept"), (5, "orphan")]
+        conn.execute("DELETE FROM renderings WHERE id = 5")
+        cur = conn.execute(
+            "INSERT INTO renderings (consumer_id, submission_id, ts, filename, "
+            "mime) VALUES (1, 1, '2026-01-03', 'c.png', 'image/png')")
+        assert cur.lastrowid == 6
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
 def test_renderings_are_readable_without_a_token(client, monkeypatch):
     """The wall is for everyone in the room to read, participant or not."""
     tok_p, tok_c = interop_setup(client, monkeypatch)
