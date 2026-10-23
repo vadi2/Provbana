@@ -6128,6 +6128,14 @@ function renderIssues(issues, bundleText) {
 }
 
 /* ---- submit ---- */
+/* fetch throws before sending a header with characters it cannot carry - a
+   token pasted with smart quotes, say - and every caller read that as a
+   network error. Tokens are plain ASCII, so such a token goes out escaped:
+   the server does not know it either way, and its 401 is the true answer. */
+function bearer(token) {
+  return "Bearer " + (/^[\x21-\x7e]*$/.test(token) ? token : encodeURIComponent(token));
+}
+
 /* The token is only typed in one place, but localStorage carries it across
    reloads so a participant pastes it once for the event. */
 function syncToken(value, from) {
@@ -6225,7 +6233,7 @@ $("#submit-btn").addEventListener("click", async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/fhir+json",
-        "Authorization": "Bearer " + token,
+        "Authorization": bearer(token),
       },
       body,
     });
@@ -7269,14 +7277,10 @@ async function whoAmI() {
   const token = $("#token").value.trim();
   const ask = ++meAsked;
   let next = null, state = "none";
-  /* fetch throws before sending a header with characters it cannot carry - a
-     token pasted with smart quotes, say - which would read as the server being
-     down, for ever. Tokens are plain ASCII, so anything else is just wrong. */
-  if (token && !/^[\x21-\x7e]+$/.test(token)) state = "rejected";
-  else if (token) {
+  if (token) {
     try {
       const res = await fetch("/fhir/Organization/$me", {
-        headers: { "Authorization": "Bearer " + token },
+        headers: { "Authorization": bearer(token) },
       });
       /* An Organization: `id` is the slug, `name` the company name. */
       if (res.ok) { next = await res.json(); state = "known"; }
@@ -7370,7 +7374,7 @@ async function uploadShot(slug) {
     const blob = await shrinkImage(file);
     const res = await fetch("/fhir/DocumentReference", {
       method: "POST",
-      headers: { "Authorization": "Bearer " + token,
+      headers: { "Authorization": bearer(token),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify({
         resourceType: "DocumentReference",
@@ -7441,7 +7445,7 @@ async function saveShotNote(id) {
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "PUT",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim(),
+      headers: { "Authorization": bearer($("#token").value.trim()),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify({
         resourceType: "DocumentReference", status: "current", description: next,
@@ -7474,7 +7478,7 @@ async function withdrawShot(id, confirmed) {
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "DELETE",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+      headers: { "Authorization": bearer($("#token").value.trim()) },
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -7666,7 +7670,7 @@ async function epSave() {
   try {
     const res = await fetch("/fhir/Endpoint" + (epEditing ? "/" + epEditing : ""), {
       method: epEditing ? "PUT" : "POST",
-      headers: { "Authorization": "Bearer " + token,
+      headers: { "Authorization": bearer(token),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify(body),
     });
@@ -7714,7 +7718,7 @@ async function epRemove(btn, confirmed) {
   try {
     const res = await fetch("/fhir/Endpoint/" + id, {
       method: "DELETE",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+      headers: { "Authorization": bearer($("#token").value.trim()) },
     });
     if (res.status === 401) { await refreshCompany(); return; }
     /* 404 is the outcome asked for, reached some other way. */

@@ -3451,6 +3451,29 @@ def test_a_file_just_over_the_limit_is_not_said_to_be_the_limit(client):
     ]
 
 
+@needs_node
+def test_a_token_fetch_cannot_carry_still_reaches_the_server(client):
+    """A token pasted with smart quotes made fetch throw before sending, and
+    Validate reported a "Network error" while the note under the field said
+    the token was wrong. Every authenticated call goes through bearer()."""
+    js = page_script(client)
+    start = js.index("function bearer(")
+    fn = js[start:js.index("\n}", start) + 2]
+    tokens = ["da79f71088e8db8c", "“da79f71088e8db8c”", "da79éf71", "☃"]
+    proc = subprocess.run(
+        ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
+         ".readFileSync(0, 'utf8')).map((t) => new Headers({ Authorization: bearer(t) })"
+         ".get('Authorization'))));"],
+        input=json.dumps(tokens), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr          # Headers throws as fetch did
+    sent = json.loads(proc.stdout)
+    assert sent[0] == "Bearer da79f71088e8db8c"        # a real token goes as it is
+    assert sent[1] == "Bearer %E2%80%9Cda79f71088e8db8c%E2%80%9D"
+    assert all(s.isascii() for s in sent)
+    # no call builds the header any other way
+    assert js.count('"Bearer " +') == 1 and js.count("bearer(") >= 8
+
+
 
 # ---------------------------------------------------------------- backups
 
