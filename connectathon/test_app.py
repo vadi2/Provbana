@@ -913,6 +913,14 @@ def test_index_drops_a_preview_error_with_the_preview_pane(client):
     assert 'const box = $("#cv-preview-msg");\n  if (!box) return;' in text
 
 
+def test_index_names_the_preview_textarea(client):
+    """Its only text was the placeholder, a JSON fragment, which a screen
+    reader read out as the field's name."""
+    text = client.get("/").text
+    paste = re.search(r'<textarea id="cv-paste"[^>]*>', text).group(0)
+    assert 'aria-label="FHIR Bundle JSON to preview"' in paste
+
+
 # ---------------------------------------------------------------- interop
 
 def interop_setup(client, monkeypatch):

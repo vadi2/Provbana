@@ -7111,7 +7111,7 @@ function renderPreviewBox(box) {
   box.innerHTML = '<div class="cv-paste">'
     + '<p class="muted" style="margin:0">Pick a Bundle .json or paste one below.'
     + " It is only rendered here, not uploaded to the hackathon.</p>"
-    + '<textarea id="cv-paste" spellcheck="false" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
+    + '<textarea id="cv-paste" spellcheck="false" aria-label="FHIR Bundle JSON to preview" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
     + '<div class="row"><button type="button" id="cv-paste-go">Preview</button>'
     + '<button type="button" class="ghost" id="cv-pick">Choose a file&hellip;</button></div>'
     + '<p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>'
