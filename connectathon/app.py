@@ -1477,7 +1477,7 @@ def summarize_bundle(bundle) -> dict:
     medicationReference) are listed under "unreferenced" as a data-quality
     hint. A bundle that is not a document (an MPD prescription is a
     collection) has no Composition to reach anything from, so its clinical
-    entries make up one "Entries" section instead.
+    entries (or, with none, all of them) make up one "Entries" section.
     """
     summary: dict = {
         "patient": None,
