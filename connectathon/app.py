@@ -7165,8 +7165,8 @@ function interopCurls() {
     "curl -s " + origin + "/fhir/Organization/PARTNER_SLUG/\\$document"
       + " -o partner-eps.json\n\n" +
     "# publish a screenshot of how it came out in your system - the image goes\n" +
-    "# in the attachment, base64-encoded, and is piped in: a real screenshot is\n" +
-    "# too big to pass on the command line:\n" +
+    "# in the attachment, base64-encoded. It is piped in, because a real\n" +
+    "# screenshot is too big to pass on the command line:\n" +
     "{ printf '%s' '{\"resourceType\": \"DocumentReference\", \"status\": \"current\",\n" +
     '    "description": "Allergies came through empty",\n' +
     '    "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +

@@ -2824,6 +2824,7 @@ def test_the_documented_screenshot_uploads_take_a_real_screenshot(
     proc = subprocess.run(["node", "-e", "\n".join(parts) + CURLS_HARNESS],
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0, proc.stderr
+
     def block(text, first, after):
         """The lines from the comment `first` up to the comment `after`."""
         start = text.index(first)
@@ -2839,10 +2840,12 @@ def test_the_documented_screenshot_uploads_take_a_real_screenshot(
     image = png_bytes() + b"\x00" * 200_000
     (tmp_path / "shot.png").write_bytes(image)
     # A real executable rather than a shell function: the limit is enforced
-    # when the shell execs a program, which a function would never reach.
+    # when the shell execs a program, which a function would never reach. It
+    # keeps its arguments too: a body on stdin is only sent if curl is told so.
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "curl").write_text('#!/bin/sh\ncat > "$BODY_OUT"\n')
+    (bindir / "curl").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$BODY_OUT.args"\ncat > "$BODY_OUT"\n')
     (bindir / "curl").chmod(0o755)
     for name, snippet in (("tab", tab), ("README", readme)):
         script = "set -eo pipefail\n" + snippet.replace("TOKEN", tok_c) \
@@ -2853,6 +2856,8 @@ def test_the_documented_screenshot_uploads_take_a_real_screenshot(
             timeout=60, env=dict(os.environ, BODY_OUT=str(body_out),
                                  PATH="%s:%s" % (bindir, os.environ["PATH"])))
         assert run.returncode == 0, (name, run.stderr)
+        args = (tmp_path / ("%s.json.args" % name)).read_text().split("\n")
+        assert "--data-binary" in args and "@-" in args, (name, args)
         res = client.post("/fhir/DocumentReference",
                           content=body_out.read_bytes(),
                           headers={"X-Team-Token": tok_c,
