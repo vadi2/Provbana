@@ -1684,7 +1684,9 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
     A claim pinned to a version the validator does not have counts as no
     claim: Matchbox reports such a profile as "not checked" with only a
     warning, so `...-eu-mpd|9.9.9` would otherwise buy the same free pass.
-    Unversioned, or the version of the package the engine loads, is checked.
+    Unversioned, or the version of the package the engine loads, is checked -
+    MPD's profiles carry their package's version, which Matchbox reports back
+    as "(from ...MedicationRequest-eu-mpd|1.0.0)".
 
     A no-op for every category with no `entry_profiles`: they are checked
     against a bundle profile of their own.
