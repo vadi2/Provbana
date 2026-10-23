@@ -6162,18 +6162,23 @@ $("#file").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
   if (!f) return;
   const errBox = $("#submit-error");
-  if (f.size > maxBundleBytes) {
-    errBox.textContent = "That file is " + (f.size / 1048576).toFixed(1) + " MB; the limit is "
-      + Math.round(maxBundleBytes / 1048576) + " MB.";
+  /* A refused file takes the previous bundle with it: left in the box, it is
+     what Validate would send, under the new file's name in the picker. */
+  const refuse = (message) => {
+    ev.target.value = "";
+    $("#bundle").value = "";
+    errBox.textContent = message;
     errBox.style.display = "block";
-    return;
+  };
+  if (f.size > maxBundleBytes) {
+    return refuse("That file is " + (f.size / 1048576).toFixed(1) + " MB; the limit is "
+      + Math.round(maxBundleBytes / 1048576) + " MB.");
   }
   try {
     $("#bundle").value = await f.text();
     errBox.style.display = "none";
   } catch (e) {
-    errBox.textContent = "Could not read the file: " + e.message;
-    errBox.style.display = "block";
+    refuse("Could not read the file: " + e.message);
   }
 });
 

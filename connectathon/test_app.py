@@ -3385,6 +3385,20 @@ def test_a_failed_bundle_does_not_show_an_earlier_score(client):
     assert '+ (score ? " " + standing : "")' in text             # standing on hover
 
 
+def test_a_refused_file_takes_the_previous_bundle_with_it(client):
+    """Picking a file over the limit left the last bundle in the box, and
+    Validate sent and scored that one under the new file's name."""
+    text = client.get("/").text
+    handler = text.split('$("#file").addEventListener("change"', 1)[1]
+    handler = handler[:handler.index("\n});")]
+    refuse = handler[handler.index("const refuse = "):]
+    refuse = refuse[:refuse.index("};")]
+    assert 'ev.target.value = ""' in refuse and '$("#bundle").value = ""' in refuse
+    # both refusals - too big, and unreadable - go through it
+    assert handler.count("refuse(") == 2
+    assert "return refuse(" in handler and 'refuse("Could not read the file: "' in handler
+
+
 
 # ---------------------------------------------------------------- backups
 
