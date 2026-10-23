@@ -3053,9 +3053,9 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     ),
 )
 def read_bundle(bundle_id: str) -> Response:
-    # "$validate" fits {bundle_id} too, and Starlette takes this full match
-    # over the POST route's method mismatch - so the 405 a PUT gets is said
-    # here, or a GET reads as a Bundle that does not exist.
+    # "$validate" fits {bundle_id} too, and Starlette prefers this full match
+    # to the POST route's method mismatch. The router answers PUT with 405 on
+    # its own; GET needs saying here, or it reads as an unknown Bundle.
     if bundle_id == "$validate":
         raise HTTPException(405, detail="Method Not Allowed", headers={"Allow": "POST"})
     found = resolve_bundle(bundle_id)

@@ -2686,6 +2686,18 @@ def test_a_crafted_id_is_a_404_outcome_on_every_read_and_write(client, monkeypat
     assert '"producer-1-' in res.headers["content-disposition"]
 
 
+def test_an_endpoint_put_whose_body_names_another_id_is_refused(client):
+    tok = register(client, "Owner")
+    ep = advertise(client, tok, endpoint()).json()["id"]
+    res = advertise(client, tok, dict(endpoint(), id="2"), ep)
+    assert res.status_code == 400
+    assert diagnostics(res) == "The body's id is '2' but the URL's is '1'"
+    # a FHIR id is compared as the string it is, not as the number it reads as
+    assert advertise(client, tok, dict(endpoint(), id="01"), ep).status_code == 400
+    res = advertise(client, tok, dict(endpoint(name="Same"), id=ep), ep)
+    assert res.status_code == 200 and res.json()["name"] == "Same"
+
+
 def test_get_on_validate_is_405_not_an_unknown_bundle(client):
     res = client.get("/fhir/Bundle/$validate")
     assert res.status_code == 405
