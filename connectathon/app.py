@@ -2786,6 +2786,23 @@ def safe_summary(bundle) -> dict:
         return summarize_bundle(None)
 
 
+ROW_ID = re.compile(r"[0-9]+")
+
+
+def row_id(value: str) -> int | None:
+    """The row id a FHIR id names, or None when it cannot name a row.
+
+    ASCII digits only: str.isdigit() also takes '²', '①' and '١', which int()
+    either refuses or quietly maps onto some other id. And below 2**63, the
+    most SQLite can hold - binding anything larger is an OverflowError, not
+    "no such row".
+    """
+    if not ROW_ID.fullmatch(value):
+        return None
+    number = int(value)
+    return number if number < 2 ** 63 else None
+
+
 def _submission_row(sub_id: int) -> sqlite3.Row | None:
     with connect() as conn:
         return conn.execute(
@@ -3009,8 +3026,9 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     slug, which always carries a letter. One space means a partner's document
     and a worked example are fetched exactly the same way.
     """
-    if bundle_id.isdigit():
-        row = _submission_row(int(bundle_id))
+    sub_id = row_id(bundle_id)
+    if sub_id is not None:
+        row = _submission_row(sub_id)
         if row is None:
             return None
         raw = read_submission_bytes(row["team_slug"], row["filename"])
@@ -3018,7 +3036,7 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
             return None
         # The category is in the name so a folder of downloads stays sortable
         # once a team has sent more than patient summaries.
-        return raw, "%s-%s-%s.json" % (row["team_slug"], bundle_id, row["doc_type"])
+        return raw, "%s-%d-%s.json" % (row["team_slug"], sub_id, row["doc_type"])
     raw = read_sample_bytes(bundle_id)
     if raw is None:
         return None
@@ -3035,6 +3053,11 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     ),
 )
 def read_bundle(bundle_id: str) -> Response:
+    # "$validate" fits {bundle_id} too, and Starlette takes this full match
+    # over the POST route's method mismatch - so the 405 a PUT gets is said
+    # here, or a GET reads as a Bundle that does not exist.
+    if bundle_id == "$validate":
+        raise HTTPException(405, detail="Method Not Allowed", headers={"Allow": "POST"})
     found = resolve_bundle(bundle_id)
     if found is None:
         raise HTTPException(404, detail="Unknown Bundle")
@@ -3205,7 +3228,12 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
     }
 
 
-def fetch_rendering(conn: sqlite3.Connection, rendering_id: int) -> sqlite3.Row | None:
+def fetch_rendering(
+    conn: sqlite3.Connection, rendering_id: int | None
+) -> sqlite3.Row | None:
+    """The rendering with this id; None also for an id row_id() refused."""
+    if rendering_id is None:
+        return None
     return conn.execute(
         RENDERING_SELECT + " WHERE r.id = ?", (rendering_id,)
     ).fetchone()
@@ -3221,7 +3249,7 @@ def read_rendering_bytes(consumer_slug: str, filename: str) -> bytes | None:
 
 
 def owned_rendering(
-    conn: sqlite3.Connection, rendering_id: int, team: sqlite3.Row
+    conn: sqlite3.Connection, rendering_id: int | None, team: sqlite3.Row
 ) -> sqlite3.Row:
     """The rendering, if this team is the one that uploaded it."""
     row = fetch_rendering(conn, rendering_id)
@@ -3380,14 +3408,19 @@ def add_rendering(
     ),
 )
 def list_renderings(
-    related: int | None = None,
+    related: str | None = None,
     custodian: str | None = None,
     author: str | None = None,
 ) -> Response:
     where, params = [], []
-    if related is not None:
+    if related:
+        # A Bundle id that names no submission - a sample's slug, say - is
+        # one nobody has screenshotted, not a malformed search.
+        sub_id = row_id(related)
+        if sub_id is None:
+            return fhir_response(searchset([]))
         where.append("r.submission_id = ?")
-        params.append(related)
+        params.append(sub_id)
     if custodian:
         where.append("p.slug = ?")
         params.append(custodian)
@@ -3407,9 +3440,9 @@ def list_renderings(
     tags=["Interop"],
     summary="One screenshot's metadata",
 )
-def read_rendering(rendering_id: int) -> Response:
+def read_rendering(rendering_id: str) -> Response:
     with connect() as conn:
-        row = fetch_rendering(conn, rendering_id)
+        row = fetch_rendering(conn, row_id(rendering_id))
     if row is None:
         raise HTTPException(404, detail="Unknown DocumentReference")
     return fhir_response(documentreference_resource(row))
@@ -3424,9 +3457,9 @@ def read_rendering(rendering_id: int) -> Response:
         "for, which is what lets an <img> point straight at it."
     ),
 )
-def rendering_image(rendering_id: int) -> Response:
+def rendering_image(rendering_id: str) -> Response:
     with connect() as conn:
-        row = fetch_rendering(conn, rendering_id)
+        row = fetch_rendering(conn, row_id(rendering_id))
     if row is None:
         raise HTTPException(404, detail="Unknown Binary")
     raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
@@ -3465,7 +3498,7 @@ def rendering_image(rendering_id: int) -> Response:
     ),
 )
 def update_rendering(
-    rendering_id: int,
+    rendering_id: str,
     payload: dict = Depends(docref_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
@@ -3475,13 +3508,13 @@ def update_rendering(
     if not isinstance(note, str):
         raise HTTPException(400, detail="\"description\" must be a string")
     with connect() as conn:
-        owned_rendering(conn, rendering_id, team)
+        row = owned_rendering(conn, row_id(rendering_id), team)
         conn.execute(
             "UPDATE renderings SET note = ? WHERE id = ?",
-            (note.strip()[:MAX_NOTE_CHARS], rendering_id),
+            (note.strip()[:MAX_NOTE_CHARS], row["id"]),
         )
         return fhir_response(
-            documentreference_resource(fetch_rendering(conn, rendering_id))
+            documentreference_resource(fetch_rendering(conn, row["id"]))
         )
 
 
@@ -3492,11 +3525,11 @@ def update_rendering(
     description="Only the company that uploaded it can remove it; 403 otherwise.",
 )
 def delete_rendering(
-    rendering_id: int, team: sqlite3.Row = Depends(current_team)
+    rendering_id: str, team: sqlite3.Row = Depends(current_team)
 ) -> Response:
     with connect() as conn:
-        row = owned_rendering(conn, rendering_id, team)
-        conn.execute("DELETE FROM renderings WHERE id = ?", (rendering_id,))
+        row = owned_rendering(conn, row_id(rendering_id), team)
+        conn.execute("DELETE FROM renderings WHERE id = ?", (row["id"],))
     # A withdrawn screenshot that is still on disk has not been withdrawn.
     try:
         os.remove(
@@ -3668,10 +3701,11 @@ def insert_endpoint(conn: sqlite3.Connection, team_id: int, fields: dict) -> int
     ).lastrowid
 
 
-def fetch_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | None:
-    # An id past what SQLite can hold is no endpoint, rather than an
-    # OverflowError on binding it.
-    if abs(endpoint_id) >= 2 ** 63:
+def fetch_endpoint(
+    conn: sqlite3.Connection, endpoint_id: int | None
+) -> sqlite3.Row | None:
+    """The endpoint with this id; None also for an id row_id() refused."""
+    if endpoint_id is None:
         return None
     return conn.execute(ENDPOINT_SELECT + " WHERE e.id = ?", (endpoint_id,)).fetchone()
 
@@ -3696,7 +3730,7 @@ def _extension_values(element, url: str, key: str, name: str) -> list:
 
 
 def owned_endpoint(
-    conn: sqlite3.Connection, endpoint_id: int, team: sqlite3.Row
+    conn: sqlite3.Connection, endpoint_id: int | None, team: sqlite3.Row
 ) -> sqlite3.Row:
     """The endpoint, if this company is the one advertising it. It is public,
     so somebody else's is a 403 and not a 404."""
@@ -3798,9 +3832,9 @@ def search_endpoints(
     tags=["Interop"],
     summary="One advertised endpoint",
 )
-def read_endpoint(endpoint_id: int) -> Response:
+def read_endpoint(endpoint_id: str) -> Response:
     with connect() as conn:
-        row = fetch_endpoint(conn, endpoint_id)
+        row = fetch_endpoint(conn, row_id(endpoint_id))
     if row is None:
         raise HTTPException(404, detail="Unknown Endpoint")
     return fhir_response(endpoint_resource(row))
@@ -3815,28 +3849,28 @@ def read_endpoint(endpoint_id: int) -> Response:
     ),
 )
 def update_endpoint(
-    endpoint_id: int,
+    endpoint_id: str,
     payload: dict = Depends(endpoint_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
-    if payload.get("id") not in (None, str(endpoint_id)):
+    if payload.get("id") not in (None, endpoint_id):
         raise HTTPException(
-            400, detail="The body's id is %r but the URL's is %d"
+            400, detail="The body's id is %r but the URL's is %r"
                         % (payload["id"], endpoint_id))
     fields = parse_endpoint(payload)
     with connect() as conn:
         # The ownership check and the write see the same row, or a DELETE
         # landing between them leaves nothing to read back.
         conn.execute("BEGIN IMMEDIATE")
-        owned_endpoint(conn, endpoint_id, team)
+        row = owned_endpoint(conn, row_id(endpoint_id), team)
         conn.execute(
             "UPDATE endpoints SET updated_at = ?, kind = ?, name = ?, "
             "address = ?, description = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), fields["kind"],
              fields["name"], fields["address"], fields["description"],
-             endpoint_id),
+             row["id"]),
         )
-        return fhir_response(endpoint_resource(fetch_endpoint(conn, endpoint_id)))
+        return fhir_response(endpoint_resource(fetch_endpoint(conn, row["id"])))
 
 
 @app.delete("/fhir/Endpoint/{endpoint_id}",
@@ -3846,11 +3880,11 @@ def update_endpoint(
     description="Only the company advertising it can remove it; 403 otherwise.",
 )
 def delete_endpoint(
-    endpoint_id: int, team: sqlite3.Row = Depends(current_team)
+    endpoint_id: str, team: sqlite3.Row = Depends(current_team)
 ) -> Response:
     with connect() as conn:
-        owned_endpoint(conn, endpoint_id, team)
-        conn.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+        row = owned_endpoint(conn, row_id(endpoint_id), team)
+        conn.execute("DELETE FROM endpoints WHERE id = ?", (row["id"],))
     return Response(status_code=204)
 
 
@@ -4155,9 +4189,10 @@ def ui_document(doc_id: str) -> dict:
             "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
             "summary": safe_summary(_loads_or_none(raw)),
         }
-    if not doc_id.isdigit():
+    sub_id = row_id(doc_id)
+    if sub_id is None:
         raise HTTPException(404, detail="Unknown document")
-    row = _submission_row(int(doc_id))
+    row = _submission_row(sub_id)
     if row is None:
         raise HTTPException(404, detail="Unknown submission")
     raw = read_submission_bytes(row["team_slug"], row["filename"])

@@ -2641,6 +2641,58 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
         == ["from third"]
     assert shots(client.get("/fhir/DocumentReference?custodian=nobody")) == []
     assert shots(client.get("/fhir/DocumentReference?related=99999")) == []
+    # a Bundle id that is a sample's slug has no screenshots, rather than a 422
+    res = client.get("/fhir/DocumentReference?related=andrea-cross-border")
+    assert res.status_code == 200 and shots(res) == []
+
+
+# Past what SQLite holds; non-ASCII digits str.isdigit() takes but int() either
+# refuses ('²', '①') or maps onto a real id (fullwidth and Arabic-Indic '1');
+# and plain ids that are not numbers at all.
+CRAFTED_IDS = ["99999999999999999999999", str(2 ** 63), "²", "①",
+               "１", "١", "abc"]
+
+
+def test_a_crafted_id_is_a_404_outcome_on_every_read_and_write(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    shot = add_shot(client, tok_c, "producer").json()["id"]
+    ep = advertise(client, tok_c, endpoint()).json()["id"]
+    assert (shot, ep) == ("1", "1")     # so a digit read as 1 would find them
+    auth = {"Authorization": "Bearer " + tok_c}
+    for crafted in CRAFTED_IDS:
+        quoted = urllib.parse.quote(crafted)
+        for res in (
+            client.get("/fhir/Bundle/" + quoted),
+            client.get("/ui/documents/" + quoted),
+            client.get("/fhir/DocumentReference/" + quoted),
+            client.get("/fhir/Binary/" + quoted),
+            client.get("/fhir/Endpoint/" + quoted),
+            client.put("/fhir/DocumentReference/" + quoted, headers=auth,
+                       json={"resourceType": "DocumentReference", "description": "x"}),
+            client.delete("/fhir/DocumentReference/" + quoted, headers=auth),
+            advertise(client, tok_c, endpoint(), quoted),
+            client.delete("/fhir/Endpoint/" + quoted, headers=auth),
+        ):
+            assert res.status_code == 404, (crafted, res.request.url, res.text)
+            assert res.json()["issue"][0]["code"] == "not-found"
+        res = client.get("/fhir/DocumentReference?related=" + quoted)
+        assert res.status_code == 200 and shots(res) == [], crafted
+    # nothing was rewritten or withdrawn on the way
+    assert client.get("/fhir/DocumentReference/1").json().get("description") != "x"
+    assert client.get("/fhir/Endpoint/1").status_code == 200
+    # the download is named from the id the row holds
+    res = client.get("/fhir/Bundle/1")
+    assert res.status_code == 200
+    assert '"producer-1-' in res.headers["content-disposition"]
+
+
+def test_get_on_validate_is_405_not_an_unknown_bundle(client):
+    res = client.get("/fhir/Bundle/$validate")
+    assert res.status_code == 405
+    assert res.headers["allow"] == "POST"
+    assert res.json()["issue"][0]["code"] == "not-supported"
+    # the same answer as any other method the operation does not take
+    assert client.put("/fhir/Bundle/$validate").status_code == 405
 
 
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
