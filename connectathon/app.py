@@ -2017,9 +2017,10 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
     and it resolves `|1.0` to that too. A bare major, `|1`, it reports as
     "could not be found".
 
-    MPD-specific: a no-op for every other category, even one that comes to
-    have `entry_profiles`, as they are checked against a bundle profile of
-    their own.
+    MPD-specific: the orders it requires are MedicationRequest and
+    MedicationDispense, so it is a no-op for every other category, even one
+    that comes to have `entry_profiles`. A category detected by its entries'
+    claims with no bundle profile of its own would need an equivalent check.
     """
     if doc.get("id") != "mpd":
         return outcome

@@ -5618,8 +5618,8 @@ def test_an_mpd_claim_at_major_minor_counts_as_checked(client, monkeypatch):
 
 
 def test_the_mpd_claim_check_leaves_other_categories_alone():
-    """Every other category is checked against a bundle profile of its own, so
-    a lab report carrying a bare MedicationRequest is not MPD's business."""
+    """The orders the check requires are MPD's, so a lab report carrying a
+    bare MedicationRequest is not its business."""
     oc = outcome()
     body = doc_bundle(comp_type="11502-2", resources=("MedicationRequest",))
     for doc_id in ("eps", "laboratory", "imaging"):
