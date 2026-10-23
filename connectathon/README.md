@@ -443,7 +443,7 @@ A prescription is checked against base `Bundle`, and the validator applies an MP
 profile only to an entry that claims one. So an MPD submission passes only when it
 carries at least one `MedicationRequest` or `MedicationDispense` and every one of them
 claims its MPD profile in `meta.profile`, unversioned or at the version the validator
-loads. An order that claims nothing would meet base R4 alone, so it is failed with an
+loads (`|1.0.0`, or `|1.0`, which the validator resolves to it; not a bare `|1`). An order that claims nothing would meet base R4 alone, so it is failed with an
 error saying which profile to add rather than paid for conformance nobody checked.
 
 Each category is validated in its own engine: Matchbox scopes an engine to the
