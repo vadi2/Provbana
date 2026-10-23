@@ -2766,8 +2766,9 @@ def _leaderboard_rows() -> list[dict]:
             primary_subs = [
                 s for s in team_subs if s["doc_type"] == PRIMARY_DOCUMENT["id"]
             ]
-            # Highest-scoring submission of the two sets, earliest first.
-            best = min(primary_subs or team_subs, key=lambda s: (-s["score"], s["ts"]))
+            # The best summary, earliest of equals, for the richness columns.
+            best = min(primary_subs, key=lambda s: (-s["score"], s["ts"]),
+                       default=None)
             best_primary = max((s["score"] for s in primary_subs), default=0)
             # Registry order, not submission order, so the column reads the same
             # for every team however they got there.
@@ -2811,8 +2812,8 @@ def _leaderboard_rows() -> list[dict]:
                     # row above it, and the status and category chips already
                     # say the team submitted, so empty cannot be misread as
                     # never having tried.
-                    "bestSections": best["sections"] if primary_subs else None,
-                    "bestResources": best["resources"] if primary_subs else None,
+                    "bestSections": best["sections"] if best else None,
+                    "bestResources": best["resources"] if best else None,
                     # Absent rather than false for a team with no summary yet:
                     # "has not passed the track's document" is the thing the
                     # column is for, and 0 would read as a passing empty one.
