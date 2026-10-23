@@ -4484,6 +4484,13 @@ th { text-align: left; color: var(--muted); font-size: 0.76rem;
 td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
 .table-wrap { overflow-x: auto; }
+/* A company name is any 2-40 characters, spaces or not: one long word has to
+   break rather than widen the page on a phone, or the leaderboard's name
+   column on any screen, pushing its last columns out of view. */
+.co-name { overflow-wrap: anywhere; }
+/* That also lets a table shrink the column to a letter: on a phone, where the
+   leaderboard scrolls anyway, ordinary names then broke mid-word. */
+td.co-name { min-width: 8em; }
 tr.rank-1 td { background: var(--gold-bg); }
 tr.rank-2 td { background: var(--silver-bg); }
 tr.rank-3 td { background: var(--bronze-bg); }
@@ -4957,7 +4964,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <section class="card" id="register-card">
     <div id="company-view" hidden>
       <h2>Your company</h2>
-      <p class="muted" style="margin:0">Registered as <strong
+      <p class="muted" style="margin:0">Registered as <strong class="co-name"
       id="company-name"></strong>. <button type="button" class="linkish"
       id="reg-another">Register a different company</button></p>
       <h3 class="company-sub">Where others can send you data</h3>
@@ -5023,7 +5030,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <div class="error-note" id="reg-error" role="alert"></div>
     <div id="reg-back-wrap" hidden>
       <p class="muted" style="margin:10px 0 0">Registering replaces the token
-      saved in this browser <strong id="reg-replace-name"></strong> - keep a
+      saved in this browser <strong class="co-name" id="reg-replace-name"></strong> - keep a
       copy first: <code id="reg-replace-token"></code></p>
       <p class="muted" style="margin:6px 0 0"><button type="button"
       class="linkish" id="reg-back">Back to your company</button></p>
@@ -5363,7 +5370,7 @@ async function refreshLeaderboard() {
     $("#lb-body").innerHTML = rows.map((r) => `
       <tr class="${r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
-        <td>${r.attempts
+        <td class="co-name">${r.attempts
           ? `<a href="#clinical/company/${encodeURIComponent(r.team_slug)}"
                title="see this company's documents">${esc(r.team)}</a>`
           : esc(r.team)}${r.first_pass
@@ -7019,7 +7026,7 @@ function renderClinicalDoc(d) {
   }
   html += cvModesHtml();
   html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
-  html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
+  html += '<p class="muted co-name" style="margin:2px 0 0">' + esc(d.team)
     + (d.preview
         ? " of " + esc(d.filename || "pasted JSON")
           + " &middot; not uploaded, validated or scored"
@@ -7193,8 +7200,8 @@ async function refreshShotCount(slug) {
 
 function partnerCard(p) {
   return '<div class="io-partner" data-slug="' + esc(p.team_slug) + '">'
-    + "<strong>" + esc(p.team) + "</strong>"
-    + '<p class="muted" style="margin:6px 0 0"><code>GET /fhir/Organization/'
+    + '<strong class="co-name">' + esc(p.team) + "</strong>"
+    + '<p class="muted" style="margin:6px 0 0"><code class="co-name">GET /fhir/Organization/'
     + esc(p.team_slug) + "/$document</code> \u00b7 Document #" + p.exchange_id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
@@ -7590,7 +7597,7 @@ async function loadEndpoints() {
     hint.textContent = groups.length ? ""
       : "No company has advertised an endpoint yet.";
     box.innerHTML = groups.map((g) =>
-      '<div class="io-partner"><strong>' + esc(g.team) + "</strong>"
+      '<div class="io-partner"><strong class="co-name">' + esc(g.team) + "</strong>"
       + g.rows.map((e) => epRow(e, false)).join("") + "</div>").join("");
     $("#my-eps").innerHTML = Object.values(myEndpoints)
       .map((e) => epRow(e, true)).join("");

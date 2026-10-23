@@ -1169,6 +1169,24 @@ def test_the_explain_menu_opens_on_screen_when_a_phone_wraps_the_toolbar(client)
     assert ".issue-toolbar .menu-wrap { margin-left: auto; }" in text
 
 
+def test_a_long_company_name_wraps_wherever_it_is_shown(client):
+    """A name is any 2-40 characters with no rule about spaces, so one long
+    word scrolled the Submit and Interop tabs sideways on a phone and pushed
+    the leaderboard's last columns out of view on a desktop."""
+    text = client.get("/").text
+    assert ".co-name { overflow-wrap: anywhere; }" in text
+    # with no floor the leaderboard column shrank to a letter on a phone
+    assert "td.co-name { min-width: 8em; }" in text
+    for shown in ('<strong class="co-name"\n      id="company-name">',
+                  '<strong class="co-name" id="reg-replace-name">',
+                  '<td class="co-name">${r.attempts',                     # leaderboard
+                  """'<strong class="co-name">' + esc(p.team)""",          # partner card
+                  '<code class="co-name">GET /fhir/Organization/',        # its slug
+                  """<strong class="co-name">' + esc(g.team)""",          # endpoints
+                  """'<p class="muted co-name" style="margin:2px 0 0">' + esc(d.team)"""):
+        assert shown in text, shown
+
+
 # ------------------------------------------------------------- sample documents
 
 
