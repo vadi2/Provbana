@@ -5113,7 +5113,6 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <h2>Clinical view of submitted documents</h2>
   <label for="cv-team">Company</label>
   <select id="cv-team"></select>
-  <p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>
   <input type="file" id="cv-file" accept=".json,application/json,application/fhir+json" hidden>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
@@ -7053,8 +7052,12 @@ $("#cv-doc").addEventListener("click", (ev) => {
 const CV_PREVIEW_KEY = "cv-preview";
 let cvPreview = null;
 
+/* The message lives in the preview pane, so redrawing the list for another
+   company or a document takes an old error away with it; one that arrives
+   after the reader has left the pane has nowhere to go and is dropped. */
 function previewMsg(text) {
   const box = $("#cv-preview-msg");
+  if (!box) return;
   box.textContent = text || "";
   box.style.display = text ? "block" : "none";
 }
@@ -7111,6 +7114,7 @@ function renderPreviewBox(box) {
     + '<textarea id="cv-paste" spellcheck="false" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
     + '<div class="row"><button type="button" id="cv-paste-go">Preview</button>'
     + '<button type="button" class="ghost" id="cv-pick">Choose a file&hellip;</button></div>'
+    + '<p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>'
     + "</div>";
   $("#cv-pick").addEventListener("click", () => {
     $("#cv-file").value = "";  // picking the same file again should still fire

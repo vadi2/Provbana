@@ -900,6 +900,19 @@ def test_preview_renders_a_bundle_without_storing_it(client):
     assert client.post("/ui/preview", content=b'{"resourceType": "Patient"}').status_code == 400
 
 
+def test_index_drops_a_preview_error_with_the_preview_pane(client):
+    """A failed preview's message sat above the list, outside what a redraw
+    replaces, so it stayed on screen under another company's list and over
+    any document opened next. It now lives in the preview pane itself."""
+    text = client.get("/").text
+    pane = text[text.index("function renderPreviewBox("):]
+    pane = pane[:pane.index("\n}\n")]
+    assert 'id="cv-preview-msg"' in pane
+    assert text.count('id="cv-preview-msg"') == 1   # not in the static card too
+    # an error that lands after the reader left the pane has nowhere to go
+    assert 'const box = $("#cv-preview-msg");\n  if (!box) return;' in text
+
+
 # ---------------------------------------------------------------- interop
 
 def interop_setup(client, monkeypatch):
