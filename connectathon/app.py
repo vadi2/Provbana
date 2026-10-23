@@ -2013,7 +2013,7 @@ class HeadAsGet:
     uptime checker or a link preview gets a 405 for the front page. Answered
     as the GET would be, headers and all, with the body dropped here rather
     than left to the server: uvicorn only drops it for a scope that still
-    says HEAD. Outermost, so everything inside sees an ordinary GET.
+    says HEAD. Added last, so it wraps the other middleware and they see a GET.
     """
 
     def __init__(self, app) -> None:
