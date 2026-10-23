@@ -3137,6 +3137,35 @@ def test_whoami_names_the_company_behind_a_token(client):
     assert client.get("/fhir/Organization/$me", headers={"X-Team-Token": "nope"}).status_code == 401
 
 
+def test_a_401_says_what_was_wrong_with_the_credential_sent(client):
+    """An unset $TOKEN in the documented curl sends a bare "Bearer"; that is
+    not a missing X-Team-Token header. Every 401 carries the challenge."""
+    tok = register(client, "Alpha")
+    cases = [
+        ({}, "No company token - send `Authorization: Bearer TOKEN`", "Bearer"),
+        ({"Authorization": "Bearer"},
+         "The Authorization header has no token after `Bearer`", "Bearer"),
+        ({"Authorization": "Bearer   "},
+         "The Authorization header has no token after `Bearer`", "Bearer"),
+        ({"Authorization": "Basic abc"},
+         "The Authorization header must be `Bearer TOKEN`", "Bearer"),
+        ({"Authorization": "Bearer nope"}, "Invalid company token",
+         'Bearer error="invalid_token"'),
+        ({"X-Team-Token": "nope"}, "Invalid company token",
+         'Bearer error="invalid_token"'),
+    ]
+    for headers, message, challenge in cases:
+        res = client.get("/fhir/Organization/$me", headers=headers)
+        assert res.status_code == 401, headers
+        assert diagnostics(res) == message, headers
+        assert res.headers["WWW-Authenticate"] == challenge, headers
+    # the scheme is case-insensitive, and X-Team-Token still wins over a
+    # header some proxy in front of the server may have added
+    for headers in ({"Authorization": "bearer " + tok},
+                    {"X-Team-Token": tok, "Authorization": "Basic abc"}):
+        assert client.get("/fhir/Organization/$me", headers=headers).status_code == 200
+
+
 def test_the_interop_tab_offers_screenshots(client):
     text = client.get("/").text
     assert "I loaded this - add a screenshot</button>" in text

@@ -2208,18 +2208,36 @@ async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
 def team_from_token(
     x_team_token: str | None, authorization: str | None
 ) -> sqlite3.Row:
-    """Resolve the X-Team-Token / Bearer credential to a team row or raise 401."""
+    """Resolve the X-Team-Token / Bearer credential to a team row or raise 401.
+
+    Every 401 names what was actually wrong with what was sent - the docs lead
+    with Bearer, so "missing X-Team-Token" would send a team with an unset
+    $TOKEN looking for a header it never used - and carries the
+    WWW-Authenticate challenge HTTP requires of a 401.
+    """
     token = x_team_token
-    if not token and authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
+    if not token and authorization:
+        scheme, _, credentials = authorization.strip().partition(" ")
+        if scheme.lower() != "bearer":
+            raise HTTPException(
+                401, detail="The Authorization header must be `Bearer TOKEN`",
+                headers={"WWW-Authenticate": "Bearer"})
+        token = credentials.strip()
+        if not token:
+            raise HTTPException(
+                401, detail="The Authorization header has no token after `Bearer`",
+                headers={"WWW-Authenticate": "Bearer"})
     if not token:
-        raise HTTPException(401, detail="Missing X-Team-Token header")
+        raise HTTPException(
+            401, detail="No company token - send `Authorization: Bearer TOKEN`",
+            headers={"WWW-Authenticate": "Bearer"})
     with connect() as conn:
         team = conn.execute(
             "SELECT id, name, slug FROM teams WHERE token = ?", (token,)
         ).fetchone()
     if team is None:
-        raise HTTPException(401, detail="Invalid company token")
+        raise HTTPException(401, detail="Invalid company token",
+                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
     return team
 
 

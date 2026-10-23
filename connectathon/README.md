@@ -480,7 +480,8 @@ curl localhost:8095/fhir/metadata
 ```
 
 Endpoints that write authenticate with `Authorization: Bearer TOKEN` (or
-`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**.
+`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**, with a
+`WWW-Authenticate: Bearer` challenge and a message saying what was wrong with what was sent.
 
 Anything the server computes rather than stores - a ranking, a health check, a token -
 comes back as a `Parameters` resource. That is FHIR's answer for exactly this, and it
