@@ -3488,16 +3488,53 @@ def read_rendering(rendering_id: int) -> Response:
     return fhir_response(documentreference_resource(row))
 
 
+# The JSON spellings FHIR accepts in Accept and _format. XML is not served here,
+# so asking for it gets the image, as any other non-FHIR request does.
+FHIR_JSON_FORMATS = {"json", "application/json", "application/fhir+json",
+                     "application/json+fhir"}
+
+
+def wants_fhir_json(request: Request) -> bool:
+    """Whether this read asked for the resource rather than the content.
+
+    _format wins over Accept, as FHIR says. A query string turns an unescaped
+    + into a space, so _format=application/fhir+json has to be put back. In
+    Accept, FHIR JSON has to be listed and nothing else preferred over it.
+    """
+    fmt = request.query_params.get("_format")
+    if fmt is not None:
+        return fmt.replace(" ", "+").strip().lower() in FHIR_JSON_FORMATS
+    fhir_q = other_q = 0.0
+    for item in request.headers.get("accept", "").split(","):
+        media, *params = (p.strip().lower() for p in item.split(";"))
+        if not media:
+            continue
+        q = 1.0
+        for p in params:
+            if p.startswith("q="):
+                try:
+                    q = float(p[2:])
+                except ValueError:
+                    pass
+        if media != "json" and media in FHIR_JSON_FORMATS:
+            fhir_q = max(fhir_q, q)
+        else:
+            other_q = max(other_q, q)
+    return fhir_q > 0 and fhir_q >= other_q
+
+
 @app.get("/fhir/Binary/{rendering_id}",
     tags=["Interop"],
     summary="The screenshot itself",
     description=(
         "The image bytes, served as the type its own bytes proved. FHIR serves "
         "a Binary as its own content type when that is what the client asked "
-        "for, which is what lets an <img> point straight at it."
+        "for, which is what lets an <img> point straight at it. Ask for FHIR "
+        "JSON instead - `Accept: application/fhir+json`, or `_format=json` - "
+        "and it is a Binary resource with the image base64-encoded in `data`."
     ),
 )
-def rendering_image(rendering_id: int) -> Response:
+def rendering_image(rendering_id: int, request: Request) -> Response:
     with connect() as conn:
         row = fetch_rendering(conn, rendering_id)
     if row is None:
@@ -3505,6 +3542,14 @@ def rendering_image(rendering_id: int) -> Response:
     raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
     if raw is None:
         raise HTTPException(404, detail="Rendering image file missing")
+    # The same URL answers two ways, so a cache has to keep them apart.
+    if wants_fhir_json(request):
+        return fhir_response(
+            {"resourceType": "Binary", "id": str(row["id"]),
+             "contentType": row["mime"],
+             "data": base64.b64encode(raw).decode("ascii")},
+            Vary="Accept",
+        )
     return Response(
         content=raw,
         media_type=row["mime"],
@@ -3522,6 +3567,7 @@ def rendering_image(rendering_id: int) -> Response:
             # The bytes behind an id never change, only ever disappear: ids
             # are AUTOINCREMENT, so a withdrawn one is never handed out again.
             "Cache-Control": "public, max-age=31536000, immutable",
+            "Vary": "Accept",
         },
     )
 

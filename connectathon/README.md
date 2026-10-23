@@ -657,6 +657,8 @@ base64 -w0 shot.png | jq -Rs --arg slug COMPANY_SLUG '{
 curl 'localhost:8095/fhir/DocumentReference?related=12'
 curl 'localhost:8095/fhir/DocumentReference?custodian=COMPANY_SLUG&author=MY_SLUG'
 curl localhost:8095/fhir/Binary/3 -o shot.png
+# or as a FHIR Binary resource, the image base64-encoded in data
+curl -H 'Accept: application/fhir+json' localhost:8095/fhir/Binary/3
 # your own uploads only: correct the note, or withdraw the screenshot entirely
 curl -X PUT localhost:8095/fhir/DocumentReference/3 -H 'Authorization: Bearer TOKEN' \
      -H 'Content-Type: application/fhir+json' \

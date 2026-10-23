@@ -2739,6 +2739,39 @@ def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monk
     assert client.get("/fhir/Binary/99999").status_code == 404
 
 
+def test_a_binary_read_in_fhir_json_is_the_binary_resource(client, monkeypatch):
+    """A FHIR client reading Binary/N with its default Accept gets the resource,
+    with the bytes in data; an <img>, a browser or a bare curl still gets the
+    picture. Both answers live at one URL, so caches are told to keep them
+    apart."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    sid = add_shot(client, tok_c, "producer", image=JPEG).json()["id"]
+    url = "/fhir/Binary/%s" % sid
+    for query, accept in (("", "application/fhir+json"),
+                          ("", "application/json"),
+                          ("", "application/fhir+json, */*;q=0.1"),
+                          ("", "image/png;q=0.5, application/fhir+json"),
+                          ("?_format=json", None),
+                          # an unescaped + in a query string arrives as a space
+                          ("?_format=application/fhir+json", None),
+                          ("?_format=json", "image/*")):
+        res = client.get(url + query, headers={"Accept": accept} if accept else {})
+        assert res.headers["content-type"] == "application/fhir+json", (query, accept)
+        assert res.json() == {"resourceType": "Binary", "id": sid,
+                              "contentType": "image/jpeg",
+                              "data": base64.b64encode(JPEG).decode("ascii")}
+        assert "Accept" in res.headers["vary"]
+    for query, accept in (("", None), ("", "*/*"),
+                          ("", "image/avif,image/webp,image/*,*/*;q=0.8"),
+                          ("", "application/fhir+json;q=0"),
+                          ("", "image/png, application/fhir+json;q=0.5"),
+                          ("", "application/fhir+xml"),
+                          ("?_format=xml", "application/fhir+json")):
+        res = client.get(url + query, headers={"Accept": accept} if accept else {})
+        assert res.content == JPEG, (query, accept)
+        assert res.headers["vary"] == "Accept"
+
+
 def test_a_rendering_stays_pinned_to_the_document_it_was_taken_from(client, monkeypatch):
     """A team's exchange document moves the moment it beats its own score. A
     screenshot has to keep pointing at the bytes somebody actually opened."""
