@@ -330,6 +330,21 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# AUTOINCREMENT for the reason endpoints has it: without it SQLite hands the id
+# of a withdrawn top row to the next upload, and Binary/N is served as immutable,
+# so anyone who saw the withdrawn screenshot would keep seeing it under the new
+# one's note - and a link already shared would come to mean another picture.
+RENDERINGS_COLUMNS = """(
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
+                submission_id INTEGER NOT NULL REFERENCES submissions(id),
+                ts            TEXT NOT NULL,
+                note          TEXT NOT NULL DEFAULT '',
+                filename      TEXT NOT NULL,
+                mime          TEXT NOT NULL
+            )"""
+
+
 def init_db() -> None:
     os.makedirs(os.path.join(DATA_DIR, "submissions"), exist_ok=True)
     with connect() as conn:
@@ -343,15 +358,7 @@ def init_db() -> None:
                 first_pass  INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS renderings (
-                id            INTEGER PRIMARY KEY,
-                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
-                submission_id INTEGER NOT NULL REFERENCES submissions(id),
-                ts            TEXT NOT NULL,
-                note          TEXT NOT NULL DEFAULT '',
-                filename      TEXT NOT NULL,
-                mime          TEXT NOT NULL
-            );
+            CREATE TABLE IF NOT EXISTS renderings %s;
             CREATE TABLE IF NOT EXISTS submissions (
                 id        INTEGER PRIMARY KEY,
                 team_id   INTEGER NOT NULL REFERENCES teams(id),
@@ -381,7 +388,35 @@ def init_db() -> None:
                 description TEXT NOT NULL DEFAULT ''
             );
             """
+            % RENDERINGS_COLUMNS
         )
+        # SQLite cannot add AUTOINCREMENT to an existing table, so a database
+        # from before it has its renderings copied into a rebuilt one. Ids are
+        # kept, and the copy seeds the sequence from the highest of them.
+        # Foreign keys are off for the copy, as SQLite's own rebuild recipe
+        # says: a row pointing at a long-gone submission must not stop the
+        # service from starting.
+        renderings_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'renderings'"
+        ).fetchone()[0]
+        if "AUTOINCREMENT" not in renderings_sql:
+            conn.executescript(
+                """
+                PRAGMA foreign_keys = OFF;
+                BEGIN;
+                CREATE TABLE renderings_new %s;
+                INSERT INTO renderings_new
+                    (id, consumer_id, submission_id, ts, note, filename, mime)
+                    SELECT id, consumer_id, submission_id, ts, note, filename, mime
+                    FROM renderings;
+                DROP TABLE renderings;
+                ALTER TABLE renderings_new RENAME TO renderings;
+                COMMIT;
+                PRAGMA foreign_keys = ON;
+                """
+                % RENDERINGS_COLUMNS
+            )
         # Migrate pre-richness databases in place.
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(submissions)")}
         for col in ("sections", "resources"):
@@ -3187,6 +3222,13 @@ def exchange_list(
             best = best_valid_submission(conn, team["id"])
             if best is None:
                 continue
+            # Screenshots, and the systems they came from: one company can
+            # post several pictures of the same document.
+            shots, systems = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT consumer_id) FROM renderings "
+                "WHERE submission_id = ?",
+                (best["id"],),
+            ).fetchone()
             entries.append(
                 (
                     "entry",
@@ -3198,10 +3240,8 @@ def exchange_list(
                         "recorded": best["ts"],
                         "sections": best["sections"],
                         "resources": best["resources"],
-                        "renderings": conn.execute(
-                            "SELECT COUNT(*) FROM renderings WHERE submission_id = ?",
-                            (best["id"],),
-                        ).fetchone()[0],
+                        "renderings": shots,
+                        "renderingSystems": systems,
                     },
                 )
             )
@@ -3288,12 +3328,11 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
     opened - `subject` cannot be used for that, because R4 restricts it to a
     Patient or similar and the thing being rendered here is a document.
     """
-    return {
+    resource = {
         "resourceType": "DocumentReference",
         "id": str(row["id"]),
         "status": "current",
         "date": row["ts"],
-        "description": row["note"] or None,
         "author": [{
             "reference": "Organization/%s" % row["consumer_slug"],
             "display": row["consumer_name"],
@@ -3312,6 +3351,10 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
             "related": [{"reference": "Bundle/%d" % row["submission_id"]}]
         },
     }
+    # FHIR JSON has no null: a screenshot without a note has no description.
+    if row["note"]:
+        resource["description"] = row["note"]
+    return resource
 
 
 def fetch_rendering(conn: sqlite3.Connection, rendering_id: int) -> sqlite3.Row | None:
@@ -3351,7 +3394,25 @@ async def docref_body(
     request: Request, team: sqlite3.Row = Depends(current_team)
 ) -> dict:
     """The uploaded DocumentReference, read only once the uploader is known."""
-    raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
+    try:
+        raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
+    except HTTPException as exc:
+        if exc.status_code != 413:
+            raise
+        # The envelope's size and cap mean nothing to someone holding a 2.2 MB
+        # PNG, so say it as _attachment_bytes would: the image and its limit.
+        # Three bytes of image per four of base64 is close enough for "about";
+        # a chunked body, or one longer than it declared, is only known to be
+        # past the cap.
+        declared = request.headers.get("content-length", "")
+        size = ("about %d" % (int(declared) * 3 // 4)
+                if declared.isdigit() and int(declared) > MAX_DOCREF_BODY_BYTES
+                else "over %d" % MAX_IMAGE_BYTES)
+        raise HTTPException(
+            413,
+            detail="Screenshot too large (%s bytes); limit is %d bytes"
+            % (size, MAX_IMAGE_BYTES),
+        )
     try:
         payload = json.loads(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
@@ -3484,25 +3545,37 @@ def add_rendering(
     description=(
         "Newest first, as a searchset. Filter by `related` (a Bundle id), by "
         "`custodian` (the company whose document it is) or by `author` (the "
-        "company that took the screenshot). Unfiltered it is every screenshot "
-        "the event has collected."
+        "company that took the screenshot). Each takes the bare id or "
+        "Type/id, and a comma-separated list matches any of them. Unfiltered "
+        "it is every screenshot the event has collected."
     ),
 )
 def list_renderings(
-    related: int | None = None,
+    related: str | None = None,
     custodian: str | None = None,
     author: str | None = None,
 ) -> Response:
     where, params = [], []
-    if related is not None:
-        where.append("r.submission_id = ?")
-        params.append(related)
+
+    def match(column: str, values: list) -> None:
+        # No value that could be an id here means nothing can match it.
+        if not values:
+            where.append("0")
+            return
+        where.append("%s IN (%s)" % (column, ", ".join("?" * len(values))))
+        params.extend(values)
+
+    # A reference search parameter takes the bare id or Type/id, as on
+    # Endpoint's organization, and a comma between values means either.
+    if related:
+        ids = (int(v) for v in (v.removeprefix("Bundle/") for v in related.split(","))
+               if v.isascii() and v.isdigit())
+        # SQLite integers stop at 2**63 - 1, and binding a bigger one raises.
+        match("r.submission_id", [i for i in ids if i < 2 ** 63])
     if custodian:
-        where.append("p.slug = ?")
-        params.append(custodian)
+        match("p.slug", [v.removeprefix("Organization/") for v in custodian.split(",")])
     if author:
-        where.append("c.slug = ?")
-        params.append(author)
+        match("c.slug", [v.removeprefix("Organization/") for v in author.split(",")])
     sql = RENDERING_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -3524,16 +3597,53 @@ def read_rendering(rendering_id: int) -> Response:
     return fhir_response(documentreference_resource(row))
 
 
+# The JSON spellings FHIR accepts in Accept and _format. XML is not served here,
+# so asking for it gets the image, as any other non-FHIR request does.
+FHIR_JSON_FORMATS = {"json", "application/json", "application/fhir+json",
+                     "application/json+fhir"}
+
+
+def wants_fhir_json(request: Request) -> bool:
+    """Whether this read asked for the resource rather than the content.
+
+    _format wins over Accept, as FHIR says. A query string turns an unescaped
+    + into a space, so _format=application/fhir+json has to be put back. In
+    Accept, FHIR JSON has to be listed and nothing else preferred over it.
+    """
+    fmt = request.query_params.get("_format")
+    if fmt is not None:
+        return fmt.replace(" ", "+").strip().lower() in FHIR_JSON_FORMATS
+    fhir_q = other_q = 0.0
+    for item in request.headers.get("accept", "").split(","):
+        media, *params = (p.strip().lower() for p in item.split(";"))
+        if not media:
+            continue
+        q = 1.0
+        for p in params:
+            if p.startswith("q="):
+                try:
+                    q = float(p[2:])
+                except ValueError:
+                    pass
+        if media != "json" and media in FHIR_JSON_FORMATS:
+            fhir_q = max(fhir_q, q)
+        else:
+            other_q = max(other_q, q)
+    return fhir_q > 0 and fhir_q >= other_q
+
+
 @app.get("/fhir/Binary/{rendering_id}",
     tags=["Interop"],
     summary="The screenshot itself",
     description=(
         "The image bytes, served as the type its own bytes proved. FHIR serves "
         "a Binary as its own content type when that is what the client asked "
-        "for, which is what lets an <img> point straight at it."
+        "for, which is what lets an <img> point straight at it. Ask for FHIR "
+        "JSON instead - `Accept: application/fhir+json`, or `_format=json` - "
+        "and it is a Binary resource with the image base64-encoded in `data`."
     ),
 )
-def rendering_image(rendering_id: int) -> Response:
+def rendering_image(rendering_id: int, request: Request) -> Response:
     with connect() as conn:
         row = fetch_rendering(conn, rendering_id)
     if row is None:
@@ -3541,6 +3651,14 @@ def rendering_image(rendering_id: int) -> Response:
     raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
     if raw is None:
         raise HTTPException(404, detail="Rendering image file missing")
+    # The same URL answers two ways, so a cache has to keep them apart.
+    if wants_fhir_json(request):
+        return fhir_response(
+            {"resourceType": "Binary", "id": str(row["id"]),
+             "contentType": row["mime"],
+             "data": base64.b64encode(raw).decode("ascii")},
+            Vary="Accept",
+        )
     return Response(
         content=raw,
         media_type=row["mime"],
@@ -3555,8 +3673,10 @@ def rendering_image(rendering_id: int) -> Response:
             # Already compressed. GZipMiddleware goes by size alone, so saying
             # the encoding out loud is what stops it spending CPU for nothing.
             "Content-Encoding": "identity",
-            # The bytes behind an id never change, only ever disappear.
+            # The bytes behind an id never change, only ever disappear: ids
+            # are AUTOINCREMENT, so a withdrawn one is never handed out again.
             "Cache-Control": "public, max-age=31536000, immutable",
+            "Vary": "Accept",
         },
     )
 
@@ -4945,6 +5065,9 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 /* the gallery: one document, every system that rendered it, side by side */
 .shots { display: grid; gap: 14px; margin-top: 14px;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+/* As with .menu-wrap: display: grid outranks the UA [hidden] rule, and the
+   count button could open the gallery but never fold it away again. */
+.shots[hidden] { display: none; }
 .shot { border: 1px solid var(--border); border-radius: var(--r-card);
   overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
 .shot img { display: block; width: 100%; height: 168px; object-fit: cover;
@@ -4954,6 +5077,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 .shot-note { font-size: 0.84rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .shot-note.empty { color: var(--muted); font-style: italic; }
 .shot-own { display: flex; gap: 6px; margin-top: 2px; }
+/* Hidden while the note is edited, so Withdraw is not beside Save note. */
+.shot-own[hidden] { display: none; }
 .shot-edit textarea { width: 100%; min-height: 62px; font-family: inherit;
   font-size: 0.84rem; }
 .shot-err { font-size: 0.82rem; color: var(--fail); }
@@ -5374,7 +5499,7 @@ function submissionRow(e) {
 function partnerRow(e) {
   return { team: e.organization, team_slug: e.organizationSlug,
            exchange_id: e.id, ts: e.recorded, sections: e.sections,
-           resources: e.resources, renderings: e.renderings };
+           resources: e.resources, rendering_systems: e.renderingSystems };
 }
 /* FHIR has no null, so a company that has never submitted has no bestErrors
    part at all rather than one set to null. Absent becomes null here, once, so
@@ -7261,15 +7386,17 @@ function interopCurls() {
     "curl -s " + origin + "/fhir/Organization/PARTNER_SLUG/\\$document"
       + " -o partner-eps.json\n\n" +
     "# publish a screenshot of how it came out in your system - the image goes\n" +
-    "# in the attachment, base64-encoded:\n" +
-    "curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
+    "# in the attachment, base64-encoded. It is piped in, because a real\n" +
+    "# screenshot is too big to pass on the command line:\n" +
+    "{ printf '%s' '{\"resourceType\": \"DocumentReference\", \"status\": \"current\",\n" +
+    '    "description": "Allergies came through empty",\n' +
+    '    "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
+    '    "content": [{"attachment": {"contentType": "image/png", "data": "\'\n' +
+    "  base64 -w0 shot.png\n" +
+    "  printf '%s' '\"}}]}'\n" +
+    "} | curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
     "     -H 'Authorization: Bearer TOKEN' \\\n" +
-    "     -H 'Content-Type: application/fhir+json' -d '{\n" +
-    '       "resourceType": "DocumentReference", "status": "current",\n' +
-    '       "description": "Allergies came through empty",\n' +
-    '       "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
-    '       "content": [{"attachment": {"contentType": "image/png",\n' +
-    '                                   "data": "\'\"$(base64 -w0 shot.png)\"\'"}}]}\'\n' +
+    "     -H 'Content-Type: application/fhir+json' --data-binary @-\n" +
     "# every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
     "# or have documents sent to you: advertise where your system takes them\n" +
@@ -7304,7 +7431,7 @@ async function refreshShotCount(slug) {
       .find((x) => x.team_slug === slug);
     const btn = document.querySelector('.io-partner[data-slug="' + slug
       + '"] [data-shots]');
-    if (p && btn) btn.textContent = shotCountLabel(p.renderings);
+    if (p && btn) btn.textContent = shotCountLabel(p.rendering_systems);
   } catch (e) { /* the count is decoration; the gallery below it is the truth */ }
 }
 
@@ -7319,7 +7446,7 @@ function partnerCard(p) {
     + '" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
     + '<button class="ghost" data-shots="' + p.exchange_id + '">'
-    + shotCountLabel(p.renderings) + "</button>"
+    + shotCountLabel(p.rendering_systems) + "</button>"
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */

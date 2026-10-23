@@ -2701,6 +2701,30 @@ def test_an_oversized_screenshot_is_refused_before_it_is_resident(client, monkey
     assert "limit is 1024 bytes" in diagnostics(res)
 
 
+def test_a_screenshot_past_the_envelope_is_refused_in_image_terms(client, monkeypatch):
+    """Most oversized screenshots trip the cap on the base64 body before the
+    image is ever decoded. The 413 still has to name the image limit people
+    were told about, not the envelope's own size and cap."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    monkeypatch.setattr(app_module, "MAX_IMAGE_BYTES", 1024)
+    monkeypatch.setattr(app_module, "MAX_DOCREF_BODY_BYTES", 1024 * 4 // 3 + 8192)
+    image = png_bytes() + b"\x00" * 20_000
+    body = json.dumps(docref("producer", image)).encode()
+    headers = {"X-Team-Token": tok_c, "Content-Type": "application/fhir+json"}
+    res = client.post("/fhir/DocumentReference", content=body, headers=headers)
+    assert res.status_code == 413
+    found = re.fullmatch(r"Screenshot too large \(about (\d+) bytes\); "
+                         r"limit is 1024 bytes", diagnostics(res))
+    assert found, diagnostics(res)
+    assert abs(int(found.group(1)) - len(image)) < 200
+    # sent chunked, the size is never declared - only that it is past the cap
+    res = client.post("/fhir/DocumentReference", headers=headers,
+                      content=(body[i:i + 4096] for i in range(0, len(body), 4096)))
+    assert res.status_code == 413
+    assert diagnostics(res) == \
+        "Screenshot too large (over 1024 bytes); limit is 1024 bytes"
+
+
 def test_a_runaway_note_is_truncated_not_refused(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     res = add_shot(client, tok_c, "producer", note="x" * (app_module.MAX_NOTE_CHARS + 500))
@@ -2728,11 +2752,62 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
     assert shots(client.get("/fhir/DocumentReference?related=99999")) == []
 
 
+def test_renderings_search_takes_references_as_the_resources_carry_them(
+        client, monkeypatch):
+    """custodian, author and related are reference parameters: the value
+    copied out of a resource (Organization/x, Bundle/1) has to find it, and a
+    comma between values means either - as Endpoint?organization already does."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    submit(client, tok_d, outcome(), monkeypatch)
+    add_shot(client, tok_c, "producer", note="consumer on producer")
+    add_shot(client, tok_c, "third", note="consumer on third")
+    add_shot(client, tok_d, "producer", note="third on producer")
+    entries = param_entries(client.get("/fhir/$exchange"))
+    doc = {e["organizationSlug"]: e["id"] for e in entries}
+
+    def notes(query):
+        res = client.get("/fhir/DocumentReference?" + query)
+        assert res.status_code == 200, res.text
+        return sorted(d["description"] for d in shots(res))
+
+    on_producer = ["consumer on producer", "third on producer"]
+    assert notes("custodian=Organization/producer") == on_producer
+    assert notes("author=Organization/third") == ["third on producer"]
+    assert notes("related=Bundle/%d" % doc["producer"]) == on_producer
+    everything = sorted(on_producer + ["consumer on third"])
+    assert notes("custodian=producer,Organization/third") == everything
+    assert notes("author=consumer,third") == everything
+    assert notes("related=%d,Bundle/%d" % (doc["producer"], doc["third"])) \
+        == everything
+    # the filters still narrow one another
+    assert notes("custodian=Organization/producer&author=Organization/consumer") \
+        == ["consumer on producer"]
+    # an id that cannot be a Bundle matches nothing rather than being refused
+    assert notes("related=Bundle/abc") == []
+    assert notes("related=abc,Bundle/%d" % doc["third"]) == ["consumer on third"]
+    # and one past what SQLite can store is not an error either
+    assert notes("related=Bundle/%d" % 2 ** 63) == []
+
+
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
-    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 0
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (0, 0)
     add_shot(client, tok_c, "producer")
-    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 1
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (1, 1)
+    # a second picture from the same company is another screenshot, not
+    # another system that has shown the document
+    add_shot(client, tok_c, "producer")
+    add_shot(client, register(client, "Third"), "producer")
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (3, 2)
+    # and "Seen in N other systems" is that count, on the card and on refresh
+    text = client.get("/").text
+    assert "rendering_systems: e.renderingSystems" in text
+    assert text.count("shotCountLabel(p.rendering_systems)") == 2
+    assert "shotCountLabel(p.renderings)" not in text
 
 
 def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monkeypatch):
@@ -2747,6 +2822,39 @@ def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monk
     # already compressed: gzipping it again would be CPU for nothing
     assert res.headers["content-encoding"] == "identity"
     assert client.get("/fhir/Binary/99999").status_code == 404
+
+
+def test_a_binary_read_in_fhir_json_is_the_binary_resource(client, monkeypatch):
+    """A FHIR client reading Binary/N with its default Accept gets the resource,
+    with the bytes in data; an <img>, a browser or a bare curl still gets the
+    picture. Both answers live at one URL, so caches are told to keep them
+    apart."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    sid = add_shot(client, tok_c, "producer", image=JPEG).json()["id"]
+    url = "/fhir/Binary/%s" % sid
+    for query, accept in (("", "application/fhir+json"),
+                          ("", "application/json"),
+                          ("", "application/fhir+json, */*;q=0.1"),
+                          ("", "image/png;q=0.5, application/fhir+json"),
+                          ("?_format=json", None),
+                          # an unescaped + in a query string arrives as a space
+                          ("?_format=application/fhir+json", None),
+                          ("?_format=json", "image/*")):
+        res = client.get(url + query, headers={"Accept": accept} if accept else {})
+        assert res.headers["content-type"] == "application/fhir+json", (query, accept)
+        assert res.json() == {"resourceType": "Binary", "id": sid,
+                              "contentType": "image/jpeg",
+                              "data": base64.b64encode(JPEG).decode("ascii")}
+        assert "Accept" in res.headers["vary"]
+    for query, accept in (("", None), ("", "*/*"),
+                          ("", "image/avif,image/webp,image/*,*/*;q=0.8"),
+                          ("", "application/fhir+json;q=0"),
+                          ("", "image/png, application/fhir+json;q=0.5"),
+                          ("", "application/fhir+xml"),
+                          ("?_format=xml", "application/fhir+json")):
+        res = client.get(url + query, headers={"Accept": accept} if accept else {})
+        assert res.content == JPEG, (query, accept)
+        assert res.headers["vary"] == "Accept"
 
 
 def test_a_rendering_stays_pinned_to_the_document_it_was_taken_from(client, monkeypatch):
@@ -2793,6 +2901,29 @@ def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
         == "clearer take"
 
 
+def test_a_screenshot_without_a_note_has_no_description(client, monkeypatch):
+    """FHIR JSON has no null, so an absent note is an absent element - in the
+    upload's answer, the read, the search, and after a note is blanked."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = add_shot(client, tok_c, "producer")
+    sid = res.json()["id"]
+    put = client.put("/fhir/DocumentReference/%s" % sid,
+                     json={"resourceType": "DocumentReference", "description": "  "},
+                     headers={"X-Team-Token": tok_c})
+    for answer in (res, client.get("/fhir/DocumentReference/%s" % sid),
+                   client.get("/fhir/DocumentReference"), put):
+        assert answer.status_code in (200, 201)
+        assert "null" not in answer.text, answer.text
+    assert "description" not in put.json()
+    # and a body read back from the server can be written back to it
+    read = client.get("/fhir/DocumentReference/%s" % sid).json()
+    read["description"] = "Allergies came through empty"
+    again = client.put("/fhir/DocumentReference/%s" % sid, json=read,
+                       headers={"X-Team-Token": tok_c})
+    assert again.status_code == 200
+    assert again.json()["description"] == "Allergies came through empty"
+
+
 def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     tok_d = register(client, "Third")
@@ -2815,6 +2946,63 @@ def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
                          headers={"X-Team-Token": tok_c}).status_code == 404
 
 
+def test_a_withdrawn_screenshot_id_is_never_handed_out_again(client, monkeypatch):
+    """Binary/N is cached as immutable. If the next upload took over a withdrawn
+    top id, a browser that had seen the withdrawn picture would keep showing it
+    under the new one's note."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    first = add_shot(client, tok_c, "producer", note="wrong one").json()["id"]
+    assert client.delete("/fhir/DocumentReference/%s" % first,
+                         headers={"X-Team-Token": tok_c}).status_code == 204
+    second = add_shot(client, tok_c, "producer", note="right one").json()["id"]
+    assert int(second) > int(first)
+    assert client.get("/fhir/Binary/%s" % first).status_code == 404
+
+
+def test_an_old_database_stops_reusing_rendering_ids(tmp_path, monkeypatch):
+    """CREATE TABLE IF NOT EXISTS leaves an existing renderings table alone, so
+    one from before AUTOINCREMENT has to be rebuilt in place, keeping its rows."""
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    with sqlite3.connect(os.path.join(str(tmp_path), "connectathon.db")) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT, slug TEXT,
+                token TEXT, first_pass INTEGER DEFAULT 0, created_at TEXT);
+            CREATE TABLE submissions (id INTEGER PRIMARY KEY, team_id INTEGER,
+                ts TEXT, pass INTEGER, errors INTEGER, warnings INTEGER,
+                infos INTEGER, score INTEGER, sections INTEGER, resources INTEGER,
+                doc_type TEXT, filename TEXT);
+            CREATE TABLE renderings (id INTEGER PRIMARY KEY, consumer_id INTEGER
+                NOT NULL REFERENCES teams(id), submission_id INTEGER NOT NULL
+                REFERENCES submissions(id), ts TEXT NOT NULL, note TEXT NOT NULL
+                DEFAULT '', filename TEXT NOT NULL, mime TEXT NOT NULL);
+            INSERT INTO teams VALUES (1, 'Old', 'old', 'tok', 0, '2026-01-01');
+            INSERT INTO submissions VALUES
+                (1, 1, '2026-01-01', 1, 0, 0, 0, 60, 1, 5, 'eps', 'a.json');
+            INSERT INTO renderings VALUES
+                (3, 1, 1, '2026-01-01', 'kept', 'a.png', 'image/png');
+            -- one whose submission has gone must not stop the service starting
+            INSERT INTO renderings VALUES
+                (5, 1, 9, '2026-01-02', 'orphan', 'b.png', 'image/png');
+            """
+        )
+    app_module.init_db()
+    app_module.init_db()      # and a second start leaves the rebuilt table alone
+    with app_module.connect() as conn:
+        assert "AUTOINCREMENT" in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'renderings'").fetchone()[0]
+        assert [tuple(r) for r in conn.execute(
+            "SELECT * FROM renderings ORDER BY id")] == [
+            (3, 1, 1, "2026-01-01", "kept", "a.png", "image/png"),
+            (5, 1, 9, "2026-01-02", "orphan", "b.png", "image/png"),
+        ]
+        conn.execute("DELETE FROM renderings WHERE id = 5")
+        cur = conn.execute(
+            "INSERT INTO renderings (consumer_id, submission_id, ts, filename, "
+            "mime) VALUES (1, 1, '2026-01-03', 'c.png', 'image/png')")
+        assert cur.lastrowid == 6
+
+
 def test_renderings_are_readable_without_a_token(client, monkeypatch):
     """The wall is for everyone in the room to read, participant or not."""
     tok_p, tok_c = interop_setup(client, monkeypatch)
@@ -2823,6 +3011,100 @@ def test_renderings_are_readable_without_a_token(client, monkeypatch):
         assert client.get("/fhir/DocumentReference", headers=headers).status_code == 200
         assert client.get("/fhir/Binary/%s" % sid,
                           headers=headers).status_code == 200
+
+
+def test_everything_the_page_hides_can_actually_be_hidden(client):
+    """An author `display:` rule outranks the UA sheet's [hidden] rule, so
+    el.hidden = true does nothing to an element whose class sets one - the
+    screenshot gallery could not be folded away, and Withdraw stayed beside
+    Save note. Every class the page hides that way needs its own [hidden]."""
+    text = client.get("/").text
+    css = text[text.index("<style>"):text.index("</style>")]
+    hidden = set()
+    for m in re.finditer(r'class=\\?"([\w\- ]+)\\?"[^>]*?\bhidden\b', text):
+        hidden.update(m.group(1).split())
+    for m in re.finditer(r'querySelector\("\.([\w-]+)"\)\.hidden\s*=', text):
+        hidden.add(m.group(1))
+    assert {"shots", "shot-own", "menu-wrap"} <= hidden   # the scan finds them
+    displayed = set()
+    for selectors, body in re.findall(r"(?m)^([^{}@/]+)\{([^}]*)\}", css):
+        if re.search(r"display:\s*(?!none)", body):
+            displayed.update(s.strip()[1:] for s in selectors.split(",")
+                             if re.fullmatch(r"\.[\w-]+", s.strip()))
+    for cls in sorted(hidden & displayed):
+        assert re.search(r"\.%s\[hidden\]\s*\{\s*display:\s*none" % re.escape(cls),
+                         css), cls
+
+
+CURLS_HARNESS = r"""
+const out = {};
+const $ = () => out;
+const origin = "http://localhost:8095";
+interopCurls();
+console.log(out.textContent);
+"""
+
+
+@pytest.mark.skipif(any(shutil.which(t) is None
+                        for t in ("node", "bash", "jq", "base64")),
+                    reason="needs node, bash, jq and coreutils base64")
+def test_the_documented_screenshot_uploads_take_a_real_screenshot(
+        client, monkeypatch, tmp_path):
+    """Linux caps a single command-line argument at 128KiB. A command that
+    pastes the base64 image into one fails with "Argument list too long" for
+    anything bigger than a thumbnail, so both the tab's example and the
+    README's are run here, as written, on an image over that cap."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    js = page_script(client)
+    parts = [js[js.index("const ENDPOINT_DESCRIPTION_EXT"):
+                js.index("function interopCurls(")]]
+    start = js.index("function interopCurls(")
+    parts.append(js[start:js.index("\n}", start) + 2])
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + CURLS_HARNESS],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+
+    def block(text, first, after):
+        """The lines from the comment `first` up to the comment `after`."""
+        start = text.index(first)
+        return text[start:text.index(after, start)]
+
+    tab = block(proc.stdout, "# publish a screenshot",
+                "# every screenshot of one document")
+    readme_path = os.path.join(os.path.dirname(app_module.__file__), "README.md")
+    with open(readme_path, encoding="utf-8") as fh:
+        readme = block(fh.read(), "# publish a screenshot of a partner's document",
+                       "# every screenshot, or just")
+
+    image = png_bytes() + b"\x00" * 200_000
+    (tmp_path / "shot.png").write_bytes(image)
+    # A real executable rather than a shell function: the limit is enforced
+    # when the shell execs a program, which a function would never reach. It
+    # keeps its arguments too: a body on stdin is only sent if curl is told so.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$BODY_OUT.args"\ncat > "$BODY_OUT"\n')
+    (bindir / "curl").chmod(0o755)
+    for name, snippet in (("tab", tab), ("README", readme)):
+        script = "set -eo pipefail\n" + snippet.replace("TOKEN", tok_c) \
+            .replace("PARTNER_SLUG", "producer").replace("COMPANY_SLUG", "producer")
+        body_out = tmp_path / ("%s.json" % name)
+        run = subprocess.run(
+            ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+            timeout=60, env=dict(os.environ, BODY_OUT=str(body_out),
+                                 PATH="%s:%s" % (bindir, os.environ["PATH"])))
+        assert run.returncode == 0, (name, run.stderr)
+        args = (tmp_path / ("%s.json.args" % name)).read_text().split("\n")
+        assert "--data-binary" in args and "@-" in args, (name, args)
+        res = client.post("/fhir/DocumentReference",
+                          content=body_out.read_bytes(),
+                          headers={"X-Team-Token": tok_c,
+                                   "Content-Type": "application/fhir+json"})
+        assert res.status_code == 201, (name, res.text)
+        assert res.json()["description"] == "Allergies came through empty"
+        assert client.get(res.json()["content"][0]["attachment"]["url"]).content \
+            == image
 
 
 # ------------------------------------------------------------ endpoints

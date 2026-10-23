@@ -653,12 +653,13 @@ the room - can read without installing your product. It is a `DocumentReference`
 rides in `content[0].attachment.data` as base64.
 
 ```
-# publish a screenshot of a partner's document
-jq -n --arg slug COMPANY_SLUG --arg img "$(base64 -w0 shot.png)" '{
+# publish a screenshot of a partner's document - the image is piped into jq,
+# because a real screenshot is too big to pass as a command-line argument
+base64 -w0 shot.png | jq -Rs --arg slug COMPANY_SLUG '{
   resourceType: "DocumentReference", status: "current",
   custodian: {reference: ("Organization/" + $slug)},
   description: "Allergies came through empty",
-  content: [{attachment: {contentType: "image/png", data: $img}}]
+  content: [{attachment: {contentType: "image/png", data: .}}]
 }' | curl -X POST localhost:8095/fhir/DocumentReference \
        -H 'Authorization: Bearer TOKEN' \
        -H 'Content-Type: application/fhir+json' --data-binary @-
@@ -666,6 +667,8 @@ jq -n --arg slug COMPANY_SLUG --arg img "$(base64 -w0 shot.png)" '{
 curl 'localhost:8095/fhir/DocumentReference?related=12'
 curl 'localhost:8095/fhir/DocumentReference?custodian=COMPANY_SLUG&author=MY_SLUG'
 curl localhost:8095/fhir/Binary/3 -o shot.png
+# or as a FHIR Binary resource, the image base64-encoded in data
+curl -H 'Accept: application/fhir+json' localhost:8095/fhir/Binary/3
 # your own uploads only: correct the note, or withdraw the screenshot entirely
 curl -X PUT localhost:8095/fhir/DocumentReference/3 -H 'Authorization: Bearer TOKEN' \
      -H 'Content-Type: application/fhir+json' \
