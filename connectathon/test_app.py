@@ -1055,6 +1055,21 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     assert "html += cvModesHtml();" in text
 
 
+def test_view_switcher_wraps_rather_than_clips_on_a_phone(client):
+    """The three labels are wider than a phone's card, and the switcher clips
+    what overflows, so on a narrow screen they have to wrap - otherwise the
+    last view cannot be seen, tapped, or told apart as the active one."""
+    text = client.get("/").text
+    base = re.search(r"\n\.cv-modes \{[^}]*\}", text).group(0)
+    assert "overflow: hidden" in base  # the rounded corners rely on it
+    phone = re.search(r"@media \(max-width: 640px\) \{\n  \.cv-modes \{[^}]*\}\n"
+                      r"  \.cv-mode \{[^}]*\}\n\}", text)
+    assert phone, "the switcher's phone layout moved; keep this test pointed at it"
+    assert "flex-wrap: wrap" in phone.group(0)
+    # labels stay whole, so it is the row that wraps rather than the words
+    assert "white-space: nowrap" in re.search(r"\n\.cv-mode \{[^}]*\}", text).group(0)
+
+
 def test_index_navigates_through_the_hash(client):
     text = client.get("/").text
     # tabs are real links, so Back and Forward move between them and a view

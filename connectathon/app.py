@@ -4731,10 +4731,14 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .cv-mode:hover { color: var(--accent); background: transparent; }
 .cv-mode.active { background: var(--btn); color: var(--btn-on); }
 /* Floating it here would leave the title a useless sliver, so it goes back to
-   being a full-width row above the document. */
+   being a full-width row above the document. A phone is narrower than the
+   three labels, so they wrap onto further rows instead of being clipped; the
+   separator is a shadow up and to the left, which the box clips at its edges
+   and so only shows between buttons, across rows as well as along them. */
 @media (max-width: 640px) {
-  .cv-modes { float: none; position: static; margin: 0 0 12px; }
-  .cv-mode { flex: 1; text-align: center; }
+  .cv-modes { float: none; position: static; margin: 0 0 12px; flex-wrap: wrap; }
+  .cv-mode { flex: 1 1 auto; text-align: center; border-left: none;
+    box-shadow: -1px -1px 0 var(--field-border); }
 }
 /* the float is the last thing in the card, so the card has to be told to
    contain it or it collapses behind the buttons */
