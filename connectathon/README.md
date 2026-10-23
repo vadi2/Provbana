@@ -728,12 +728,14 @@ curl 'localhost:8095/fhir/$leaderboard'
 
 One `entry` per registered company, best score first, carrying `rank`, `organization`,
 `organizationSlug`, `score`, `passed`, `attempts`, `firstPass` and - for companies that
-have submitted - `bestErrors`, `bestSections`, `bestResources` and `lastSubmission`.
+have submitted - `bestErrors` and `lastSubmission`. A company that has never submitted
+has a `score` of 0 and sorts below every company that has.
 `secondaryCategories` repeats once per non-summary [document
 type](#document-types) the company has passed, in registry order, and is absent
 for a company that has passed none. `bestPatientSummary` is the score the
-standing rests on, absent for a company that has not submitted a summary at all -
-`bestSections` and `bestResources` describe that same submission.
+standing rests on, and `bestSections` and `bestResources` describe that same
+submission; all three are absent for a company that has not submitted a summary at
+all, even one that has submitted other document types.
 
 The whole API is also described at `/openapi.json`, browsable at `/docs`.
 

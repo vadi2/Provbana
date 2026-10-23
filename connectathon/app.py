@@ -2861,8 +2861,8 @@ def _leaderboard_rows() -> list[dict]:
     description=(
         "One `entry` parameter per registered company, best score first. "
         "Companies that have registered but never submitted appear at the "
-        "bottom with no score. This is an operation rather than a search "
-        "because a ranking is computed on the way out - it is not a resource "
+        "bottom with a score of 0 and no submission details. This is an "
+        "operation rather than a search because a ranking is computed on the way out - it is not a resource "
         "the server stores, and pretending otherwise would mean inventing one."
     ),
 )

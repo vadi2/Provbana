@@ -524,6 +524,10 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
     # FHIR has no null, so the empty columns are absent rather than sent as one
     for absent in ("bestErrors", "bestSections", "bestResources", "lastSubmission"):
         assert absent not in idle, absent
+    # ...and the description says so, rather than promising "no score".
+    described = client.get("/openapi.json").json()["paths"]["/fhir/$leaderboard"]["get"]
+    assert "with a score of 0 and no submission details" in described["description"]
+    assert "no score" not in described["description"]
 
 
 def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkeypatch):
