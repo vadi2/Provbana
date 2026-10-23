@@ -5659,6 +5659,32 @@ def test_naming_a_versioned_profile_settles_the_category_too(client, monkeypatch
     assert res.status_code == 400
 
 
+def test_a_profile_pinned_to_a_version_the_validator_lacks_is_refused(
+        client, monkeypatch):
+    """Checking against the loaded version while the team named another would
+    pass or fail them on a guide they did not ask for, with nothing saying so."""
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, outcome())
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]
+    mpd = app_module.DOCUMENTS_BY_ID["mpd"]
+
+    def send(profile):
+        return client.post("/fhir/Bundle/$validate", params={"profile": profile},
+                           content=BUNDLE, headers={"X-Team-Token": token})
+
+    for pin in ("|1.0.0", "|9.9.9", "|garbage", "|2", "|"):
+        res = send(lab["profile"] + pin)
+        assert res.status_code == (200 if pin == "|" else 400), (pin, res.text)
+    assert "2.0.0" in diagnostics(send(lab["profile"] + "|9.9.9"))
+    # The loaded version, or its major.minor, still settles the category.
+    for pin in ("|2.0.0", "|2.0"):
+        res = send(lab["profile"] + pin)
+        assert res.headers["X-Document-Type"] == "laboratory", (pin, res.text)
+    # MPD's profile is base R4's Bundle, so its version is R4's.
+    assert send(mpd["profile"] + "|4.0.1").headers["X-Document-Type"] == "mpd"
+    assert send(mpd["profile"] + "|1.0.0").status_code == 400
+
+
 def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):
     """Honouring an arbitrary profile would let a team pick one their bundle
     already satisfies and score full marks on it."""

@@ -1995,6 +1995,25 @@ def detect_document(bundle) -> dict:
     return PRIMARY_DOCUMENT
 
 
+def version_is_loaded(version: str, loaded) -> bool:
+    """Whether a canonical's `|version` pin names a version the validator has.
+
+    Unversioned, one of `loaded`, or its major.minor - Matchbox resolves `|1.0`
+    to the 1.0.0 it has, but reports a bare major, `|1`, as "could not be
+    found"."""
+    return not version or any(
+        v == version or (version.count(".") == 1 and v.startswith(version + "."))
+        for v in loaded)
+
+
+def profile_versions(doc: dict) -> set:
+    """The versions of doc["profile"] the validator has: base R4's for a core
+    canonical (MPD's plain Bundle), otherwise its guide's, the first package."""
+    if doc["profile"].startswith("http://hl7.org/fhir/StructureDefinition/"):
+        return {"4.0.1"}
+    return {doc["igs"][0].partition("#")[2]} if doc["igs"] else set()
+
+
 def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict:
     """Fail an MPD submission whose orders were never checked against MPD.
 
@@ -2034,10 +2053,7 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
             if not isinstance(c, str):
                 continue
             url, _, version = c.partition("|")
-            if url in claims and (not version or any(
-                    v == version or (version.count(".") == 1
-                                     and v.startswith(version + "."))
-                    for v in loaded)):
+            if url in claims and version_is_loaded(version, loaded):
                 return True
         return False
 
@@ -3051,19 +3067,28 @@ def validate_bundle(
     # on it, so the accepted values are exactly the ones this event scores
     # against - one per EHDS category. Naming one settles the category outright,
     # which is the escape hatch for a document detect_document() reads wrongly.
-    # A version suffix is dropped, as _meta_profiles() drops it from a claim:
-    # a team that pins the version still means the same profile.
+    # A version suffix the validator has is accepted and settles the same
+    # profile. One it does not have is refused: the bundle would be checked
+    # against another version than the one named, with nothing to say so.
     requested = None
     if profile is not None:
+        url, _, version = profile.partition("|")
         requested = next(
-            (d for d in EHDS_DOCUMENTS if d["profile"] == profile.split("|", 1)[0]),
-            None,
+            (d for d in EHDS_DOCUMENTS if d["profile"] == url), None,
         )
         if requested is None:
             raise HTTPException(
                 400,
                 detail="This server validates against %s only"
                 % ", ".join(d["profile"] for d in EHDS_DOCUMENTS),
+            )
+        have = profile_versions(requested)
+        if not version_is_loaded(version, have):
+            raise HTTPException(
+                400,
+                detail="This server has %s at version %s only; name it "
+                "unversioned or at that version"
+                % (url, " or ".join(sorted(have)) or "(unknown)"),
             )
     try:
         bundle = loads_json(body)
