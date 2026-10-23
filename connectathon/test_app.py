@@ -4197,6 +4197,11 @@ def mpd_collection(*resources):
      mpd_collection({"resourceType": "MedicationRequest",
                      "meta": {"profile": [MPD_REQUEST]}},
                     {"resourceType": "MedicationDispense"})),
+    # Claimed at a version the validator does not have: Matchbox only warns
+    # that the profile "has not been checked", so this is no claim either.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|9.9.9"]}})),
     # Only a Medication claims MPD: there is no prescription or dispense at all.
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "Medication", "meta": {"profile": [

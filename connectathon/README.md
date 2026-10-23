@@ -434,15 +434,15 @@ patient summary - the event's own track - so failing to announce a document can 
 demote a summary out of the scoring.
 
 Claim the profile in `meta.profile`, or pass `?profile=` on the submit call, to settle
-it outright.
+it outright. `curl 'localhost:8095/fhir/$documents'` lists the lot, including whether
+Matchbox has each one's packages loaded.
 
 A prescription is checked against base `Bundle`, and the validator applies an MPD
 profile only to an entry that claims one. So an MPD submission passes only when it
 carries at least one `MedicationRequest` or `MedicationDispense` and every one of them
-claims its MPD profile in `meta.profile`; an order that claims nothing would meet base
-R4 alone, and is failed with an error saying which profile to add rather than paid for
-conformance nobody checked. `curl 'localhost:8095/fhir/$documents'` lists the lot, including whether
-Matchbox has each one's packages loaded.
+claims its MPD profile in `meta.profile`, unversioned or at the version the validator
+loads. An order that claims nothing would meet base R4 alone, so it is failed with an
+error saying which profile to add rather than paid for conformance nobody checked.
 
 Each category is validated in its own engine: Matchbox scopes an engine to the
 requested profile's dependency closure, so a lab report checked with the summary's

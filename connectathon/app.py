@@ -1681,12 +1681,30 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
     becomes an error here, so the bonus is paid only for orders that really
     were held to the guide.
 
+    A claim pinned to a version the validator does not have counts as no
+    claim: Matchbox reports such a profile as "not checked" with only a
+    warning, so `...-eu-mpd|9.9.9` would otherwise buy the same free pass.
+    Unversioned, or the version of the package the engine loads, is checked.
+
     A no-op for every category with no `entry_profiles`: they are checked
     against a bundle profile of their own.
     """
     claims = set(doc.get("entry_profiles") or ())
     if not claims:
         return outcome
+    loaded = {ig.split("#", 1)[1] for ig in doc["igs"] if "#" in ig}
+
+    def checked_claim(resource) -> bool:
+        meta = resource.get("meta")
+        claimed = meta.get("profile") if isinstance(meta, dict) else None
+        for c in claimed if isinstance(claimed, list) else []:
+            if not isinstance(c, str):
+                continue
+            url, _, version = c.partition("|")
+            if url in claims and (not version or version in loaded):
+                return True
+        return False
+
     entries = bundle.get("entry")
     added, orders = [], 0
     for i, entry in enumerate(entries if isinstance(entries, list) else []):
@@ -1698,14 +1716,15 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
         if rtype not in ("MedicationRequest", "MedicationDispense"):
             continue
         orders += 1
-        if not claims.intersection(_meta_profiles(resource)):
+        if not checked_claim(resource):
             own = [p for p in doc["entry_profiles"]
                    if p.rsplit("/", 1)[-1].startswith(rtype + "-")]
             added.append({
                 "severity": "error",
                 "code": "required",
-                "diagnostics": "This %s claims no MPD profile, so it was not "
-                "checked against the MPD guide. Add %s to its meta.profile."
+                "diagnostics": "This %s claims no MPD profile the validator "
+                "has, so it was not checked against the MPD guide. Add %s, "
+                "unversioned, to its meta.profile."
                 % (rtype, " or ".join(own) or "its MPD profile"),
                 "expression": ["Bundle.entry[%d].resource" % i],
             })
@@ -2591,7 +2610,7 @@ def validate_bundle(
     outcome = drop_uncheckable_terminology(outcome)
     outcome = require_entry_profile_claims(outcome, bundle, doc)
 
-    counts ={"fatal": 0, "error": 0, "warning": 0, "information": 0}
+    counts = {"fatal": 0, "error": 0, "warning": 0, "information": 0}
     issues = outcome.get("issue")
     for issue in issues if isinstance(issues, list) else []:
         sev = issue.get("severity") if isinstance(issue, dict) else None
