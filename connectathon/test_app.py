@@ -524,6 +524,10 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
     # FHIR has no null, so the empty columns are absent rather than sent as one
     for absent in ("bestErrors", "bestSections", "bestResources", "lastSubmission"):
         assert absent not in idle, absent
+    # ...and the description says so, rather than promising "no score".
+    described = client.get("/openapi.json").json()["paths"]["/fhir/$leaderboard"]["get"]
+    assert "with a score of 0 and no submission details" in described["description"]
+    assert "no score" not in described["description"]
 
 
 def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkeypatch):
@@ -538,6 +542,56 @@ def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkey
     lb = param_entries(client.get("/fhir/$leaderboard"))
     names = [r["organization"] for r in lb]
     assert names.index("Early") < names.index("Late")
+
+
+def test_tiebreak_a_failed_summary_does_not_cost_a_tied_team_its_place(client,
+                                                                     monkeypatch):
+    """A team with only other categories that then tries a summary and fails
+    has the same total it had - its place among equals cannot change either."""
+    consume_first_pass(client, monkeypatch)
+    tok_a = register(client, "Zulu Early")    # named to lose an alphabetical tie
+    tok_b = register(client, "Alpha Late")
+    submit(client, tok_a, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_b, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_a, outcome(errors=3), monkeypatch)   # a failed summary
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Zulu Early"]["score"] == board["Alpha Late"]["score"]
+    assert board["Zulu Early"]["rank"] < board["Alpha Late"]["rank"]
+
+
+def test_tiebreak_goes_to_whoever_reached_the_total_first_not_the_summary(client,
+                                                                         monkeypatch):
+    """The other categories are part of the total, so reaching the same total
+    later - by adding a lab report after a rival did - ranks below them, even
+    with the earlier summary."""
+    consume_first_pass(client, monkeypatch)
+    tok_p = register(client, "Alpha Summary First")
+    tok_q = register(client, "Zulu Total First")
+    submit(client, tok_p, outcome(), monkeypatch)
+    submit(client, tok_q, outcome(), monkeypatch)
+    lab = secondary_bundle("laboratory")
+    submit(client, tok_q, outcome(), monkeypatch, body=lab)
+    submit(client, tok_p, outcome(), monkeypatch, body=lab)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Alpha Summary First"]["score"] == board["Zulu Total First"]["score"]
+    assert board["Zulu Total First"]["rank"] < board["Alpha Summary First"]["rank"]
+    # And a later failed lab report changes nothing for the leader.
+    submit(client, tok_q, outcome(errors=1), monkeypatch, body=lab)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Zulu Total First"]["rank"] < board["Alpha Summary First"]["rank"]
+
+
+def test_tiebreak_a_team_that_has_scored_nothing_keeps_its_first_attempt(client,
+                                                                        monkeypatch):
+    """Among teams on 0, one that has tried still ranks above one that has not,
+    and trying again does not move it."""
+    tok_a = register(client, "Zulu Tried")
+    register(client, "Alpha Idle")
+    submit(client, tok_a, outcome(errors=1), monkeypatch)
+    submit(client, tok_a, outcome(errors=1), monkeypatch,
+           body=secondary_bundle("laboratory"))
+    names = [r["organization"] for r in param_entries(client.get("/fhir/$leaderboard"))]
+    assert names.index("Zulu Tried") < names.index("Alpha Idle")
 
 
 def test_tiebreak_alphabetical_for_identical_teams(client):
@@ -1053,6 +1107,37 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     # picker card, so it has to come from the render path
     assert "function cvModesHtml(" in text
     assert "html += cvModesHtml();" in text
+
+
+def test_leaderboard_poll_rewrites_only_the_rows_that_changed(client):
+    """Replacing the whole body every five seconds destroyed the focused link
+    and any selected text even when nothing had moved."""
+    text = client.get("/").text
+    script = text[text.index("async function refreshLeaderboard("):]
+    script = script[:script.index("\nrefreshLeaderboard();")]
+    assert '$("#lb-body").innerHTML =' not in script
+    assert "if (h !== lbRowsHtml[i]) body.rows[i].outerHTML = h;" in script
+    assert "lbRowsHtml = html;" in script
+    # A row that did change gets focus put back on the same company's link.
+    assert "if (focusedHref && !active.isConnected)" in script
+    # Trimmed, or each rewritten row would leave a stray text node behind.
+    assert "</tr>`.trim());" in script
+
+
+def test_leaderboard_podium_is_only_for_teams_that_have_scored(client):
+    """At the start every team is on 0, and rank alone would hand gold, silver
+    and bronze to the first three names in the alphabet."""
+    text = client.get("/").text
+    assert '${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}' in text
+    assert '${r.rank <= 3 ? "rank-"' not in text
+
+
+def test_first_pass_flame_names_what_earns_it(client):
+    """The bonus is for the first passing patient summary - a lab report that
+    passed earlier does not win it, so "a valid document" was wrong."""
+    text = client.get("/").text
+    assert "First pass: first company to submit a valid patient summary" in text
+    assert "first company to submit a valid document" not in text
 
 
 def test_index_navigates_through_the_hash(client):
@@ -4168,6 +4253,134 @@ def test_naming_a_profile_settles_the_category(client, monkeypatch):
                       content=BUNDLE, headers={"X-Team-Token": token})
     assert res.status_code == 200
     assert res.headers["X-Document-Type"] == "imaging"
+
+
+MPD_REQUEST = "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd"
+MPD_DISPENSE = "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd"
+
+
+# What Matchbox really says about a bundle with nothing wrong in it.
+MATCHBOX_PASSED = {"resourceType": "OperationOutcome", "issue": [
+    {"severity": "information", "code": "informational",
+     "diagnostics": "No fatal or error issues detected, the validation has passed"}]}
+
+
+def mpd_collection(*resources):
+    return json.dumps({"resourceType": "Bundle", "type": "collection",
+                       "entry": [{"resource": r} for r in resources]})
+
+
+@pytest.mark.parametrize("path,body", [
+    # Forced into MPD by naming its profile, which is base Bundle.
+    ("/fhir/Bundle/$validate?profile=http://hl7.org/fhir/StructureDefinition/Bundle",
+     mpd_collection()),
+    # Read as MPD from a bare MedicationRequest, which then only meets base R4.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest", "status": "active"})),
+    # One order claimed, the other not: the second was never checked either.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST]}},
+                    {"resourceType": "MedicationDispense"})),
+    # Claimed at a version the validator does not have: Matchbox only warns
+    # that the profile "has not been checked", so this is no claim either.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|9.9.9"]}})),
+    # Only a Medication claims MPD: there is no prescription or dispense at all.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "Medication", "meta": {"profile": [
+         "http://hl7.eu/fhir/mpd/StructureDefinition/Medication-eu-mpd"]}})),
+])
+def test_an_mpd_bonus_needs_its_orders_checked_against_mpd(client, monkeypatch,
+                                                          path, body):
+    """MPD is validated against base Bundle, and Matchbox applies an MPD
+    profile only to an entry that claims one. An order with no claim meets base
+    R4 alone, so a clean outcome from Matchbox says nothing about MPD - and
+    without this check leaving the claim out was easier than making it."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, MATCHBOX_PASSED)
+    res = client.post(path, content=body, headers={"X-Team-Token": token})
+    assert res.status_code == 200
+    assert res.headers["X-Document-Type"] == "mpd"
+    assert res.headers["X-Pass"] == "false"
+    assert res.headers["X-Score"] == "0"
+    assert res.headers["X-Secondary-Categories"] == "0"
+    issues = res.json()["issue"]
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert errors and all("MPD" in i["diagnostics"] for i in errors)
+    # Matchbox's "the validation has passed" would contradict the verdict.
+    assert "validation has passed" not in json.dumps(issues)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Alpha"]["score"] == 0
+    assert part_list(board["Alpha"], "secondaryCategories") == []
+
+
+def test_an_unclaimed_order_is_named_where_it_sits(client, monkeypatch):
+    """The finding points at the entry and names the profile to claim, so the
+    page can put it on the right line and the fix is in the message."""
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(warnings=1), monkeypatch,
+                 body=mpd_collection(
+                     {"resourceType": "MedicationRequest",
+                      "meta": {"profile": [MPD_REQUEST]}},
+                     {"resourceType": "MedicationDispense"}))
+    errors = [i for i in res.json()["issue"] if i["severity"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["expression"] == ["Bundle.entry[1].resource"]
+    assert MPD_DISPENSE in errors[0]["diagnostics"]
+    # Matchbox's own findings are kept alongside.
+    assert any(i["severity"] == "warning" for i in res.json()["issue"])
+
+
+def test_an_mpd_bundle_whose_orders_all_claim_mpd_still_earns_the_bonus(client,
+                                                                        monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch, body=mpd_collection(
+        {"resourceType": "MedicationRequest",
+         "meta": {"profile": [MPD_REQUEST + "|1.0.0"]}},
+        {"resourceType": "MedicationDispense", "meta": {"profile": [MPD_DISPENSE]}},
+        {"resourceType": "Patient"}))
+    assert res.headers["X-Pass"] == "true"
+    assert res.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+
+def test_the_mpd_claim_check_leaves_other_categories_alone():
+    """Every other category is checked against a bundle profile of its own, so
+    a lab report carrying a bare MedicationRequest is not MPD's business."""
+    oc = outcome()
+    body = doc_bundle(comp_type="11502-2", resources=("MedicationRequest",))
+    for doc_id in ("eps", "laboratory", "imaging"):
+        doc = app_module.DOCUMENTS_BY_ID[doc_id]
+        assert app_module.require_entry_profile_claims(oc, body, doc) is oc
+
+
+def test_naming_a_versioned_profile_settles_the_category_too(client, monkeypatch):
+    """A canonical with its version is still that canonical, and a version in
+    meta.profile is already read that way - ?profile= must agree."""
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]
+    token = register(client, "Alpha")
+    seen = {}
+
+    def capture(body, doc=None):
+        seen["doc"] = doc
+        return outcome()
+
+    monkeypatch.setattr(app_module, "validate_with_matchbox", capture)
+    res = client.post("/fhir/Bundle/$validate",
+                      params={"profile": lab["profile"] + "|2.0.0"},
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 200, res.text
+    assert res.headers["X-Document-Type"] == "laboratory"
+    # Matchbox is still asked for the profile it has, not the pinned string.
+    assert seen["doc"]["profile"] == lab["profile"]
+    # The version does not make an unscored profile acceptable.
+    res = client.post("/fhir/Bundle/$validate",
+                      params={"profile": "http://example.org/easy|" + lab["profile"]},
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 400
 
 
 def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):

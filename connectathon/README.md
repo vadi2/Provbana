@@ -382,7 +382,9 @@ A team's score is its best **patient summary**, plus a one-time **+20 first pass
 bonus for the first company ever to pass one, plus **+15** for each of the other
 [document types](#document-types) it also has a passing submission in. Nothing else
 scores - interop testing is deliberately unscored, so there is nothing to farm. Set
-`REGISTER_CODE` if you want registration closed as well.
+`REGISTER_CODE` if you want registration closed as well. Companies on the same score
+are ranked by who reached that score first, so another attempt - failed or not - never
+costs a company its place.
 
 The +15 is flat and paid once per category however many of that kind you send, and a
 non-summary earns no section or resource points at all: richness is measured against
@@ -436,6 +438,13 @@ demote a summary out of the scoring.
 Claim the profile in `meta.profile`, or pass `?profile=` on the submit call, to settle
 it outright. `curl 'localhost:8095/fhir/$documents'` lists the lot, including whether
 Matchbox has each one's packages loaded.
+
+A prescription is checked against base `Bundle`, and the validator applies an MPD
+profile only to an entry that claims one. So an MPD submission passes only when it
+carries at least one `MedicationRequest` or `MedicationDispense` and every one of them
+claims its MPD profile in `meta.profile`, unversioned or at the version the validator
+loads. An order that claims nothing would meet base R4 alone, so it is failed with an
+error saying which profile to add rather than paid for conformance nobody checked.
 
 Each category is validated in its own engine: Matchbox scopes an engine to the
 requested profile's dependency closure, so a lab report checked with the summary's
@@ -578,7 +587,8 @@ the track", not "a summary worth nothing", and the submit page says exactly that
 canonical it was therefore checked against. Worth reading first: a team that meant to
 send a lab report and sees `eps` here has its answer before it reads a single finding -
 the bundle never claimed what it was. `?profile=` settles it, and is rejected with
-**400** for any canonical outside the four.
+**400** for any canonical outside the four. A `|version` suffix is ignored, as it is in
+`meta.profile`: the bundle is checked against the version the validator has loaded.
 
 The web form does more with that same outcome than the API can. A location like
 `Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose[x].value` is a locator, and
@@ -718,12 +728,14 @@ curl 'localhost:8095/fhir/$leaderboard'
 
 One `entry` per registered company, best score first, carrying `rank`, `organization`,
 `organizationSlug`, `score`, `passed`, `attempts`, `firstPass` and - for companies that
-have submitted - `bestErrors`, `bestSections`, `bestResources` and `lastSubmission`.
+have submitted - `bestErrors` and `lastSubmission`. A company that has never submitted
+has a `score` of 0 and sorts below every company that has.
 `secondaryCategories` repeats once per non-summary [document
 type](#document-types) the company has passed, in registry order, and is absent
 for a company that has passed none. `bestPatientSummary` is the score the
-standing rests on, absent for a company that has not submitted a summary at all -
-`bestSections` and `bestResources` describe that same submission.
+standing rests on, and `bestSections` and `bestResources` describe that same
+submission; all three are absent for a company that has not submitted a summary at
+all, even one that has submitted other document types.
 
 The whole API is also described at `/openapi.json`, browsable at `/docs`.
 

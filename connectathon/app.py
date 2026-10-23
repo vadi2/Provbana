@@ -150,7 +150,9 @@ EHDS_DOCUMENTS = [
         # into and checks. Verified by breaking a MedicationRequest inside an
         # otherwise valid bundle: the failure comes back attributed "(from
         # http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd)",
-        # so the profile really is being applied and not merely loaded.
+        # so the profile really is being applied and not merely loaded. An
+        # order that claims nothing meets base R4 alone, which is why
+        # require_entry_profile_claims() fails one rather than paying for it.
         "profile": "http://hl7.org/fhir/StructureDefinition/Bundle",
         "igs": ["hl7.fhir.eu.mpd#1.0.0"],
         "bundles": [],
@@ -1666,6 +1668,93 @@ def detect_document(bundle) -> dict:
     return PRIMARY_DOCUMENT
 
 
+def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict:
+    """Fail an MPD submission whose orders were never checked against MPD.
+
+    MPD is validated against base Bundle, and Matchbox applies an MPD profile
+    only to an entry that claims one itself. So a MedicationRequest or
+    MedicationDispense with no claim is checked against base R4 alone, and a
+    bundle with none at all - an empty one sent with ?profile= - is checked
+    against nothing. Either would pass and earn the category bonus for MPD
+    conformance nobody checked, and leaving the claim out would be strictly
+    easier than making it. Each unclaimed order, or the absence of any order,
+    becomes an error here, so the bonus is paid only for orders that really
+    were held to the guide.
+
+    A claim pinned to a version the validator does not have counts as no
+    claim: Matchbox reports such a profile as "not checked" with only a
+    warning, so `...-eu-mpd|9.9.9` would otherwise buy the same free pass.
+    Unversioned, or the version of the package the engine loads, is checked -
+    MPD's profiles carry their package's version, which Matchbox reports back
+    as "(from ...MedicationRequest-eu-mpd|1.0.0)".
+
+    A no-op for every category with no `entry_profiles`: they are checked
+    against a bundle profile of their own.
+    """
+    claims = set(doc.get("entry_profiles") or ())
+    if not claims:
+        return outcome
+    loaded = {ig.split("#", 1)[1] for ig in doc["igs"] if "#" in ig}
+
+    def checked_claim(resource) -> bool:
+        meta = resource.get("meta")
+        claimed = meta.get("profile") if isinstance(meta, dict) else None
+        for c in claimed if isinstance(claimed, list) else []:
+            if not isinstance(c, str):
+                continue
+            url, _, version = c.partition("|")
+            if url in claims and (not version or version in loaded):
+                return True
+        return False
+
+    entries = bundle.get("entry")
+    added, orders = [], 0
+    for i, entry in enumerate(entries if isinstance(entries, list) else []):
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        rtype = resource.get("resourceType")
+        # The types detect_document reads a claimless prescription from.
+        if rtype not in ("MedicationRequest", "MedicationDispense"):
+            continue
+        orders += 1
+        if not checked_claim(resource):
+            own = [p for p in doc["entry_profiles"]
+                   if p.rsplit("/", 1)[-1].startswith(rtype + "-")]
+            added.append({
+                "severity": "error",
+                "code": "required",
+                "diagnostics": "This %s claims no MPD profile the validator "
+                "has, so it was not checked against the MPD guide. Add %s, "
+                "unversioned, to its meta.profile."
+                % (rtype, " or ".join(own) or "its MPD profile"),
+                "expression": ["Bundle.entry[%d].resource" % i],
+            })
+    if not orders:
+        added.append({
+            "severity": "error",
+            "code": "required",
+            "diagnostics": "A prescription or dispense needs at least one "
+            "MedicationRequest or MedicationDispense claiming its MPD profile "
+            "in meta.profile, and this bundle has neither.",
+            "expression": ["Bundle"],
+        })
+    if not added:
+        return outcome
+    issues = outcome.get("issue")
+    # Matchbox's own "the validation has passed" would now contradict the
+    # verdict, so it goes.
+    kept = [
+        issue for issue in (issues if isinstance(issues, list) else [])
+        if not (isinstance(issue, dict)
+                and issue.get("severity") == "information"
+                and "validation has passed" in str(issue.get("diagnostics")))
+    ]
+    checked = dict(outcome)
+    checked["issue"] = kept + added
+    return checked
+
+
 # ---------------------------------------------------------------- matchbox
 
 
@@ -2487,10 +2576,13 @@ def validate_bundle(
     # on it, so the accepted values are exactly the ones this event scores
     # against - one per EHDS category. Naming one settles the category outright,
     # which is the escape hatch for a document detect_document() reads wrongly.
+    # A version suffix is dropped, as _meta_profiles() drops it from a claim:
+    # a team that pins the version still means the same profile.
     requested = None
     if profile is not None:
         requested = next(
-            (d for d in EHDS_DOCUMENTS if d["profile"] == profile), None
+            (d for d in EHDS_DOCUMENTS if d["profile"] == profile.split("|", 1)[0]),
+            None,
         )
         if requested is None:
             raise HTTPException(
@@ -2521,6 +2613,7 @@ def validate_bundle(
     # not to check, and leave the banner asking them to fix errors it will not
     # show them.
     outcome = drop_uncheckable_terminology(outcome)
+    outcome = require_entry_profile_claims(outcome, bundle, doc)
 
     counts = {"fatal": 0, "error": 0, "warning": 0, "information": 0}
     issues = outcome.get("issue")
@@ -2673,10 +2766,9 @@ def _leaderboard_rows() -> list[dict]:
             primary_subs = [
                 s for s in team_subs if s["doc_type"] == PRIMARY_DOCUMENT["id"]
             ]
-            # Highest-scoring submission of the two sets; its timestamp is the
-            # moment the team first achieved its current best score (used as
-            # ranking tiebreak, so re-submitting never hurts).
-            best = min(primary_subs or team_subs, key=lambda s: (-s["score"], s["ts"]))
+            # The best summary, earliest of equals, for the richness columns.
+            best = min(primary_subs, key=lambda s: (-s["score"], s["ts"]),
+                       default=None)
             best_primary = max((s["score"] for s in primary_subs), default=0)
             # Registry order, not submission order, so the column reads the same
             # for every team however they got there.
@@ -2686,6 +2778,23 @@ def _leaderboard_rows() -> list[dict]:
                 if any(s["pass"] and s["doc_type"] == d["id"] for s in team_subs)
             ]
             score = team_score(best_primary, first_pass, len(secondary))
+            # The ranking tiebreak: the moment the team's current total was
+            # first reached, which is when the last of its terms arrived - the
+            # first summary to score its best, and the first pass in each other
+            # category it is credited for. The first-pass bonus needs no term
+            # of its own: it is won by the team's first passing summary, which
+            # is never later than its best. A failed attempt adds nothing to
+            # the total, so it never moves this - trying again must not cost a
+            # tied team its place. A team that has scored nothing at all falls
+            # back to its first attempt, which keeps it above the idle teams.
+            reached = [
+                min(s["ts"] for s in primary_subs if s["score"] == best_primary)
+            ] if best_primary else []
+            reached += [
+                min(s["ts"] for s in team_subs if s["pass"] and s["doc_type"] == doc_id)
+                for doc_id in secondary
+            ]
+            best_ts = max(reached) if reached else team_subs[0]["ts"]
             rows.append(
                 {
                     "organization": team["name"],
@@ -2703,8 +2812,8 @@ def _leaderboard_rows() -> list[dict]:
                     # row above it, and the status and category chips already
                     # say the team submitted, so empty cannot be misread as
                     # never having tried.
-                    "bestSections": best["sections"] if primary_subs else None,
-                    "bestResources": best["resources"] if primary_subs else None,
+                    "bestSections": best["sections"] if best else None,
+                    "bestResources": best["resources"] if best else None,
                     # Absent rather than false for a team with no summary yet:
                     # "has not passed the track's document" is the thing the
                     # column is for, and 0 would read as a passing empty one.
@@ -2712,7 +2821,7 @@ def _leaderboard_rows() -> list[dict]:
                     "secondaryCategories": secondary,
                     "lastSubmission": team_subs[-1]["ts"],
                     "firstPass": first_pass,
-                    "_best_ts": best["ts"],
+                    "_best_ts": best_ts,
                 }
             )
         else:
@@ -2734,7 +2843,7 @@ def _leaderboard_rows() -> list[dict]:
                 }
             )
 
-    # Score desc, then whoever reached their best score first, then name.
+    # Score desc, then whoever reached their current score first, then name.
     # Attempts and last submission are deliberately not tiebreaks: trying
     # again must never hurt a team's rank.
     rows.sort(
@@ -2752,8 +2861,8 @@ def _leaderboard_rows() -> list[dict]:
     description=(
         "One `entry` parameter per registered company, best score first. "
         "Companies that have registered but never submitted appear at the "
-        "bottom with no score. This is an operation rather than a search "
-        "because a ranking is computed on the way out - it is not a resource "
+        "bottom with a score of 0 and no submission details. This is an "
+        "operation rather than a search because a ranking is computed on the way out - it is not a resource "
         "the server stores, and pretending otherwise would mean inventing one."
     ),
 )
@@ -5348,6 +5457,8 @@ async function loadDocuments() {
 loadDocuments();
 
 /* ---- leaderboard ---- */
+/* The rows as last written, so a poll can tell which ones actually changed. */
+let lbRowsHtml = [];
 async function refreshLeaderboard() {
   updatePracticeNote();
   try {
@@ -5356,14 +5467,17 @@ async function refreshLeaderboard() {
     const rows = paramEntries(await res.json(), "entry").map(leaderboardRow);
     $("#lb-empty").style.display = rows.length ? "none" : "block";
     $("#lb").style.display = rows.length ? "table" : "none";
-    $("#lb-body").innerHTML = rows.map((r) => `
-      <tr class="${r.rank <= 3 ? "rank-" + r.rank : ""}">
+    /* No podium for a team that has not scored: at the start, or while fewer
+       than three teams have scored, rank alone would hand a medal to whoever
+       sorts first by name. */
+    const html = rows.map((r) => `
+      <tr class="${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
         <td>${r.attempts
           ? `<a href="#clinical/company/${encodeURIComponent(r.team_slug)}"
                title="see this company's documents">${esc(r.team)}</a>`
           : esc(r.team)}${r.first_pass
-          ? ' <span title="First pass: first company to submit a valid document">'
+          ? ' <span title="First pass: first company to submit a valid patient summary">'
             + '\u{1F525}</span>' : ""}</td>
         <td><strong>${r.score}</strong></td>
         <td>${r.passed ? '<span class="badge pass">VALID</span>'
@@ -5376,7 +5490,25 @@ async function refreshLeaderboard() {
         <td>${r.best_resources === null ? "-" : r.best_resources}</td>
         <td>${r.best_errors === null ? "-" : r.best_errors}</td>
         <td class="muted">${r.last_submission ? fmtWhen(r.last_submission) : "-"}</td>
-      </tr>`).join("");
+      </tr>`.trim());
+    /* Only the rows that changed are rewritten. Replacing the whole body every
+       five seconds destroyed the focused link and any selected text even when
+       nothing had moved; a row that did change still loses them, so focus is
+       put back on the same company's link wherever it now sits. */
+    const body = $("#lb-body");
+    const active = document.activeElement;
+    const focusedHref = body.contains(active) ? active.getAttribute("href") : null;
+    if (body.rows.length !== html.length || lbRowsHtml.length !== html.length) {
+      body.innerHTML = html.join("");
+    } else {
+      html.forEach((h, i) => { if (h !== lbRowsHtml[i]) body.rows[i].outerHTML = h; });
+    }
+    lbRowsHtml = html;
+    if (focusedHref && !active.isConnected) {
+      const link = [...body.querySelectorAll("a")]
+        .find((a) => a.getAttribute("href") === focusedHref);
+      if (link) link.focus();
+    }
   } catch (e) { /* transient network error - retry on next tick */ }
 }
 refreshLeaderboard();
