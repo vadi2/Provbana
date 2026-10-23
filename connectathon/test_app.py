@@ -4170,6 +4170,103 @@ def test_naming_a_profile_settles_the_category(client, monkeypatch):
     assert res.headers["X-Document-Type"] == "imaging"
 
 
+MPD_REQUEST = "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd"
+MPD_DISPENSE = "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd"
+
+
+# What Matchbox really says about a bundle with nothing wrong in it.
+MATCHBOX_PASSED = {"resourceType": "OperationOutcome", "issue": [
+    {"severity": "information", "code": "informational",
+     "diagnostics": "No fatal or error issues detected, the validation has passed"}]}
+
+
+def mpd_collection(*resources):
+    return json.dumps({"resourceType": "Bundle", "type": "collection",
+                       "entry": [{"resource": r} for r in resources]})
+
+
+@pytest.mark.parametrize("path,body", [
+    # Forced into MPD by naming its profile, which is base Bundle.
+    ("/fhir/Bundle/$validate?profile=http://hl7.org/fhir/StructureDefinition/Bundle",
+     mpd_collection()),
+    # Read as MPD from a bare MedicationRequest, which then only meets base R4.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest", "status": "active"})),
+    # One order claimed, the other not: the second was never checked either.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST]}},
+                    {"resourceType": "MedicationDispense"})),
+    # Only a Medication claims MPD: there is no prescription or dispense at all.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "Medication", "meta": {"profile": [
+         "http://hl7.eu/fhir/mpd/StructureDefinition/Medication-eu-mpd"]}})),
+])
+def test_an_mpd_bonus_needs_its_orders_checked_against_mpd(client, monkeypatch,
+                                                          path, body):
+    """MPD is validated against base Bundle, and Matchbox applies an MPD
+    profile only to an entry that claims one. An order with no claim meets base
+    R4 alone, so a clean outcome from Matchbox says nothing about MPD - and
+    without this check leaving the claim out was easier than making it."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, MATCHBOX_PASSED)
+    res = client.post(path, content=body, headers={"X-Team-Token": token})
+    assert res.status_code == 200
+    assert res.headers["X-Document-Type"] == "mpd"
+    assert res.headers["X-Pass"] == "false"
+    assert res.headers["X-Score"] == "0"
+    assert res.headers["X-Secondary-Categories"] == "0"
+    issues = res.json()["issue"]
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert errors and all("MPD" in i["diagnostics"] for i in errors)
+    # Matchbox's "the validation has passed" would contradict the verdict.
+    assert "validation has passed" not in json.dumps(issues)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Alpha"]["score"] == 0
+    assert part_list(board["Alpha"], "secondaryCategories") == []
+
+
+def test_an_unclaimed_order_is_named_where_it_sits(client, monkeypatch):
+    """The finding points at the entry and names the profile to claim, so the
+    page can put it on the right line and the fix is in the message."""
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(warnings=1), monkeypatch,
+                 body=mpd_collection(
+                     {"resourceType": "MedicationRequest",
+                      "meta": {"profile": [MPD_REQUEST]}},
+                     {"resourceType": "MedicationDispense"}))
+    errors = [i for i in res.json()["issue"] if i["severity"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["expression"] == ["Bundle.entry[1].resource"]
+    assert MPD_DISPENSE in errors[0]["diagnostics"]
+    # Matchbox's own findings are kept alongside.
+    assert any(i["severity"] == "warning" for i in res.json()["issue"])
+
+
+def test_an_mpd_bundle_whose_orders_all_claim_mpd_still_earns_the_bonus(client,
+                                                                        monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch, body=mpd_collection(
+        {"resourceType": "MedicationRequest",
+         "meta": {"profile": [MPD_REQUEST + "|1.0.0"]}},
+        {"resourceType": "MedicationDispense", "meta": {"profile": [MPD_DISPENSE]}},
+        {"resourceType": "Patient"}))
+    assert res.headers["X-Pass"] == "true"
+    assert res.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+
+def test_the_mpd_claim_check_leaves_other_categories_alone():
+    """Every other category is checked against a bundle profile of its own, so
+    a lab report carrying a bare MedicationRequest is not MPD's business."""
+    oc = outcome()
+    body = doc_bundle(comp_type="11502-2", resources=("MedicationRequest",))
+    for doc_id in ("eps", "laboratory", "imaging"):
+        doc = app_module.DOCUMENTS_BY_ID[doc_id]
+        assert app_module.require_entry_profile_claims(oc, body, doc) is oc
+
+
 def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):
     """Honouring an arbitrary profile would let a team pick one their bundle
     already satisfies and score full marks on it."""

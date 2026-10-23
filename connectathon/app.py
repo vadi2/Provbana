@@ -150,7 +150,9 @@ EHDS_DOCUMENTS = [
         # into and checks. Verified by breaking a MedicationRequest inside an
         # otherwise valid bundle: the failure comes back attributed "(from
         # http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd)",
-        # so the profile really is being applied and not merely loaded.
+        # so the profile really is being applied and not merely loaded. An
+        # order that claims nothing meets base R4 alone, which is why
+        # require_entry_profile_claims() fails one rather than paying for it.
         "profile": "http://hl7.org/fhir/StructureDefinition/Bundle",
         "igs": ["hl7.fhir.eu.mpd#1.0.0"],
         "bundles": [],
@@ -1666,6 +1668,72 @@ def detect_document(bundle) -> dict:
     return PRIMARY_DOCUMENT
 
 
+def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict:
+    """Fail an MPD submission whose orders were never checked against MPD.
+
+    MPD is validated against base Bundle, and Matchbox applies an MPD profile
+    only to an entry that claims one itself. So a MedicationRequest or
+    MedicationDispense with no claim is checked against base R4 alone, and a
+    bundle with none at all - an empty one sent with ?profile= - is checked
+    against nothing. Either would pass and earn the category bonus for MPD
+    conformance nobody checked, and leaving the claim out would be strictly
+    easier than making it. Each unclaimed order, or the absence of any order,
+    becomes an error here, so the bonus is paid only for orders that really
+    were held to the guide.
+
+    A no-op for every category with no `entry_profiles`: they are checked
+    against a bundle profile of their own.
+    """
+    claims = set(doc.get("entry_profiles") or ())
+    if not claims:
+        return outcome
+    entries = bundle.get("entry")
+    added, orders = [], 0
+    for i, entry in enumerate(entries if isinstance(entries, list) else []):
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        rtype = resource.get("resourceType")
+        # The types detect_document reads a claimless prescription from.
+        if rtype not in ("MedicationRequest", "MedicationDispense"):
+            continue
+        orders += 1
+        if not claims.intersection(_meta_profiles(resource)):
+            own = [p for p in doc["entry_profiles"]
+                   if p.rsplit("/", 1)[-1].startswith(rtype + "-")]
+            added.append({
+                "severity": "error",
+                "code": "required",
+                "diagnostics": "This %s claims no MPD profile, so it was not "
+                "checked against the MPD guide. Add %s to its meta.profile."
+                % (rtype, " or ".join(own) or "its MPD profile"),
+                "expression": ["Bundle.entry[%d].resource" % i],
+            })
+    if not orders:
+        added.append({
+            "severity": "error",
+            "code": "required",
+            "diagnostics": "A prescription or dispense needs at least one "
+            "MedicationRequest or MedicationDispense claiming its MPD profile "
+            "in meta.profile, and this bundle has neither.",
+            "expression": ["Bundle"],
+        })
+    if not added:
+        return outcome
+    issues = outcome.get("issue")
+    # Matchbox's own "the validation has passed" would now contradict the
+    # verdict, so it goes.
+    kept = [
+        issue for issue in (issues if isinstance(issues, list) else [])
+        if not (isinstance(issue, dict)
+                and issue.get("severity") == "information"
+                and "validation has passed" in str(issue.get("diagnostics")))
+    ]
+    checked = dict(outcome)
+    checked["issue"] = kept + added
+    return checked
+
+
 # ---------------------------------------------------------------- matchbox
 
 
@@ -2521,8 +2589,9 @@ def validate_bundle(
     # not to check, and leave the banner asking them to fix errors it will not
     # show them.
     outcome = drop_uncheckable_terminology(outcome)
+    outcome = require_entry_profile_claims(outcome, bundle, doc)
 
-    counts = {"fatal": 0, "error": 0, "warning": 0, "information": 0}
+    counts ={"fatal": 0, "error": 0, "warning": 0, "information": 0}
     issues = outcome.get("issue")
     for issue in issues if isinstance(issues, list) else []:
         sev = issue.get("severity") if isinstance(issue, dict) else None
