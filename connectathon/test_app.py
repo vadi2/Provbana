@@ -1137,8 +1137,8 @@ def test_index_reapplies_a_link_to_the_hash_already_shown(client):
     handler = text[text.index('document.addEventListener("click", (ev) => {\n'
                               "  if (ev.defaultPrevented"):]
     handler = handler[:handler.index("\n});\n")]
-    assert "link.hash !== location.hash) return;" in handler
-    assert "ev.preventDefault();\n  applyRoute(true);" in handler
+    assert "if (link.hash !== location.hash) {" in handler
+    assert "return; }\n  ev.preventDefault();\n  applyRoute(true);" in handler
     # new-tab and new-window clicks stay with the browser
     for key in ("metaKey", "ctrlKey", "shiftKey", "altKey"):
         assert "ev." + key in handler
