@@ -382,7 +382,9 @@ A team's score is its best **patient summary**, plus a one-time **+20 first pass
 bonus for the first company ever to pass one, plus **+15** for each of the other
 [document types](#document-types) it also has a passing submission in. Nothing else
 scores - interop testing is deliberately unscored, so there is nothing to farm. Set
-`REGISTER_CODE` if you want registration closed as well.
+`REGISTER_CODE` if you want registration closed as well. Companies on the same score
+are ranked by who reached that score first, so another attempt - failed or not - never
+costs a company its place.
 
 The +15 is flat and paid once per category however many of that kind you send, and a
 non-summary earns no section or resource points at all: richness is measured against

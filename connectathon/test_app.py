@@ -540,6 +540,56 @@ def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkey
     assert names.index("Early") < names.index("Late")
 
 
+def test_tiebreak_a_failed_summary_does_not_cost_a_tied_team_its_place(client,
+                                                                     monkeypatch):
+    """A team with only other categories that then tries a summary and fails
+    has the same total it had - its place among equals cannot change either."""
+    consume_first_pass(client, monkeypatch)
+    tok_a = register(client, "Zulu Early")    # named to lose an alphabetical tie
+    tok_b = register(client, "Alpha Late")
+    submit(client, tok_a, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_b, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_a, outcome(errors=3), monkeypatch)   # a failed summary
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Zulu Early"]["score"] == board["Alpha Late"]["score"]
+    assert board["Zulu Early"]["rank"] < board["Alpha Late"]["rank"]
+
+
+def test_tiebreak_goes_to_whoever_reached_the_total_first_not_the_summary(client,
+                                                                         monkeypatch):
+    """The other categories are part of the total, so reaching the same total
+    later - by adding a lab report after a rival did - ranks below them, even
+    with the earlier summary."""
+    consume_first_pass(client, monkeypatch)
+    tok_p = register(client, "Alpha Summary First")
+    tok_q = register(client, "Zulu Total First")
+    submit(client, tok_p, outcome(), monkeypatch)
+    submit(client, tok_q, outcome(), monkeypatch)
+    lab = secondary_bundle("laboratory")
+    submit(client, tok_q, outcome(), monkeypatch, body=lab)
+    submit(client, tok_p, outcome(), monkeypatch, body=lab)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Alpha Summary First"]["score"] == board["Zulu Total First"]["score"]
+    assert board["Zulu Total First"]["rank"] < board["Alpha Summary First"]["rank"]
+    # And a later failed lab report changes nothing for the leader.
+    submit(client, tok_q, outcome(errors=1), monkeypatch, body=lab)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Zulu Total First"]["rank"] < board["Alpha Summary First"]["rank"]
+
+
+def test_tiebreak_a_team_that_has_scored_nothing_keeps_its_first_attempt(client,
+                                                                        monkeypatch):
+    """Among teams on 0, one that has tried still ranks above one that has not,
+    and trying again does not move it."""
+    tok_a = register(client, "Zulu Tried")
+    register(client, "Alpha Idle")
+    submit(client, tok_a, outcome(errors=1), monkeypatch)
+    submit(client, tok_a, outcome(errors=1), monkeypatch,
+           body=secondary_bundle("laboratory"))
+    names = [r["organization"] for r in param_entries(client.get("/fhir/$leaderboard"))]
+    assert names.index("Zulu Tried") < names.index("Alpha Idle")
+
+
 def test_tiebreak_alphabetical_for_identical_teams(client):
     register(client, "Zeta Squad")   # registered first
     register(client, "Anna Squad")

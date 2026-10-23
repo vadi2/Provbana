@@ -2766,9 +2766,7 @@ def _leaderboard_rows() -> list[dict]:
             primary_subs = [
                 s for s in team_subs if s["doc_type"] == PRIMARY_DOCUMENT["id"]
             ]
-            # Highest-scoring submission of the two sets; its timestamp is the
-            # moment the team first achieved its current best score (used as
-            # ranking tiebreak, so re-submitting never hurts).
+            # Highest-scoring submission of the two sets, earliest first.
             best = min(primary_subs or team_subs, key=lambda s: (-s["score"], s["ts"]))
             best_primary = max((s["score"] for s in primary_subs), default=0)
             # Registry order, not submission order, so the column reads the same
@@ -2779,6 +2777,23 @@ def _leaderboard_rows() -> list[dict]:
                 if any(s["pass"] and s["doc_type"] == d["id"] for s in team_subs)
             ]
             score = team_score(best_primary, first_pass, len(secondary))
+            # The ranking tiebreak: the moment the team's current total was
+            # first reached, which is when the last of its terms arrived - the
+            # first summary to score its best, and the first pass in each other
+            # category it is credited for. The first-pass bonus needs no term
+            # of its own: it is won by the team's first passing summary, which
+            # is never later than its best. A failed attempt adds nothing to
+            # the total, so it never moves this - trying again must not cost a
+            # tied team its place. A team that has scored nothing at all falls
+            # back to its first attempt, which keeps it above the idle teams.
+            reached = [
+                min(s["ts"] for s in primary_subs if s["score"] == best_primary)
+            ] if best_primary else []
+            reached += [
+                min(s["ts"] for s in team_subs if s["pass"] and s["doc_type"] == doc_id)
+                for doc_id in secondary
+            ]
+            best_ts = max(reached) if reached else team_subs[0]["ts"]
             rows.append(
                 {
                     "organization": team["name"],
@@ -2805,7 +2820,7 @@ def _leaderboard_rows() -> list[dict]:
                     "secondaryCategories": secondary,
                     "lastSubmission": team_subs[-1]["ts"],
                     "firstPass": first_pass,
-                    "_best_ts": best["ts"],
+                    "_best_ts": best_ts,
                 }
             )
         else:
@@ -2827,7 +2842,7 @@ def _leaderboard_rows() -> list[dict]:
                 }
             )
 
-    # Score desc, then whoever reached their best score first, then name.
+    # Score desc, then whoever reached their current score first, then name.
     # Attempts and last submission are deliberately not tiebreaks: trying
     # again must never hurt a team's rank.
     rows.sort(
