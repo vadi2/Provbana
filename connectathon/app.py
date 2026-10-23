@@ -713,7 +713,40 @@ def _quantity_str(quantity) -> str | None:
     unit = quantity.get("unit")
     if not isinstance(unit, str):
         unit = quantity.get("code") if isinstance(quantity.get("code"), str) else ""
-    return f"{value} {unit}".strip()
+    # "<5 mg/L" is a different result from "5 mg/L": below the assay's limit,
+    # not a measured 5.
+    comparator = quantity.get("comparator")
+    if comparator not in ("<", "<=", ">=", ">"):
+        comparator = ""
+    return f"{comparator}{value} {unit}".strip()
+
+
+def _ratio_str(ratio) -> str | None:
+    """1:64 for a titre; "5 mg / 1 mL" when the parts carry units."""
+    if not isinstance(ratio, dict):
+        return None
+    num = _quantity_str(ratio.get("numerator"))
+    den = _quantity_str(ratio.get("denominator"))
+    if not (num and den):
+        return None
+    return f"{num}:{den}" if " " not in num + den else f"{num} / {den}"
+
+
+def _range_str(rng) -> str | None:
+    if not isinstance(rng, dict):
+        return None
+    low, high = rng.get("low"), rng.get("high")
+    low_s, high_s = _quantity_str(low), _quantity_str(high)
+    if low_s and high_s:
+        # One unit is enough when both ends share it: "2-4 mmol/L".
+        if (low.get("unit"), low.get("code")) == (high.get("unit"), high.get("code")):
+            low_s = _quantity_str(dict(low, unit="", code=None))
+        return f"{low_s}-{high_s}"
+    if low_s:
+        return f">={low_s}"
+    if high_s:
+        return f"<={high_s}"
+    return None
 
 
 def _period_str(period) -> str | None:
@@ -747,20 +780,34 @@ def _choice_str(resource, prefix) -> str | None:
     )
 
 
-def _observation_value(obs) -> str | None:
+def _value_str(holder) -> str | None:
+    """The value[x] of an Observation or one of its components, as text."""
     value = (
-        _quantity_str(obs.get("valueQuantity"))
-        or _cc_display(obs.get("valueCodeableConcept"))
-        or _first_str(obs, "valueString")
+        _quantity_str(holder.get("valueQuantity"))
+        or _cc_display(holder.get("valueCodeableConcept"))
+        or _first_str(holder, "valueString", "valueDateTime", "valueTime")
+        or _ratio_str(holder.get("valueRatio"))
+        or _range_str(holder.get("valueRange"))
+        or _period_str(holder.get("valuePeriod"))
     )
     if value:
         return value
-    if isinstance(obs.get("valueBoolean"), bool):
-        return "yes" if obs["valueBoolean"] else "no"
-    if isinstance(obs.get("valueInteger"), int) and not isinstance(
-        obs.get("valueInteger"), bool
+    if isinstance(holder.get("valueBoolean"), bool):
+        return "yes" if holder["valueBoolean"] else "no"
+    if isinstance(holder.get("valueInteger"), int) and not isinstance(
+        holder.get("valueInteger"), bool
     ):
-        return str(obs["valueInteger"])
+        return str(holder["valueInteger"])
+    if isinstance(holder.get("valueSampledData"), dict):
+        # A waveform has no one-line rendering, but it is a value all the same.
+        return "sampled data"
+    return None
+
+
+def _observation_value(obs) -> str | None:
+    value = _value_str(obs)
+    if value:
+        return value
     components = obs.get("component")
     if isinstance(components, list):
         parts = []
@@ -768,11 +815,7 @@ def _observation_value(obs) -> str | None:
             if not isinstance(comp, dict):
                 continue
             label = _cc_display(comp.get("code"))
-            val = (
-                _quantity_str(comp.get("valueQuantity"))
-                or _cc_display(comp.get("valueCodeableConcept"))
-                or _first_str(comp, "valueString")
-            )
+            val = _value_str(comp)
             if label and val:
                 parts.append(f"{label} {val}")
             elif val:
@@ -853,7 +896,22 @@ def _dosage_detail(resource) -> str | None:
         if text:
             parts.append(text)
             continue
+        # No text: a prescription is often structured only ("4 Tablet, every
+        # day, late evening, for 42 days"), and that is a dose all the same.
         bits = []
+        rates = dosage.get("doseAndRate")
+        for rate in rates if isinstance(rates, list) else []:
+            if not isinstance(rate, dict):
+                continue
+            dose = _quantity_str(rate.get("doseQuantity")) or _range_str(rate.get("doseRange"))
+            if dose:
+                # UCUM annotations ("{tbl}") are units only to a machine.
+                bits.append(re.sub(r"\{([^{}]*)\}", r"\1", dose))
+            speed = (_quantity_str(rate.get("rateQuantity"))
+                     or _ratio_str(rate.get("rateRatio"))
+                     or _range_str(rate.get("rateRange")))
+            if speed:
+                bits.append(f"at {speed}")
         route = _cc_display(dosage.get("route"))
         if route:
             bits.append(route)
@@ -862,9 +920,88 @@ def _dosage_detail(resource) -> str | None:
             when = _cc_display(timing.get("code"))
             if when:
                 bits.append(when)
+            if isinstance(timing.get("repeat"), dict):
+                bits.extend(_timing_repeat_bits(timing["repeat"]))
+        need = _cc_display(dosage.get("asNeededCodeableConcept"))
+        if need:
+            bits.append(f"as needed for {need}")
+        elif dosage.get("asNeededBoolean") is True:
+            bits.append("as needed")
         if bits:
             parts.append(", ".join(bits))
     return "; ".join(parts) or None
+
+
+TIMING_UNITS = {"s": "second", "min": "minute", "h": "hour", "d": "day",
+                "wk": "week", "mo": "month", "a": "year"}
+
+# The common v3 TimingEvent codes in words; anything else shows as its code.
+TIMING_EVENTS = {
+    "MORN": "morning", "MORN.early": "early morning", "MORN.late": "late morning",
+    "NOON": "noon", "AFT": "afternoon", "AFT.early": "early afternoon",
+    "AFT.late": "late afternoon", "EVE": "evening", "EVE.early": "early evening",
+    "EVE.late": "late evening", "NIGHT": "night", "PHS": "after sleep",
+    "HS": "before sleep", "WAKE": "on waking", "C": "with a meal",
+    "CM": "with breakfast", "CD": "with lunch", "CV": "with dinner",
+    "AC": "before a meal", "ACM": "before breakfast", "ACD": "before lunch",
+    "ACV": "before dinner", "PC": "after a meal", "PCM": "after breakfast",
+    "PCD": "after lunch", "PCV": "after dinner",
+}
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _span(n, n_max, unit) -> str:
+    """"4 hours", "4-6 hours", or "day" for a bare 1 of the unit."""
+    word = TIMING_UNITS[unit]
+    if n_max is not None:
+        return f"{n}-{n_max} {word}s"
+    return word if n == 1 else f"{n} {word}s"
+
+
+def _timing_repeat_bits(repeat) -> list:
+    """Timing.repeat as phrases: "2x per day", "every 4-6 hours", "for 42 days"."""
+    def num(key):
+        return repeat.get(key) if _number(repeat.get(key)) else None
+
+    def strings(key):
+        vals = repeat.get(key)
+        return [v for v in vals if isinstance(v, str)] if isinstance(vals, list) else []
+
+    bits = []
+    freq, freq_max = num("frequency"), num("frequencyMax")
+    period, period_max = num("period"), num("periodMax")
+    unit = repeat.get("periodUnit")
+    if period is not None and unit in TIMING_UNITS:
+        span = _span(period, period_max, unit)
+        if freq in (None, 1) and freq_max is None:
+            bits.append(f"every {span}")
+        else:
+            times = f"{freq}-{freq_max}" if freq_max is not None else f"{freq}"
+            bits.append(f"{times}x per {span}")
+    if strings("dayOfWeek"):
+        bits.append("on " + ", ".join(strings("dayOfWeek")))
+    if strings("timeOfDay"):
+        bits.append("at " + ", ".join(t[:5] for t in strings("timeOfDay")))
+    bits.extend(TIMING_EVENTS.get(e, e) for e in strings("when"))
+    bounds = repeat.get("boundsDuration")
+    if isinstance(bounds, dict) and _number(bounds.get("value")):
+        if bounds.get("code") in TIMING_UNITS:
+            value = bounds["value"]
+            word = TIMING_UNITS[bounds["code"]]
+            bits.append(f"for 1 {word}" if value == 1 else f"for {value} {word}s")
+        elif _quantity_str(bounds):
+            bits.append("for " + _quantity_str(bounds))
+    window = repeat.get("boundsPeriod")
+    if isinstance(window, dict):
+        start, end = _first_str(window, "start"), _first_str(window, "end")
+        if start and end:
+            bits.append(f"from {start} to {end}")
+        elif start or end:
+            bits.append(f"from {start}" if start else f"until {end}")
+    return bits
 
 
 def _humanize_type(rtype: str) -> str:
@@ -1094,7 +1231,8 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
     status = (item.get("status") or "").strip().lower()
     flags: list = []
     gaps: list = []
-    if not code:
+    # a care team is people and phone numbers, with nothing to code
+    if not code and rtype != "CareTeam":
         gaps.append("not coded")
     if not date and category in DATE_EXPECTED:
         gaps.append("no date")
@@ -1225,6 +1363,7 @@ def _render_resource(resource, by_ref) -> dict:
     rtype = rtype if isinstance(rtype, str) and rtype else "Resource"
     status = resource.get("status") if isinstance(resource.get("status"), str) else None
     detail = None
+    lines: list = []
     if rtype == "MedicationAdministration":
         label = _medication_name(resource, by_ref)
         given = _choice_str(resource, "effective")
@@ -1313,17 +1452,30 @@ def _render_resource(resource, by_ref) -> dict:
         label = label or "Care plan"
         # The activity is what a reader acts on: a plan can be "active" while
         # its one appointment is cancelled, and the cancellation is the news.
-        activity = _first_activity_detail(resource)
+        # A plan of several steps is its steps, each one listed; no one step
+        # speaks for the plan, so its own status stands.
+        activities = _activity_details(resource)
         parts = []
-        if activity is not None:
+        if len(activities) == 1:
+            activity = activities[0]
             act_status = activity.get("status")
             if isinstance(act_status, str) and act_status.strip():
                 status = act_status.strip()
-            scheduled = _period_str(activity.get("scheduledPeriod")) or _first_str(
-                activity, "scheduledString"
-            )
+            scheduled = _activity_scheduled(activity)
             if scheduled:
                 parts.append(f"scheduled {scheduled}")
+        for activity in activities:
+            text = _first_str(activity, "description") or _cc_display(activity.get("code"))
+            if not text or text == label:
+                continue
+            extra = []
+            if len(activities) > 1:
+                if activity.get("status") in ACTIVITY_NEWS:
+                    extra.append(activity["status"])
+                scheduled = _activity_scheduled(activity)
+                if scheduled:
+                    extra.append(f"scheduled {scheduled}")
+            lines.append(text + (f" ({', '.join(extra)})" if extra else ""))
         period = resource.get("period")
         span = _period_str(period)
         if span:
@@ -1334,6 +1486,25 @@ def _render_resource(resource, by_ref) -> dict:
             else:
                 parts.append(f"plan until {span}")
         detail = "; ".join(parts) or None
+    elif rtype == "CareTeam":
+        # Who to ring. summarize_bundle also lists a team after the first plan
+        # that names it, since a section seldom points at one directly.
+        label = _first_str(resource, "name") or "Care team"
+        participants = resource.get("participant")
+        for part in participants if isinstance(participants, list) else []:
+            if not isinstance(part, dict):
+                continue
+            who = _member_name(part.get("member"), by_ref)
+            roles = part.get("role")
+            role = _cc_display(roles[0]) if isinstance(roles, list) and roles else None
+            if who or role:
+                lines.append(", ".join(p for p in (who, role) if p))
+        telecoms = resource.get("telecom")
+        detail = "; ".join(
+            f"{t['system']} {t['value']}" if isinstance(t.get("system"), str) else t["value"]
+            for t in (telecoms if isinstance(telecoms, list) else [])
+            if isinstance(t, dict) and isinstance(t.get("value"), str)
+        ) or None
     elif rtype == "Device":
         label = _cc_display(resource.get("type")) or "Device"
     elif rtype == "DeviceUseStatement":
@@ -1371,17 +1542,43 @@ def _render_resource(resource, by_ref) -> dict:
             label = _humanize_type(rtype)
     item = {"label": label, "detail": detail, "status": status,
             "note": _note_text(resource) if rtype != "Flag" else _flag_note(resource)}
+    if lines:
+        # A plan's steps, a team's members: one per line under the item.
+        item["lines"] = lines
     _annotate_item(item, resource, rtype, by_ref)
     return item
 
 
-def _first_activity_detail(resource) -> dict | None:
+# Activity statuses worth printing beside a step of a plan that goes on.
+ACTIVITY_NEWS = ("cancelled", "stopped", "on-hold", "entered-in-error")
+
+
+def _activity_details(resource) -> list:
     activities = resource.get("activity")
-    if isinstance(activities, list):
-        for activity in activities:
-            if isinstance(activity, dict) and isinstance(activity.get("detail"), dict):
-                return activity["detail"]
-    return None
+    if not isinstance(activities, list):
+        return []
+    return [a["detail"] for a in activities
+            if isinstance(a, dict) and isinstance(a.get("detail"), dict)]
+
+
+def _activity_scheduled(activity) -> str | None:
+    return _period_str(activity.get("scheduledPeriod")) or _first_str(
+        activity, "scheduledString")
+
+
+def _member_name(ref, by_ref) -> str | None:
+    """A care-team member by its display, else by the resource it points at."""
+    if not isinstance(ref, dict):
+        return None
+    display = _first_str(ref, "display")
+    if display:
+        return display
+    target = _resolve_reference(ref.get("reference"), by_ref)
+    if not isinstance(target, dict):
+        return None
+    if isinstance(target.get("name"), str):
+        return _first_str(target, "name")
+    return _human_name(target.get("name"))
 
 
 def _note_text(resource) -> str | None:
@@ -1397,25 +1594,43 @@ def _note_text(resource) -> str | None:
     return None
 
 
+# HumanName.use, best first: the name on the banner is the one the person
+# goes by now, not a maiden name listed before it.
+NAME_USE_RANK = {"official": 0, "usual": 1, None: 2, "temp": 2, "nickname": 3,
+                 "anonymous": 3, "old": 4, "maiden": 4}
+
+
+def _human_name(names) -> str | None:
+    """The current name out of a HumanName list, as text - or, with no
+    current one, the best of the rest."""
+    if not isinstance(names, list):
+        return None
+    today = datetime.now(timezone.utc).date().isoformat()
+    best = None
+    for index, name in enumerate(names):
+        if not isinstance(name, dict):
+            continue
+        given = name.get("given")
+        parts = [g for g in given if isinstance(g, str)] if isinstance(given, list) else []
+        family = name.get("family")
+        if isinstance(family, str) and family.strip():
+            parts.append(family.strip())
+        text = " ".join(parts) or _first_str(name, "text")
+        if not text:
+            continue
+        use = name.get("use") if isinstance(name.get("use"), str) else None
+        rank = NAME_USE_RANK.get(use, 2)
+        period = name.get("period")
+        end = period.get("end") if isinstance(period, dict) else None
+        if isinstance(end, str) and end[:10] < today:
+            rank = NAME_USE_RANK["old"]   # an ended name is a former one
+        if best is None or (rank, index) < best[:2]:
+            best = (rank, index, text)
+    return best[2] if best else None
+
+
 def _patient_summary(patient) -> dict:
-    name_text = None
-    names = patient.get("name")
-    if isinstance(names, list):
-        for name in names:
-            if not isinstance(name, dict):
-                continue
-            given = name.get("given")
-            parts = [g for g in given if isinstance(g, str)] if isinstance(given, list) else []
-            family = name.get("family")
-            if isinstance(family, str) and family.strip():
-                parts.append(family.strip())
-            if parts:
-                name_text = " ".join(parts)
-                break
-            text = name.get("text")
-            if isinstance(text, str) and text.strip():
-                name_text = text.strip()
-                break
+    name_text = _human_name(patient.get("name"))
     identifiers = []
     ids = patient.get("identifier")
     if isinstance(ids, list):
@@ -1469,7 +1684,9 @@ def summarize_bundle(bundle) -> dict:
     own 'resourceType/id'. Clinical resources not reachable from the
     Composition (directly via sections or transitively via references such as
     medicationReference) are listed under "unreferenced" as a data-quality
-    hint.
+    hint. A bundle that is not a document (an MPD prescription is a
+    collection) has no Composition to reach anything from, so its clinical
+    entries (or, with none, all of them) make up one "Entries" section.
     """
     summary: dict = {
         "patient": None,
@@ -1496,6 +1713,7 @@ def summarize_bundle(bundle) -> dict:
     if patient is not None:
         summary["patient"] = _patient_summary(patient)
     reachable: set = set()
+    teams_shown: set = set()
     if composition is not None:
         summary["composition"] = {
             "title": _first_str(composition, "title"),
@@ -1512,17 +1730,69 @@ def summarize_bundle(bundle) -> dict:
                     or "Untitled section"
                 )
                 items = []
-                refs = section.get("entry")
-                if isinstance(refs, list):
-                    for ref_entry in refs:
-                        if not isinstance(ref_entry, dict):
-                            continue
-                        target = _resolve_reference(ref_entry.get("reference"), by_ref)
-                        if target is not None:
-                            items.append(_render_resource(target, by_ref))
+                # A lab report keeps its results in sub-sections ("Blood
+                # examinations" under "Laboratory examinations"); their entries
+                # belong to the top-level section, tagged with the sub-section
+                # they came from. Depth-first in document order, and iterative
+                # for the same reason as _collect_references. A section with
+                # nothing of its own speaks through its sub-sections' emptyReason
+                # or, lacking one, their narrative - as a top-level one does.
+                sub_texts, sub_reasons = [], []
+                stack = [(section, None)]
+                while stack:
+                    node, sub = stack.pop()
+                    if sub:
+                        reason = _cc_display(node.get("emptyReason"))
+                        if reason:
+                            sub_reasons.append(reason)
+                        elif not isinstance(node.get("entry"), list):
+                            text = _section_narrative(node)
+                            if text:
+                                sub_texts.append(f"{sub}\n{text}")
+                    refs = node.get("entry")
+                    if isinstance(refs, list):
+                        for ref_entry in refs:
+                            if not isinstance(ref_entry, dict):
+                                continue
+                            target = _resolve_reference(ref_entry.get("reference"), by_ref)
+                            if target is None:
+                                continue
+                            if target.get("resourceType") == "CareTeam":
+                                if id(target) in teams_shown:
+                                    continue
+                                teams_shown.add(id(target))
+                            rendered = [_render_resource(target, by_ref)]
+                            # A plan's team is who to ring about it, and no
+                            # section points at it: shown once, after the
+                            # first plan that names it.
+                            teams = target.get("careTeam") \
+                                if target.get("resourceType") == "CarePlan" else None
+                            for team_ref in teams if isinstance(teams, list) else []:
+                                team = _resolve_reference(
+                                    team_ref.get("reference") if isinstance(team_ref, dict)
+                                    else None, by_ref)
+                                if (isinstance(team, dict) and id(team) not in teams_shown
+                                        and team.get("resourceType") == "CareTeam"):
+                                    teams_shown.add(id(team))
+                                    rendered.append(_render_resource(team, by_ref))
+                            for item in rendered:
+                                if sub:
+                                    item["subsection"] = sub
+                                items.append(item)
+                    children = node.get("section")
+                    if isinstance(children, list):
+                        for child in reversed(children):
+                            if not isinstance(child, dict):
+                                continue
+                            # The nearest title only: a path would grow with
+                            # the depth, and the depth is the submitter's.
+                            stack.append((child, _first_str(child, "title")
+                                          or _cc_display(child.get("code"))
+                                          or "Untitled section"))
                 empty_reason = narrative = None
                 if not items:
-                    empty_reason = _cc_display(section.get("emptyReason"))
+                    empty_reason = _cc_display(section.get("emptyReason")) or (
+                        sub_reasons[0] if sub_reasons and not sub_texts else None)
                     if empty_reason:
                         empty_reason = EMPTY_REASON_LABELS.get(
                             _squash(empty_reason), empty_reason
@@ -1531,7 +1801,8 @@ def summarize_bundle(bundle) -> dict:
                         # No entries and no reason for the lack: the section's
                         # content is its narrative (a patient story), so the
                         # views show that rather than "No entries".
-                        narrative = _section_narrative(section)
+                        narrative = _section_narrative(section) or (
+                            "\n".join(sub_texts) or None)
                 summary["sections"].append(
                     {
                         "title": title,
@@ -1554,6 +1825,22 @@ def summarize_bundle(bundle) -> dict:
                     seen.add(id(target))
                     reachable.add(id(target))
                     queue.append(target)
+    elif bundle.get("type") != "document":
+        # A collection - a prescription travels as one - has no Composition for
+        # its entries to be orphaned from. Its clinical entries are its
+        # content; the rest (the prescriber, the RequestGroup tying the orders
+        # together) are their context, as an author is a document's. A bundle
+        # with no clinical entry at all shows what it has rather than nothing.
+        content = [e["resource"] for e in entries
+                   if e["resource"].get("resourceType") not in ("Composition", "Patient")]
+        items = [_render_resource(r, by_ref) for r in content
+                 if r.get("resourceType") in ITEM_CATEGORIES]
+        items = items or [_render_resource(r, by_ref) for r in content]
+        if items:
+            summary["sections"].append({"title": "Entries", "kind": "other",
+                                        "items": items, "empty_reason": None,
+                                        "narrative": None})
+        reachable = {id(e["resource"]) for e in entries}
     for entry in entries:
         resource = entry["resource"]
         if resource.get("resourceType") in ("Composition", "Patient"):
@@ -1615,12 +1902,15 @@ def _meta_profiles(resource) -> list[str]:
         return []
     meta = resource.get("meta")
     claimed = meta.get("profile") if isinstance(meta, dict) else None
-    return [c.split("|", 1)[0] for c in claimed or [] if isinstance(c, str)]
+    if not isinstance(claimed, list):
+        return []
+    return [c.split("|", 1)[0] for c in claimed if isinstance(c, str)]
 
 
 def _composition_type_codes(bundle: dict) -> set[str]:
     """LOINC codes on the first Composition's type, for identifying a document."""
-    for entry in bundle.get("entry") or []:
+    entries = bundle.get("entry")
+    for entry in entries if isinstance(entries, list) else []:
         resource = entry.get("resource") if isinstance(entry, dict) else None
         if not isinstance(resource, dict):
             continue
@@ -1630,7 +1920,7 @@ def _composition_type_codes(bundle: dict) -> set[str]:
         codings = ctype.get("coding") if isinstance(ctype, dict) else None
         return {
             c["code"]
-            for c in codings or []
+            for c in (codings if isinstance(codings, list) else [])
             if isinstance(c, dict)
             and isinstance(c.get("code"), str)
             and c.get("system") == "http://loinc.org"
@@ -4415,6 +4705,7 @@ def ui_document(doc_id: str) -> dict:
         raw = read_sample_bytes(doc_id)
         if raw is None:
             raise HTTPException(404, detail="Unknown sample")
+        bundle = _loads_or_none(raw)
         return {
             "id": meta["id"],
             "team": meta["name"],
@@ -4426,7 +4717,10 @@ def ui_document(doc_id: str) -> dict:
             "score": None,
             "bundle_readable": True,
             "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
-            "summary": safe_summary(_loads_or_none(raw)),
+            # What the views may expect of it: a lab report or a prescription
+            # has no allergy section to be missing.
+            "doc_type": detect_document(bundle)["id"],
+            "summary": safe_summary(bundle),
         }
     if not doc_id.isdigit():
         raise HTTPException(404, detail="Unknown document")
@@ -4449,6 +4743,7 @@ def ui_document(doc_id: str) -> dict:
         # The stored verdict stands even when the file no longer parses, so say
         # so explicitly: an empty summary otherwise reads as an empty document.
         "bundle_readable": bundle is not None,
+        "doc_type": row["doc_type"],
         "summary": safe_summary(bundle),
     }
 
@@ -4471,6 +4766,7 @@ async def ui_preview(request: Request) -> dict:
         "ts": None,
         "preview": True,
         "bundle_readable": True,
+        "doc_type": detect_document(bundle)["id"],
         "summary": safe_summary(bundle),
     }
 
@@ -4957,9 +5253,12 @@ select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   border-radius: var(--r-card); padding: 14px 16px; margin: 12px 0 6px; }
 .patient-name { font-size: var(--fs-large); }
 h3.cv-sec { margin: 22px 0 4px; font-size: var(--fs-large); }
+h4.cv-subsec { margin: 12px 0 0; font-size: 0.95rem; }
 .cv-items { list-style: none; padding: 0; margin: 4px 0 10px; }
 .cv-items li { padding: 8px 2px; border-bottom: 1px solid var(--border); }
 .cv-items li:last-child { border-bottom: none; }
+.cv-lines { margin: 4px 0 2px; padding-left: 18px; font-size: 0.85rem; }
+.cv-items .cv-lines li, .cv-lines li { padding: 1px 0; border-bottom: none; }
 .cv-label { font-weight: 600; }
 .cv-detail { font-size: 0.85rem; }
 .cv-note, .tl-note { font-style: italic; }
@@ -5538,7 +5837,7 @@ function submissionRow(e) {
   return { id: e.id, ts: e.recorded, team: e.organization,
            team_slug: e.organizationSlug, pass: e.pass, score: e.score,
            errors: e.errors, warnings: e.warnings, sections: e.sections,
-           resources: e.resources };
+           resources: e.resources, doc_type: e.documentType };
 }
 function partnerRow(e) {
   return { team: e.organization, team_slug: e.organizationSlug,
@@ -6806,12 +7105,15 @@ async function renderCvList() {
     return;
   }
   box.innerHTML = '<div class="table-wrap"><table><thead><tr>'
-    + '<th scope="col">Time</th><th scope="col">Status</th><th scope="col">Score</th>'
+    + '<th scope="col">Time</th><th scope="col">Type</th>'
+    + '<th scope="col">Status</th><th scope="col">Score</th>'
     + '<th scope="col">Sections</th><th scope="col">Resources</th>'
     + "</tr></thead><tbody>"
     + subs.map((s) => '<tr class="cv-row" data-id="' + s.id
       + '" title="click to open"><td><a class="cv-open" href="#clinical/submission/'
       + s.id + '">' + new Date(s.ts).toLocaleString() + "</a></td>"
+      + '<td><span class="cat-chip" title="' + esc(docLabel(s.doc_type)) + '">'
+      + esc(docShort(s.doc_type)) + "</span></td>"
       + "<td>" + (s.pass ? '<span class="badge pass">VALID</span>'
                          : '<span class="badge fail">INVALID</span>') + "</td>"
       + "<td><strong>" + s.score + "</strong></td>"
@@ -6900,8 +7202,17 @@ function cvItemHtml(item) {
     + (item.status ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
     + chips
     + (item.detail ? '<div class="cv-detail muted">' + esc(item.detail) + "</div>" : "")
+    + cvLinesHtml(item)
     + (item.note ? '<div class="cv-note muted">' + esc(item.note) + "</div>" : "")
     + "</li>";
+}
+
+/* A plan's steps or a team's members - the part a reader acts on. */
+function cvLinesHtml(item) {
+  return (item.lines || []).length
+    ? '<ul class="cv-lines">' + item.lines.map((l) => "<li>" + esc(l) + "</li>").join("")
+      + "</ul>"
+    : "";
 }
 
 /* ---- shared helpers for the clinician renderings ---- */
@@ -7001,6 +7312,7 @@ function viewTimeline(d) {
         + (i.status ? " &middot; " + esc(i.status) : "") + "</div>"
         + '<div class="tl-label">' + esc(i.label || "Unnamed item") + cvChips(i) + "</div>"
         + (i.detail ? '<div class="tl-detail">' + esc(i.detail) + "</div>" : "")
+        + cvLinesHtml(i)
         + (i.note ? '<div class="tl-detail tl-note">' + esc(i.note) + "</div>" : "")
         + "</div>";
     });
@@ -7138,12 +7450,16 @@ function viewDashboard(d) {
           : '<div class="db-sub">Positively asserted by the author - safe to'
             + " rely on.</div>");
     aCls = orphanAllergies.length ? "alert" : "good";
+  } else if (d.doc_type && d.doc_type !== "eps") {
+    /* Only a patient summary has to say something about allergies; flagging a
+       lab report or a prescription for its silence flags it for what it is. */
+    aBody = null;
   } else {
     aBody = '<div class="db-big">Unknown</div><div class="db-sub">Neither an allergy'
       + " nor a statement that none is known.</div>";
     aCls = "alert";
   }
-  h += dbCard("Allergies and intolerances", aBody, aCls);
+  if (aBody) h += dbCard("Allergies and intolerances", aBody, aCls);
 
   const active = problems.filter((x) => hasFlag(x, "active"));
   h += dbCard("Problems",
@@ -7262,7 +7578,18 @@ function viewDocument(d) {
   for (const sec of s.sections || []) {
     html += '<h3 class="cv-sec">' + esc(sec.title || "Untitled section") + "</h3>";
     if (sec.items && sec.items.length) {
-      html += '<ul class="cv-items">' + sec.items.map(cvItemHtml).join("") + "</ul>";
+      // a section's own entries come first, then each sub-section's (a lab
+      // report's "Blood examinations") under its own sub-heading
+      const runs = [];
+      sec.items.forEach((it) => {
+        const sub = it.subsection || null;
+        if (!runs.length || runs[runs.length - 1].sub !== sub) runs.push({ sub, items: [] });
+        runs[runs.length - 1].items.push(it);
+      });
+      runs.forEach((r) => {
+        html += (r.sub ? '<h4 class="cv-subsec">' + esc(r.sub) + "</h4>" : "")
+          + '<ul class="cv-items">' + r.items.map(cvItemHtml).join("") + "</ul>";
+      });
     } else if (sec.narrative) {
       // a section that is its narrative (a patient story): the prose is the
       // content, shown as written
@@ -7323,8 +7650,11 @@ function renderClinicalDoc(d) {
       + " time; nothing under it was read from the file.</div>";
   }
   html += cvModesHtml();
-  html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
-  html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
+  // what kind of document this is, in the title when it has none of its own
+  html += "<h2>" + esc(comp.title || docLabel(d.doc_type || "eps")) + "</h2>";
+  html += '<p class="muted" style="margin:2px 0 0">'
+    + (comp.title && d.doc_type ? esc(docLabel(d.doc_type)) + " &middot; " : "")
+    + esc(d.team)
     + (d.preview
         ? " of " + esc(d.filename || "pasted JSON")
           + " &middot; not uploaded, validated or scored"

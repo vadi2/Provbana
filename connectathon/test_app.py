@@ -804,6 +804,47 @@ def test_item_gaps_flag_missing_dose_and_date():
     assert problem["gaps"] == ["not coded", "no date"]
 
 
+def test_a_structured_dose_is_a_dose():
+    """An MPD prescription states its dose only in doseAndRate and
+    timing.repeat; reading text alone flagged every medicine "no dose"."""
+    def med(*dosage):
+        return {"resourceType": "MedicationRequest", "id": "m", "status": "active",
+                "medicationCodeableConcept": {"text": "x"}, "dosageInstruction": list(dosage)}
+    tablet = {"value": 4, "unit": "Tablet", "system": "http://snomed.info/sct"}
+    cases = [
+        ({"doseAndRate": [{"doseQuantity": tablet}], "timing": {"repeat": {
+            "frequency": 1, "period": 1, "periodUnit": "d", "when": ["EVE.late"],
+            "boundsDuration": {"value": 42, "unit": "day", "code": "d"}}}},
+         "4 Tablet, every day, late evening, for 42 days"),
+        ({"doseAndRate": [{"doseQuantity": {"value": 1, "unit": "{tbl}"}}],
+          "timing": {"repeat": {"frequency": 2, "period": 1, "periodUnit": "d"}},
+          "asNeededBoolean": False}, "1 tbl, 2x per day"),
+        ({"doseAndRate": [{"doseRange": {"low": {"value": 1, "unit": "mg"},
+                                         "high": {"value": 2, "unit": "mg"}}}],
+          "timing": {"repeat": {"frequency": 1, "period": 4, "periodMax": 6,
+                                "periodUnit": "h"}},
+          "asNeededCodeableConcept": {"text": "pain"}},
+         "1-2 mg, every 4-6 hours, as needed for pain"),
+        ({"timing": {"repeat": {"frequency": 1, "frequencyMax": 2, "period": 1,
+                                "periodUnit": "wk", "dayOfWeek": ["mon", "thu"],
+                                "timeOfDay": ["08:00:00"],
+                                "boundsPeriod": {"start": "2025-01-01"}}},
+          "asNeededBoolean": True},
+         "1-2x per week, on mon, thu, at 08:00, from 2025-01-01, as needed"),
+        ({"doseAndRate": [{"doseQuantity": {"value": 500, "unit": "mL"},
+                           "rateQuantity": {"value": 100, "unit": "mL/h"}}],
+          "timing": {"repeat": {"boundsDuration": {"value": 1, "code": "d"}}}},
+         "500 mL, at 100 mL/h, for 1 day"),
+    ]
+    for dosage, expected in cases:
+        item = _items(_doc("10160-0", "Medication", med(dosage)))[0]
+        assert item["detail"] == expected, (dosage, item["detail"])
+        assert "no dose" not in item["gaps"], dosage
+    # still a gap when nothing at all is said about the dose
+    bare = _items(_doc("10160-0", "Medication", med({"asNeededBoolean": False})))[0]
+    assert "no dose" in bare["gaps"]
+
+
 def test_observation_abnormal_flag_and_missing_value():
     bundle = {"resourceType": "Bundle", "entry": [
         {"fullUrl": "urn:uuid:c",
@@ -827,6 +868,42 @@ def test_observation_abnormal_flag_and_missing_value():
     assert hb["flags"] == ["abnormal"] and hb["code_system"] == "LOINC"
     assert hb["gaps"] == []
     assert set(mood["gaps"]) == {"not coded", "no date", "no value"}
+
+
+def test_observation_values_keep_comparator_ratio_and_range():
+    """"<5 mg/L" read as "5 mg/L" is a measured value that was never measured,
+    and a valid titre or range must not be flagged as missing its value."""
+    def obs(**value):
+        return {"resourceType": "Observation", "status": "final",
+                "code": {"text": "x"}, **value}
+    cases = [
+        (obs(valueQuantity={"value": 5, "comparator": "<", "unit": "mg/L"}), "<5 mg/L"),
+        (obs(valueQuantity={"value": 90, "comparator": ">", "unit": "mL/min"}),
+         ">90 mL/min"),
+        (obs(valueRatio={"numerator": {"value": 1}, "denominator": {"value": 64}}),
+         "1:64"),
+        (obs(valueRatio={"numerator": {"value": 5, "unit": "mg"},
+                         "denominator": {"value": 1, "unit": "mL"}}), "5 mg / 1 mL"),
+        (obs(valueRange={"low": {"value": 2, "unit": "mmol/L"},
+                         "high": {"value": 4, "unit": "mmol/L"}}), "2-4 mmol/L"),
+        (obs(valueRange={"low": {"value": 2, "unit": "mmol/L"}}), ">=2 mmol/L"),
+        (obs(valueRange={"high": {"value": 4}}), "<=4"),
+        (obs(valueDateTime="2025-03-04"), "2025-03-04"),
+        (obs(valueTime="08:30:00"), "08:30:00"),
+        (obs(valuePeriod={"start": "2025-01-01", "end": "2025-02-01"}),
+         "2025-01-01 to 2025-02-01"),
+        (obs(valueSampledData={"origin": {"value": 0}, "period": 10,
+                               "dimensions": 1, "data": "1 2 3"}), "sampled data"),
+        (obs(component=[{"code": {"text": "Systolic"}, "valueQuantity": {
+            "value": 140, "comparator": ">=", "unit": "mmHg"}},
+                        {"code": {"text": "Titre"}, "valueRatio": {
+            "numerator": {"value": 1}, "denominator": {"value": 8}}}]),
+         "Systolic >=140 mmHg, Titre 1:8"),
+    ]
+    for resource, expected in cases:
+        item = _items(_doc("30954-2", "Results", dict(resource, id="o")))[0]
+        assert item["detail"] == expected, (resource, item["detail"])
+        assert "no value" not in item["gaps"], resource
 
 
 def test_summary_quality_block():
@@ -926,6 +1003,75 @@ def test_submission_detail_and_raw_bundle(client, monkeypatch):
     assert raw.status_code == 200
     assert raw.headers["content-type"].startswith("application/fhir+json")
     assert raw.json()["resourceType"] == "Bundle"
+
+
+def test_the_clinical_view_knows_what_kind_of_document_it_shows(client, monkeypatch):
+    """A prescription is not a patient summary: the views need the type to stop
+    flagging it for the allergy section only a summary has to carry."""
+    token = register(client, "Alpha")
+    with open(os.path.join(os.path.dirname(__file__), "examples", "mpd-example.json"),
+              "rb") as fh:
+        mpd = fh.read()
+    submit(client, token, outcome(), monkeypatch, body=mpd)
+    sub_id = param_entries(client.get("/fhir/$submissions"))[0]["id"]
+    detail = client.get(f"/ui/documents/{sub_id}").json()
+    assert detail["doc_type"] == "mpd"
+    assert client.post("/ui/preview", content=mpd).json()["doc_type"] == "mpd"
+    assert client.post("/ui/preview", content=CLINICAL_BODY).json()["doc_type"] == "eps"
+    assert client.get("/ui/documents/arne-complex-care").json()["doc_type"] == "eps"
+    # a collection has no Composition to orphan its entries from: the three
+    # orders are its content, the prescriber and RequestGroup their context
+    summary = detail["summary"]
+    assert [(s["title"], len(s["items"])) for s in summary["sections"]] == [("Entries", 3)]
+    assert summary["unreferenced"] == []
+    text = client.get("/").text
+    assert 'esc(comp.title || docLabel(d.doc_type || "eps"))' in text
+    assert '} else if (d.doc_type && d.doc_type !== "eps") {' in text
+    assert "if (aBody) h += dbCard(" in text
+
+
+def test_a_company_document_list_shows_each_type(client, monkeypatch):
+    """A lab report, a prescription and a summary from one company must not
+    look alike in its list - the API says which is which, so the row does."""
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("mpd"))
+    entry, = param_entries(client.get("/fhir/$submissions"))
+    assert entry["documentType"] == "mpd"
+    text = client.get("/").text
+    row = text[text.index("function submissionRow("):text.index("function partnerRow(")]
+    assert "doc_type: e.documentType" in row
+    body = text[text.index("async function renderCvList("):]
+    body = body[:body.index("\n}\n")]
+    assert '<th scope="col">Type</th>' in body
+    assert "esc(docShort(s.doc_type))" in body
+
+
+def test_a_document_bundle_without_a_composition_still_reports_orphans():
+    """Only a bundle that is not a document reads as a list of entries; a
+    document that lost its Composition is broken, and says so."""
+    s = app_module.summarize_bundle({"resourceType": "Bundle", "type": "document",
+                                     "entry": [{"resource": {"resourceType": "Condition"}}]})
+    assert s["sections"] == [] and len(s["unreferenced"]) == 1
+
+
+def test_a_collection_with_nothing_clinical_shows_what_it_has():
+    s = app_module.summarize_bundle({"resourceType": "Bundle", "type": "collection",
+                                     "entry": [{"resource": {"resourceType": "Patient"}},
+                                               {"resource": {"resourceType": "DiagnosticReport",
+                                                             "code": {"text": "CT head"}}}]})
+    assert [[i["label"] for i in sec["items"]] for sec in s["sections"]] == [["CT head"]]
+    assert s["unreferenced"] == []
+
+
+@pytest.mark.parametrize("bundle", [
+    {"resourceType": "Bundle", "meta": {"profile": 5}},
+    {"resourceType": "Bundle", "entry": 5},
+    {"resourceType": "Bundle", "entry": [{"resource": {
+        "resourceType": "Composition", "type": {"coding": 5}}}]},
+])
+def test_document_detection_survives_malformed_fields(client, bundle):
+    assert app_module.detect_document(bundle)["id"] == "eps"
+    assert client.post("/ui/preview", json=bundle).status_code == 200
 
 
 def test_submission_404s(client, monkeypatch):
@@ -1433,6 +1579,55 @@ def test_a_section_with_no_entry_and_no_empty_reason_asserts_nothing():
         {"title": "Allergies"})))
     assert s["sections"][0]["items"] == []
     assert s["sections"][0]["empty_reason"] is None
+
+
+def test_sub_section_entries_belong_to_their_top_level_section():
+    """A lab report keeps every result in a sub-section. Dropping them left a
+    valid report showing a heading and nothing else, in every view."""
+    ref = lambda i: [{"reference": f"urn:uuid:res-{i}"}]
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Laboratory examinations", "entry": ref(0),
+         "text": {"div": "<div>Laboratory examinations</div>"}, "section": [
+            {"title": "Urine", "entry": ref(1), "section": [
+                {"code": {"text": "Sediment"}, "entry": ref(2)}]},
+            "not a section",
+            {"title": "Blood", "entry": ref(3)}]},
+        {"title": "Empty parent", "section": [{"title": "Nothing here"}]},
+        resources=4)))
+    lab, empty = s["sections"]
+    assert [(i["label"], i.get("subsection")) for i in lab["items"]] == [
+        ("observation 0", None), ("observation 1", "Urine"),
+        ("observation 2", "Sediment"), ("observation 3", "Blood")]
+    assert lab["narrative"] is None
+    assert empty["items"] == []
+    assert s["unreferenced"] == []
+    assert s["quality"]["items"] == 4
+
+
+def test_an_empty_section_speaks_through_its_sub_sections():
+    """With nothing of its own, a section's content is what its sub-sections
+    say: their prose, or their positive "nothing to report"."""
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Results", "section": [
+            {"title": "Comment", "text": {"div": "<div>Sample haemolysed</div>"}},
+            {"title": "Blood", "emptyReason": {"coding": [{"code": "nilknown"}]}}]},
+        {"title": "Allergies", "section": [
+            {"title": "Drug", "emptyReason": {"coding": [{"code": "nilknown"}]},
+             "text": {"div": "<div>No known drug allergies</div>"}}]},
+        {"title": "Problems", "text": {"div": "<div>See letter</div>"},
+         "section": [{"title": "Old", "text": {"div": "<div>Ignored</div>"}}]})))
+    results, allergies, problems = s["sections"]
+    assert (results["narrative"], results["empty_reason"]) == (
+        "Comment\nSample haemolysed", None)
+    assert (allergies["narrative"], allergies["empty_reason"]) == (None, "None reported")
+    assert problems["narrative"] == "See letter"
+
+
+def test_document_view_heads_each_sub_section(client):
+    text = client.get("/").text
+    body = text[text.index("function viewDocument("):text.index("const CV_VIEWS")]
+    assert "it.subsection" in body
+    assert '<h4 class="cv-subsec">' in body
 
 
 def test_empty_sections_never_earn_points(client, monkeypatch):
@@ -2496,6 +2691,78 @@ def test_care_plan_shows_the_activity_not_the_plan(client):
     assert plan["status"] == "cancelled"
     assert "plan since" in plan["detail"]
     assert plan["note"]
+
+
+def test_ville_airway_plan_shows_its_steps_and_who_to_ring(client):
+    """The airway plan is what the Ville scenario turns on: every step of it,
+    the plan's own status rather than its first step's, and the Karolinska
+    team it names."""
+    summary = client.get("/ui/documents/ville-difficult-airway").json()["summary"]
+    items = [i for sec in summary["sections"] for i in sec["items"]]
+    airway = next(i for i in items if i["label"].startswith("Luftvägsplan"))
+    assert airway["status"] == "active"
+    assert len(airway["lines"]) == 5
+    assert airway["lines"][2].startswith("Förstahandsval: nasal fiberoptisk intubation")
+    infection = next(i for i in items if i["label"].startswith("Infektionsplan"))
+    assert infection["lines"][0].startswith("Vid feber över 38,5")
+    # three plans name the team; it is shown once, right after the first
+    teams = [i for i in items if i["label"] == "Villes vårdteam på Karolinska"]
+    assert len(teams) == 1 and items.index(teams[0]) == items.index(airway) + 1
+    team = teams[0]
+    assert team["detail"] == "phone +46 8 000 00 10"
+    assert team["lines"][0] == "Dr Hanna Ekholm, Barnreumatolog, patientansvarig läkare"
+    assert "barnanestesijouren +46 8 000 00 11" in team["note"]
+    assert "not coded" not in team["gaps"]
+    text = client.get("/").text
+    assert text.count("+ cvLinesHtml(") == 2      # document and timeline rows
+
+
+def test_the_banner_shows_the_current_name_not_the_first_listed():
+    """A maiden name listed first is still a former name."""
+    def name(names):
+        return app_module._patient_summary({"name": names})["name"]
+    maiden = {"use": "old", "family": "Maidenname", "given": ["Eva"]}
+    official = {"use": "official", "family": "Current", "given": ["Eva"]}
+    assert name([maiden, official]) == "Eva Current"
+    assert name([{"use": "nickname", "text": "Evi"}, {"text": "Eva Current"}]) == "Eva Current"
+    assert name([{"family": "Ended", "period": {"end": "2010-01-01"}},
+                 {"family": "Now"}]) == "Now"
+    assert name([{"text": "Eva Usual", "use": "usual"}, official]) == "Eva Current"
+    # with only a former name, that is still better than none
+    assert name([maiden, {"use": "official"}, "junk"]) == "Eva Maidenname"
+    assert name([{"use": "official", "given": ["A"]}, {"use": "official", "given": ["B"]}]) == "A"
+    assert name("junk") is None
+
+
+def test_a_plan_step_carries_its_own_news():
+    """In a plan of several steps, a cancelled one says so beside it; a team
+    member with no display is named from the resource it points at."""
+    plan = {"resourceType": "CarePlan", "id": "cp", "status": "active",
+            "intent": "plan", "title": "Follow-up", "activity": [
+                {"detail": {"status": "scheduled", "description": "Bloods",
+                            "scheduledString": "monthly"}},
+                {"detail": {"status": "cancelled", "code": {"text": "Echo"}}},
+                {"detail": {"status": "not-started", "description": "Follow-up"}},
+                "junk", {"detail": "junk"}],
+            "careTeam": [{"reference": "CareTeam/t"}, {"reference": "CareTeam/t"},
+                         {"reference": "Patient/p"}, "junk"]}
+    team = {"resourceType": "CareTeam", "id": "t", "participant": [
+        {"member": {"reference": "Practitioner/dr"}},
+        {"role": [{"text": "Nurse"}]}, "junk"],
+        "telecom": [{"value": "123"}, {"system": "email"}]}
+    bundle = _doc("18776-5", "Plan of care", plan)
+    bundle["entry"] += [{"resource": team}, {"resource": {
+        "resourceType": "Practitioner", "id": "dr",
+        "name": [{"given": ["Ann"], "family": "Berg"}]}}]
+    items = _items(bundle)
+    assert [i["label"] for i in items] == ["Follow-up", "Care team"]
+    assert items[0]["status"] == "active"
+    assert items[0]["lines"] == ["Bloods (scheduled monthly)", "Echo (cancelled)"]
+    assert items[1]["lines"] == ["Ann Berg", "Nurse"]
+    assert items[1]["detail"] == "123"
+    # a section that also lists the team itself does not get it twice
+    bundle["entry"][0]["resource"]["section"][0]["entry"].append({"reference": "CareTeam/t"})
+    assert [i["label"] for i in _items(bundle)] == ["Follow-up", "Care team"]
 
 
 def test_device_use_shows_when_the_device_went_in(client):
