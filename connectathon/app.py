@@ -157,7 +157,9 @@ EHDS_DOCUMENTS = [
         "igs": ["hl7.fhir.eu.mpd#1.0.0"],
         "bundles": [],
         "loinc": [],
-        # What an entry has to claim for a bundle to be read as MPD.
+        # What an entry has to claim for a bundle to be read as MPD. For MPD
+        # alone, require_entry_profile_claims() also demands that every
+        # MedicationRequest/MedicationDispense claims one of these.
         "entry_profiles": [
             "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd",
             "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd",
@@ -2015,12 +2017,13 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
     and it resolves `|1.0` to that too. A bare major, `|1`, it reports as
     "could not be found".
 
-    A no-op for every category with no `entry_profiles`: they are checked
-    against a bundle profile of their own.
+    MPD-specific: a no-op for every other category, even one that comes to
+    have `entry_profiles`, as they are checked against a bundle profile of
+    their own.
     """
-    claims = set(doc.get("entry_profiles") or ())
-    if not claims:
+    if doc.get("id") != "mpd":
         return outcome
+    claims = set(doc["entry_profiles"])
     loaded = {ig.split("#", 1)[1] for ig in doc["igs"] if "#" in ig}
 
     def checked_claim(resource) -> bool:

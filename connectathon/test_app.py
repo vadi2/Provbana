@@ -5618,6 +5618,12 @@ def test_the_mpd_claim_check_leaves_other_categories_alone():
     for doc_id in ("eps", "laboratory", "imaging"):
         doc = app_module.DOCUMENTS_BY_ID[doc_id]
         assert app_module.require_entry_profile_claims(oc, body, doc) is oc
+    # Even one that comes to be detected by its entries' profiles: the order
+    # requirement is MPD's, not something `entry_profiles` brings along.
+    imaging = dict(app_module.DOCUMENTS_BY_ID["imaging"], entry_profiles=[
+        "http://example.org/StructureDefinition/ImagingStudy-x"])
+    body = doc_bundle(comp_type="18748-4", resources=("ImagingStudy",))
+    assert app_module.require_entry_profile_claims(oc, body, imaging) is oc
 
 
 def test_naming_a_versioned_profile_settles_the_category_too(client, monkeypatch):
