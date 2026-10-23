@@ -1564,7 +1564,8 @@ NAME_USE_RANK = {"official": 0, "usual": 1, None: 2, "temp": 2, "nickname": 3,
 
 
 def _human_name(names) -> str | None:
-    """The current name out of a HumanName list, as text."""
+    """The current name out of a HumanName list, as text - or, with no
+    current one, the best of the rest."""
     if not isinstance(names, list):
         return None
     today = datetime.now(timezone.utc).date().isoformat()
