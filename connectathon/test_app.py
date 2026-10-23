@@ -1409,6 +1409,24 @@ def test_sub_section_entries_belong_to_their_top_level_section():
     assert s["quality"]["items"] == 4
 
 
+def test_an_empty_section_speaks_through_its_sub_sections():
+    """With nothing of its own, a section's content is what its sub-sections
+    say: their prose, or their positive "nothing to report"."""
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Results", "section": [
+            {"title": "Comment", "text": {"div": "<div>Sample haemolysed</div>"}},
+            {"title": "Blood", "emptyReason": {"coding": [{"code": "nilknown"}]}}]},
+        {"title": "Allergies", "section": [
+            {"title": "Drug", "emptyReason": {"coding": [{"code": "nilknown"}]}}]},
+        {"title": "Problems", "text": {"div": "<div>See letter</div>"},
+         "section": [{"title": "Old", "text": {"div": "<div>Ignored</div>"}}]})))
+    results, allergies, problems = s["sections"]
+    assert (results["narrative"], results["empty_reason"]) == (
+        "Comment\nSample haemolysed", None)
+    assert (allergies["narrative"], allergies["empty_reason"]) == (None, "None reported")
+    assert problems["narrative"] == "See letter"
+
+
 def test_document_view_heads_each_sub_section(client):
     text = client.get("/").text
     body = text[text.index("function viewDocument("):text.index("const CV_VIEWS")]

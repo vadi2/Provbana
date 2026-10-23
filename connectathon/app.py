@@ -1523,9 +1523,19 @@ def summarize_bundle(bundle) -> dict:
                 # belong to the top-level section, tagged with the sub-section
                 # they came from. Depth-first in document order, and iterative
                 # for the same reason as _collect_references.
+                # Their narratives and emptyReasons speak for the section too
+                # when it has nothing of its own.
+                sub_texts, sub_reasons = [], []
                 stack = [(section, None)]
                 while stack:
                     node, sub = stack.pop()
+                    if sub:
+                        text = _section_narrative(node)
+                        if text and not isinstance(node.get("entry"), list):
+                            sub_texts.append(f"{sub}\n{text}")
+                        reason = _cc_display(node.get("emptyReason"))
+                        if reason:
+                            sub_reasons.append(reason)
                     refs = node.get("entry")
                     if isinstance(refs, list):
                         for ref_entry in refs:
@@ -1549,7 +1559,8 @@ def summarize_bundle(bundle) -> dict:
                                           or "Untitled section"))
                 empty_reason = narrative = None
                 if not items:
-                    empty_reason = _cc_display(section.get("emptyReason"))
+                    empty_reason = _cc_display(section.get("emptyReason")) or (
+                        sub_reasons[0] if sub_reasons and not sub_texts else None)
                     if empty_reason:
                         empty_reason = EMPTY_REASON_LABELS.get(
                             _squash(empty_reason), empty_reason
@@ -1558,7 +1569,8 @@ def summarize_bundle(bundle) -> dict:
                         # No entries and no reason for the lack: the section's
                         # content is its narrative (a patient story), so the
                         # views show that rather than "No entries".
-                        narrative = _section_narrative(section)
+                        narrative = _section_narrative(section) or (
+                            "\n".join(sub_texts) or None)
                 summary["sections"].append(
                     {
                         "title": title,
