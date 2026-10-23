@@ -2585,10 +2585,12 @@ def test_openapi_documents_what_the_server_really_sends(client):
     assert "404" in spec["paths"]["/fhir/Endpoint/{endpoint_id}"]["get"]["responses"]
     assert "401" in spec["paths"]["/fhir/Endpoint"]["post"]["responses"]
     assert "401" not in spec["paths"]["/fhir/Endpoint"]["get"]["responses"]
-    # a Binary is the image, as whichever type its bytes proved
+    # a Binary is the image, as whichever type its bytes proved, or a Binary
+    # resource for a client that asks for FHIR JSON
     binary = spec["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
     assert set(binary["content"]) == {
-        app_module.sniff_image(raw)[0] for raw in (png_bytes(), JPEG, WEBP)}
+        app_module.sniff_image(raw)[0] for raw in (png_bytes(), JPEG, WEBP)
+    } | {"application/fhir+json"}
 
 
 def test_openapi_leaves_the_ui_out(client):

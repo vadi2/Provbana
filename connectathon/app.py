@@ -9041,6 +9041,8 @@ def custom_openapi() -> dict:
     binary["content"] = {
         mime: {"schema": {"type": "string", "format": "binary"}} for mime in BINARY_TYPES
     }
+    # Asked for as FHIR JSON, the same read is a Binary resource instead.
+    binary["content"][FHIR_JSON] = {"schema": {"type": "object"}}
     submit = schema["paths"]["/fhir/Bundle/$validate"]["post"]["responses"]["200"]
     submit["description"] = "The Matchbox OperationOutcome for this bundle."
     submit["content"] = {"application/fhir+json": {"schema": {"type": "object"}}}
