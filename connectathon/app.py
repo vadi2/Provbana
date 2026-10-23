@@ -2399,7 +2399,7 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
     # row however many bundles there are, and a scanner's thousand made-up
     # paths are one "(no route)" row rather than a thousand.
     route = getattr(request.scope.get("route"), "path", None) or "(no route)"
-    method = request.method
+    method = "HEAD" if request.scope.get(HEAD_AS_GET) else request.method
     # Caddy overwrites X-Real-IP with the connecting address, so it cannot be
     # forged from outside; locally there is no Caddy and the socket says.
     address = request.headers.get("x-real-ip") or (
@@ -2416,13 +2416,66 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
                      method=method, route=route, status=status)
 
 
+# Set on the scope of a HEAD answered as a GET, so the usage log still says HEAD.
+HEAD_AS_GET = "connectathon.head_as_get"
+
+
+class HeadAsGet:
+    """HEAD is GET without the body (RFC 9110), on every route that has a GET.
+
+    FastAPI registers only the methods a route names, so without this an
+    uptime checker or a link preview gets a 405 for the front page. Answered
+    as the GET would be, headers and all, with the body dropped here rather
+    than left to the server: uvicorn only drops it for a scope that still
+    says HEAD. Added last, so it wraps the other middleware and they see a GET.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] != "HEAD":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_without_body(message) -> None:
+            if message["type"] == "http.response.body":
+                message = dict(message, body=b"")
+            await send(message)
+
+        await self.app(dict(scope, method="GET", **{HEAD_AS_GET: True}),
+                       receive, send_without_body)
+
+
+app.add_middleware(HeadAsGet)
+
+
 # ------------------------------------------------------------ FHIR plumbing
 
 FHIR_JSON = "application/fhir+json"
-# The service's own canonical base, used in CapabilityStatement and in the
-# fullUrls of any searchset. Relative URLs would be ambiguous the moment a
-# response is saved to disk or passed to a second tool.
+# The path the FHIR API hangs off. CapabilityStatement and the fullUrls of a
+# searchset need the base absolute - a relative URL is ambiguous the moment a
+# response is saved to disk or passed to a second tool, and R4 forbids one in
+# fullUrl - so those take fhir_base(), which puts the origin in front.
 FHIR_BASE = "/fhir"
+
+
+def fhir_base(request: Request) -> str:
+    """The absolute FHIR base, as the client reached it.
+
+    Taken from the request rather than configured, so localhost and the public
+    name both answer with themselves. Caddy terminates TLS and says so in
+    X-Forwarded-Proto; uvicorn believes that header only from 127.0.0.1, and
+    Caddy is another container, so it is read here.
+    """
+    return str(request.base_url.replace(scheme=_scheme(request))).rstrip("/") \
+        + FHIR_BASE
+
+
+def _scheme(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    return proto if proto in ("http", "https") else request.url.scheme
+
 
 # HTTP status -> the OperationOutcome issue code FHIR asks for. Anything not
 # listed falls back to "processing", the spec's own catch-all, so an
@@ -2525,29 +2578,72 @@ def parameters(pairs) -> dict:
     element *is* the null, and emitting one is invalid.
 
     A list value repeats the parameter, which is how FHIR expresses
-    multiplicity - it has no array type.
+    multiplicity - it has no array type. With nothing to say there is no
+    `parameter` at all: FHIR forbids an empty array as it forbids a null.
     """
-    return {"resourceType": "Parameters", "parameter": _named_params(pairs)}
+    resource = {"resourceType": "Parameters"}
+    named = _named_params(pairs)
+    if named:
+        resource["parameter"] = named
+    return resource
 
 
-def searchset(resources: list, total: int | None = None) -> dict:
+def search_params(request: Request, supported: set[str]) -> list[tuple[str, str]]:
+    """The (name, value) pairs of a search that this server applies, in order.
+
+    FHIR lets a server pass over a parameter it does not know - lenient is the
+    default handling - as long as the self link then shows what was really
+    searched on, which is what these pairs are for. A client that asks for
+    `Prefer: handling=strict` gets the 400 instead. A modifier or a chain is
+    another matter: passed over, `name:text=fab` would answer with every
+    company, so one not supported here is refused either way - FHIR requires
+    that of a modifier, and a chain ignored goes wrong the same way. A blank
+    value is the same as not asking, and is not applied.
+    """
+    # Preference names and values are case-insensitive (RFC 7240).
+    prefer = request.headers.get("prefer", "").lower().replace(" ", "")
+    strict = "handling=strict" in re.split(r"[,;]", prefer)
+    applied = []
+    for name, value in request.query_params.multi_items():
+        if name in supported:
+            if value:
+                applied.append((name, value))
+        elif strict or ":" in name or "." in name:
+            raise HTTPException(
+                400, detail="Search parameter `%s` is not supported here; this "
+                            "search takes %s" % (name, ", ".join(sorted(supported))))
+    return applied
+
+
+def searchset(request: Request, resources: list,
+              applied: list[tuple[str, str]], total: int | None = None) -> dict:
     """A searchset Bundle, which is how FHIR returns a list of resources.
 
     `total` defaults to the number carried, which is right whenever the whole
-    result is in one page - this server never pages, so it always is.
+    result is in one page - this server never pages, so it always is. No
+    match is no `entry`, never an empty one, which FHIR forbids. The self
+    link carries the `applied` parameters only, so a client can see which of
+    the ones it sent were passed over.
     """
-    return {
+    self_url = request.url.replace(
+        scheme=_scheme(request), query=urllib.parse.urlencode(applied, safe=":,/"))
+    bundle = {
         "resourceType": "Bundle",
         "type": "searchset",
         "total": len(resources) if total is None else total,
-        "entry": [
+        "link": [{"relation": "self", "url": str(self_url)}],
+    }
+    if resources:
+        base = fhir_base(request)
+        bundle["entry"] = [
             {
-                "fullUrl": "%s/%s/%s" % (FHIR_BASE, r["resourceType"], r["id"]),
+                "fullUrl": "%s/%s/%s" % (base, r["resourceType"], r["id"]),
                 "resource": r,
+                "search": {"mode": "match"},
             }
             for r in resources
-        ],
-    }
+        ]
+    return bundle
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -2592,6 +2688,20 @@ def validation_error_to_outcome(
         operation_outcome(422, "; ".join(parts) or "Invalid request"),
         status=422,
     )
+
+
+def loads_json(raw: bytes):
+    """json.loads, refusing a lone UTF-16 surrogate as the ValueError every
+    caller already reads as "not valid JSON".
+
+    json.loads turns the escape "\\ud800" into a str that is no Unicode text,
+    and the first thing to encode it - SQLite, compare_digest, the response -
+    raises a 500 long after the parse said yes. Encoding it once here is what
+    finds one, wherever in the document it is.
+    """
+    payload = json.loads(raw)
+    json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return payload
 
 
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
@@ -2727,7 +2837,7 @@ async def parameters_body(request: Request) -> dict:
     """
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "Parameters":
@@ -2852,10 +2962,12 @@ def register(params: dict = Depends(parameters_body)) -> Response:
     ),
 )
 def search_organizations(
+    request: Request,
     name: list[str] | None = Query(None),
     name_contains: list[str] | None = Query(None, alias="name:contains"),
     name_exact: list[str] | None = Query(None, alias="name:exact"),
 ) -> Response:
+    applied = search_params(request, {"name", "name:contains", "name:exact"})
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
@@ -2863,11 +2975,13 @@ def search_organizations(
         endpoints = endpoints_by_team(conn)
     return fhir_response(
         searchset(
+            request,
             [
                 organization_resource(r, endpoints.get(r["id"], ()))
                 for r in rows
                 if name_matches(r["name"], name, name_contains, name_exact)
-            ]
+            ],
+            applied,
         )
     )
 
@@ -2943,7 +3057,7 @@ def validate_bundle(
                 % ", ".join(d["profile"] for d in EHDS_DOCUMENTS),
             )
     try:
-        bundle = json.loads(body)
+        bundle = loads_json(body)
     except (ValueError, UnicodeDecodeError, RecursionError):
         # RecursionError: json rejects deeply nested input by blowing the stack,
         # which is still the client's bad payload, not a server fault.
@@ -3229,7 +3343,7 @@ def leaderboard() -> Response:
 
 def _loads_or_none(raw: bytes):
     try:
-        return json.loads(raw)
+        return loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
 
@@ -3245,6 +3359,23 @@ def safe_summary(bundle) -> dict:
         return summarize_bundle(bundle)
     except Exception:  # noqa: BLE001 - anything at all, by design
         return summarize_bundle(None)
+
+
+ROW_ID = re.compile(r"[0-9]+")
+
+
+def row_id(value: str) -> int | None:
+    """The row id a FHIR id names, or None when it cannot name a row.
+
+    ASCII digits only: str.isdigit() also takes '²', '①' and '١', which int()
+    either refuses or quietly maps onto some other id. And below 2**63, the
+    most SQLite can hold - binding anything larger is an OverflowError, not
+    "no such row".
+    """
+    if not ROW_ID.fullmatch(value):
+        return None
+    number = int(value)
+    return number if number < 2 ** 63 else None
 
 
 def _submission_row(sub_id: int) -> sqlite3.Row | None:
@@ -3470,8 +3601,9 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     slug, which always carries a letter. One space means a partner's document
     and a worked example are fetched exactly the same way.
     """
-    if bundle_id.isdigit():
-        row = _submission_row(int(bundle_id))
+    sub_id = row_id(bundle_id)
+    if sub_id is not None:
+        row = _submission_row(sub_id)
         if row is None:
             return None
         raw = read_submission_bytes(row["team_slug"], row["filename"])
@@ -3479,7 +3611,7 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
             return None
         # The category is in the name so a folder of downloads stays sortable
         # once a team has sent more than patient summaries.
-        return raw, "%s-%s-%s.json" % (row["team_slug"], bundle_id, row["doc_type"])
+        return raw, "%s-%d-%s.json" % (row["team_slug"], sub_id, row["doc_type"])
     raw = read_sample_bytes(bundle_id)
     if raw is None:
         return None
@@ -3496,6 +3628,11 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     ),
 )
 def read_bundle(bundle_id: str) -> Response:
+    # "$validate" fits {bundle_id} too, and Starlette prefers this full match
+    # to the POST route's method mismatch. The router answers PUT with 405 on
+    # its own; GET needs saying here, or it reads as an unknown Bundle.
+    if bundle_id == "$validate":
+        raise HTTPException(405, detail="Method Not Allowed", headers={"Allow": "POST"})
     found = resolve_bundle(bundle_id)
     if found is None:
         raise HTTPException(404, detail="Unknown Bundle")
@@ -3674,7 +3811,12 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
     return resource
 
 
-def fetch_rendering(conn: sqlite3.Connection, rendering_id: int) -> sqlite3.Row | None:
+def fetch_rendering(
+    conn: sqlite3.Connection, rendering_id: int | None
+) -> sqlite3.Row | None:
+    """The rendering with this id; None also for an id row_id() refused."""
+    if rendering_id is None:
+        return None
     return conn.execute(
         RENDERING_SELECT + " WHERE r.id = ?", (rendering_id,)
     ).fetchone()
@@ -3690,7 +3832,7 @@ def read_rendering_bytes(consumer_slug: str, filename: str) -> bytes | None:
 
 
 def owned_rendering(
-    conn: sqlite3.Connection, rendering_id: int, team: sqlite3.Row
+    conn: sqlite3.Connection, rendering_id: int | None, team: sqlite3.Row
 ) -> sqlite3.Row:
     """The rendering, if this team is the one that uploaded it."""
     row = fetch_rendering(conn, rendering_id)
@@ -3731,7 +3873,7 @@ async def docref_body(
             % (size, MAX_IMAGE_BYTES),
         )
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "DocumentReference":
@@ -3868,47 +4010,45 @@ def add_rendering(
     ),
 )
 def list_renderings(
-    related: str | None = None,
-    custodian: str | None = None,
-    author: str | None = None,
+    request: Request,
+    related: list[str] | None = Query(None),
+    custodian: list[str] | None = Query(None),
+    author: list[str] | None = Query(None),
 ) -> Response:
+    applied = search_params(request, {"related", "custodian", "author"})
     where, params = [], []
-
-    def match(column: str, values: list) -> None:
-        # No value that could be an id here means nothing can match it.
-        if not values:
-            where.append("0")
-            return
-        where.append("%s IN (%s)" % (column, ", ".join("?" * len(values))))
-        params.extend(values)
-
-    # A reference search parameter takes the bare id or Type/id, as on
-    # Endpoint's organization, and a comma between values means either.
-    if related:
-        ids = (int(v) for v in (v.removeprefix("Bundle/") for v in related.split(","))
-               if v.isascii() and v.isdigit())
-        # SQLite integers stop at 2**63 - 1, and binding a bigger one raises.
-        match("r.submission_id", [i for i in ids if i < 2 ** 63])
-    if custodian:
-        match("p.slug", [v.removeprefix("Organization/") for v in custodian.split(",")])
-    if author:
-        match("c.slug", [v.removeprefix("Organization/") for v in author.split(",")])
+    # A reference takes the bare id or Type/id. Repeats are ANDed and the
+    # commas inside one ORed, as FHIR reads every search parameter.
+    for column, values, prefix in (("p.slug", custodian, "Organization/"),
+                                   ("c.slug", author, "Organization/")):
+        for ors in search_terms(values, fold=False):
+            where.append("%s IN (%s)" % (column, ", ".join("?" * len(ors))))
+            params.extend(o.removeprefix(prefix) for o in ors)
+    for ors in search_terms(related, fold=False):
+        # A Bundle id that names no submission - a sample's slug, say - is
+        # one nobody has screenshotted, not a malformed search.
+        ids = [i for i in (row_id(o.removeprefix("Bundle/")) for o in ors)
+               if i is not None]
+        if not ids:
+            return fhir_response(searchset(request, [], applied))
+        where.append("r.submission_id IN (%s)" % ", ".join("?" * len(ids)))
+        params.extend(ids)
     sql = RENDERING_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY r.ts DESC, r.id DESC"
     with connect() as conn:
         rows = [documentreference_resource(row) for row in conn.execute(sql, params)]
-    return fhir_response(searchset(rows))
+    return fhir_response(searchset(request, rows, applied))
 
 
 @app.get("/fhir/DocumentReference/{rendering_id}",
     tags=["Interop"],
     summary="One screenshot's metadata",
 )
-def read_rendering(rendering_id: int) -> Response:
+def read_rendering(rendering_id: str) -> Response:
     with connect() as conn:
-        row = fetch_rendering(conn, rendering_id)
+        row = fetch_rendering(conn, row_id(rendering_id))
     if row is None:
         raise HTTPException(404, detail="Unknown DocumentReference")
     return fhir_response(documentreference_resource(row))
@@ -3960,9 +4100,9 @@ def wants_fhir_json(request: Request) -> bool:
         "and it is a Binary resource with the image base64-encoded in `data`."
     ),
 )
-def rendering_image(rendering_id: int, request: Request) -> Response:
+def rendering_image(rendering_id: str, request: Request) -> Response:
     with connect() as conn:
-        row = fetch_rendering(conn, rendering_id)
+        row = fetch_rendering(conn, row_id(rendering_id))
     if row is None:
         raise HTTPException(404, detail="Unknown Binary")
     raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
@@ -4011,7 +4151,7 @@ def rendering_image(rendering_id: int, request: Request) -> Response:
     ),
 )
 def update_rendering(
-    rendering_id: int,
+    rendering_id: str,
     payload: dict = Depends(docref_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
@@ -4021,13 +4161,13 @@ def update_rendering(
     if not isinstance(note, str):
         raise HTTPException(400, detail="\"description\" must be a string")
     with connect() as conn:
-        owned_rendering(conn, rendering_id, team)
+        row = owned_rendering(conn, row_id(rendering_id), team)
         conn.execute(
             "UPDATE renderings SET note = ? WHERE id = ?",
-            (note.strip()[:MAX_NOTE_CHARS], rendering_id),
+            (note.strip()[:MAX_NOTE_CHARS], row["id"]),
         )
         return fhir_response(
-            documentreference_resource(fetch_rendering(conn, rendering_id))
+            documentreference_resource(fetch_rendering(conn, row["id"]))
         )
 
 
@@ -4038,11 +4178,11 @@ def update_rendering(
     description="Only the company that uploaded it can remove it; 403 otherwise.",
 )
 def delete_rendering(
-    rendering_id: int, team: sqlite3.Row = Depends(current_team)
+    rendering_id: str, team: sqlite3.Row = Depends(current_team)
 ) -> Response:
     with connect() as conn:
-        row = owned_rendering(conn, rendering_id, team)
-        conn.execute("DELETE FROM renderings WHERE id = ?", (rendering_id,))
+        row = owned_rendering(conn, row_id(rendering_id), team)
+        conn.execute("DELETE FROM renderings WHERE id = ?", (row["id"],))
     # A withdrawn screenshot that is still on disk has not been withdrawn.
     try:
         os.remove(
@@ -4222,10 +4362,11 @@ def insert_endpoint(conn: sqlite3.Connection, team_id: int, fields: dict) -> int
     ).lastrowid
 
 
-def fetch_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | None:
-    # An id past what SQLite can hold is no endpoint, rather than an
-    # OverflowError on binding it.
-    if abs(endpoint_id) >= 2 ** 63:
+def fetch_endpoint(
+    conn: sqlite3.Connection, endpoint_id: int | None
+) -> sqlite3.Row | None:
+    """The endpoint with this id; None also for an id row_id() refused."""
+    if endpoint_id is None:
         return None
     return conn.execute(ENDPOINT_SELECT + " WHERE e.id = ?", (endpoint_id,)).fetchone()
 
@@ -4250,7 +4391,7 @@ def _extension_values(element, url: str, key: str, name: str) -> list:
 
 
 def owned_endpoint(
-    conn: sqlite3.Connection, endpoint_id: int, team: sqlite3.Row
+    conn: sqlite3.Connection, endpoint_id: int | None, team: sqlite3.Row
 ) -> sqlite3.Row:
     """The endpoint, if this company is the one advertising it. It is public,
     so somebody else's is a 403 and not a 404."""
@@ -4268,7 +4409,7 @@ async def endpoint_body(
     """The Endpoint resource, read only once the caller is known."""
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Endpoint")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "Endpoint":
@@ -4331,33 +4472,36 @@ def create_endpoint(
     ),
 )
 def search_endpoints(
-    organization: str | None = None,
-    connection_type: str | None = Query(None, alias="connection-type"),
+    request: Request,
+    organization: list[str] | None = Query(None),
+    connection_type: list[str] | None = Query(None, alias="connection-type"),
 ) -> Response:
+    applied = search_params(request, {"organization", "connection-type"})
     # A reference search parameter takes the bare id or Type/id; a token one
     # may carry its system before a |, which is dropped rather than checked.
-    slugs = {v.removeprefix("Organization/") for v in organization.split(",")} \
-        if organization else None
-    kinds = {v.rpartition("|")[2] for v in connection_type.split(",")} \
-        if connection_type else None
+    # Repeats are ANDed, the commas inside one ORed.
+    slugs = [{o.removeprefix("Organization/") for o in ors}
+             for ors in search_terms(organization, fold=False)]
+    kinds = [{o.rpartition("|")[2] for o in ors}
+             for ors in search_terms(connection_type, fold=False)]
     with connect() as conn:
         rows = conn.execute(
             ENDPOINT_SELECT + " ORDER BY t.name COLLATE NOCASE, e.id"
         ).fetchall()
-    return fhir_response(searchset([
+    return fhir_response(searchset(request, [
         endpoint_resource(r) for r in rows
-        if (slugs is None or r["team_slug"] in slugs)
-        and (kinds is None or r["kind"] in kinds)
-    ]))
+        if all(r["team_slug"] in ors for ors in slugs)
+        and all(r["kind"] in ors for ors in kinds)
+    ], applied))
 
 
 @app.get("/fhir/Endpoint/{endpoint_id}",
     tags=["Interop"],
     summary="One advertised endpoint",
 )
-def read_endpoint(endpoint_id: int) -> Response:
+def read_endpoint(endpoint_id: str) -> Response:
     with connect() as conn:
-        row = fetch_endpoint(conn, endpoint_id)
+        row = fetch_endpoint(conn, row_id(endpoint_id))
     if row is None:
         raise HTTPException(404, detail="Unknown Endpoint")
     return fhir_response(endpoint_resource(row))
@@ -4372,7 +4516,7 @@ def read_endpoint(endpoint_id: int) -> Response:
     ),
 )
 def update_endpoint(
-    endpoint_id: int,
+    endpoint_id: str,
     payload: dict = Depends(endpoint_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
@@ -4382,24 +4526,24 @@ def update_endpoint(
     if body_id is not None and not isinstance(body_id, str):
         raise HTTPException(
             400, detail="The body's id must be a JSON string, as every FHIR id is")
-    if body_id not in (None, str(endpoint_id)):
+    if body_id not in (None, endpoint_id):
         raise HTTPException(
-            400, detail="The body's id is %s but the URL's is \"%d\""
-                        % (json.dumps(body_id), endpoint_id))
+            400, detail="The body's id is %s but the URL's is %s"
+                        % (json.dumps(body_id), json.dumps(endpoint_id)))
     fields = parse_endpoint(payload)
     with connect() as conn:
         # The ownership check and the write see the same row, or a DELETE
         # landing between them leaves nothing to read back.
         conn.execute("BEGIN IMMEDIATE")
-        owned_endpoint(conn, endpoint_id, team)
+        row = owned_endpoint(conn, row_id(endpoint_id), team)
         conn.execute(
             "UPDATE endpoints SET updated_at = ?, kind = ?, name = ?, "
             "address = ?, description = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), fields["kind"],
              fields["name"], fields["address"], fields["description"],
-             endpoint_id),
+             row["id"]),
         )
-        return fhir_response(endpoint_resource(fetch_endpoint(conn, endpoint_id)))
+        return fhir_response(endpoint_resource(fetch_endpoint(conn, row["id"])))
 
 
 @app.delete("/fhir/Endpoint/{endpoint_id}",
@@ -4409,11 +4553,11 @@ def update_endpoint(
     description="Only the company advertising it can remove it; 403 otherwise.",
 )
 def delete_endpoint(
-    endpoint_id: int, team: sqlite3.Row = Depends(current_team)
+    endpoint_id: str, team: sqlite3.Row = Depends(current_team)
 ) -> Response:
     with connect() as conn:
-        owned_endpoint(conn, endpoint_id, team)
-        conn.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+        row = owned_endpoint(conn, row_id(endpoint_id), team)
+        conn.execute("DELETE FROM endpoints WHERE id = ?", (row["id"],))
     return Response(status_code=204)
 
 
@@ -4454,7 +4598,7 @@ def matchbox_status() -> tuple[str, list[str]]:
         "being told any of it."
     ),
 )
-def metadata() -> Response:
+def metadata(request: Request) -> Response:
     return fhir_response(
         {
             "resourceType": "CapabilityStatement",
@@ -4465,7 +4609,7 @@ def metadata() -> Response:
             "software": {"name": app.title, "version": APP_VERSION},
             "implementation": {
                 "description": "Nordic Hackathon 2026 EPS validation service",
-                "url": FHIR_BASE,
+                "url": fhir_base(request),
             },
             "fhirVersion": "4.0.1",
             "format": [FHIR_JSON, "json"],
@@ -4722,9 +4866,10 @@ def ui_document(doc_id: str) -> dict:
             "doc_type": detect_document(bundle)["id"],
             "summary": safe_summary(bundle),
         }
-    if not doc_id.isdigit():
+    sub_id = row_id(doc_id)
+    if sub_id is None:
         raise HTTPException(404, detail="Unknown document")
-    row = _submission_row(int(doc_id))
+    row = _submission_row(sub_id)
     if row is None:
         raise HTTPException(404, detail="Unknown submission")
     raw = read_submission_bytes(row["team_slug"], row["filename"])
@@ -8761,6 +8906,33 @@ SUBMIT_RESPONSE_HEADERS = {
     "Content-Location": ("where this bundle is now readable", "string"),
 }
 
+# What every error is, whoever raised it - the two exception handlers turn
+# them all into one - and which FastAPI documents as a {detail: [...]} of its
+# own instead.
+OPERATION_OUTCOME_SCHEMA = {
+    "type": "object",
+    "description": "A FHIR R4 OperationOutcome; `issue[].diagnostics` says "
+                   "what went wrong.",
+    "required": ["resourceType", "issue"],
+    "properties": {
+        "resourceType": {"type": "string", "enum": ["OperationOutcome"]},
+        "issue": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "code": {"type": "string"},
+                    "diagnostics": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+# The types sniff_image() admits, which are the only ones a Binary is served as.
+BINARY_TYPES = ("image/png", "image/jpeg", "image/webp")
+
 # Endpoints that read the token. Anything else is open.
 TOKEN_REQUIRED = {
     ("/fhir/Endpoint", "post"),
@@ -8772,6 +8944,20 @@ TOKEN_REQUIRED = {
     ("/fhir/DocumentReference/{rendering_id}", "put"),
     ("/fhir/DocumentReference/{rendering_id}", "delete"),
 }
+
+
+def _takes_any_text(param: dict) -> bool:
+    """Whether an OpenAPI parameter accepts whatever text it is sent - an
+    optional string, or a list of them - so validating it cannot fail."""
+    if param.get("required") and param.get("in") != "path":
+        return False
+    schema = param.get("schema", {})
+    return all(
+        option.get("type") in ("string", "null")
+        or (option.get("type") == "array"
+            and option.get("items", {}).get("type") == "string")
+        for option in schema.get("anyOf", [schema])
+    )
 
 
 def custom_openapi() -> dict:
@@ -8800,6 +8986,12 @@ def custom_openapi() -> dict:
         routes=app.routes,
     )
     schema["components"] = schema.get("components", {})
+    # Never sent: validation_error_to_outcome answers in an OperationOutcome.
+    for name in ("HTTPValidationError", "ValidationError"):
+        schema["components"].get("schemas", {}).pop(name, None)
+    schema["components"].setdefault("schemas", {})["OperationOutcome"] = \
+        OPERATION_OUTCOME_SCHEMA
+    outcome = {FHIR_JSON: {"schema": {"$ref": "#/components/schemas/OperationOutcome"}}}
     schema["components"]["securitySchemes"] = {
         "TeamToken": {
             "type": "apiKey",
@@ -8824,6 +9016,31 @@ def custom_openapi() -> dict:
                 op["security"] = [{"TeamToken": []}]
             if key in OPENAPI_BODIES:
                 op["requestBody"] = OPENAPI_BODIES[key]
+            responses = op["responses"]
+            # FastAPI assumes application/json; the routes answer through
+            # fhir_response or bundle_response, both fhir+json.
+            for status, response in responses.items():
+                if status.startswith("2") and "application/json" in response.get(
+                        "content", {}):
+                    response["content"] = {FHIR_JSON: {"schema": {"type": "object"}}}
+            # FastAPI lists a 422 on anything with a parameter; only one it
+            # cannot take as given - a number, say - can actually fail.
+            responses.pop("422", None)
+            if any(not _takes_any_text(p) for p in op.get("parameters", [])):
+                responses["422"] = {"description": "A parameter of the wrong type",
+                                    "content": outcome}
+            if key in TOKEN_REQUIRED:
+                responses["401"] = {"description": "No token, or not a company's",
+                                    "content": outcome}
+            if "{" in path:
+                responses["404"] = {"description": "Nothing found there",
+                                    "content": outcome}
+            responses["default"] = {"description": "Any other error",
+                                    "content": outcome}
+    binary = schema["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
+    binary["content"] = {
+        mime: {"schema": {"type": "string", "format": "binary"}} for mime in BINARY_TYPES
+    }
     submit = schema["paths"]["/fhir/Bundle/$validate"]["post"]["responses"]["200"]
     submit["description"] = "The Matchbox OperationOutcome for this bundle."
     submit["content"] = {"application/fhir+json": {"schema": {"type": "object"}}}

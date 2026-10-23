@@ -497,7 +497,15 @@ comes back as a `Parameters` resource. That is FHIR's answer for exactly this, a
 has two consequences worth knowing before you parse one: a repeated parameter name *is*
 the list (FHIR has no array type), and an absent parameter *is* the null (FHIR has no
 null), so a company that has never submitted simply has no `bestErrors` part rather
-than one set to `null`.
+than one set to `null`. The same goes for an empty list: a search with no matches has
+no `entry`, and an operation with nothing to report has no `parameter`.
+
+Searches (`Organization`, `Endpoint`, `DocumentReference`) read their parameters the
+FHIR way: commas inside one are ORed and a repeated parameter is ANDed. A parameter the
+search does not know is passed over, and the searchset's `self` link lists only the ones
+that were applied; send `Prefer: handling=strict` to get a **400** instead. A modifier or
+chain the search does not support (`name:text`, `organization.name`) is always a **400**,
+since ignoring it would answer with everything.
 
 ### Registration
 

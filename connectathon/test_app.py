@@ -1899,6 +1899,61 @@ def test_a_body_that_is_not_parameters_is_rejected(client):
         assert diagnostics(res) == "Body must be a FHIR Parameters resource"
 
 
+LONE = "\\ud800"   # the JSON escape of a lone UTF-16 surrogate, as sent
+
+
+def test_a_lone_surrogate_is_a_400_on_every_json_body(client, monkeypatch):
+    """json.loads takes the escape, but the str it makes is no Unicode text:
+    whatever encodes it first - SQLite, compare_digest - used to raise a 500."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    headers = {"Content-Type": "application/fhir+json"}
+    auth = dict(headers, Authorization="Bearer " + tok_c)
+    ep = '{"resourceType": "Endpoint", "status": "active", "connectionType": ' \
+         '{"code": "web-page"}, "address": "https://x.example", "name": "%s"}' % LONE
+    shot = add_shot(client, tok_c, "producer").json()["id"]
+    calls = []
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body, doc=None: calls.append(body))
+    for path, method, body, hdrs in (
+        ("/fhir/$register", "POST", '{"resourceType": "Parameters", "parameter": '
+         '[{"name": "name", "valueString": "%sbad"}]}' % LONE, headers),
+        ("/fhir/$register", "POST", '{"resourceType": "Parameters", "parameter": '
+         '[{"name": "name", "valueString": "Surr"}, {"name": "endpoint", '
+         '"resource": %s}]}' % ep, headers),
+        ("/fhir/Endpoint", "POST", ep, auth),
+        ("/fhir/DocumentReference", "POST", '{"resourceType": "DocumentReference", '
+         '"custodian": {"reference": "Organization/%s"}}' % LONE, auth),
+        ("/fhir/DocumentReference/" + shot, "PUT", '{"resourceType": '
+         '"DocumentReference", "description": "%s"}' % LONE, auth),
+        ("/fhir/Bundle/$validate", "POST", '{"resourceType": "Bundle", "entry": '
+         '[{"resource": {"resourceType": "Composition", "title": "%s"}}]}' % LONE,
+         auth),
+    ):
+        res = client.request(method, path, content=body, headers=hdrs)
+        assert res.status_code == 400, (path, res.text)
+        assert diagnostics(res) == "Body is not valid JSON"
+    assert calls == []          # refused before it reached the validator
+    assert [e["resource"]["id"]
+            for e in client.get("/fhir/Organization").json()["entry"]] \
+        == ["consumer", "producer"]
+    # a pair of surrogates is one real character and goes through
+    res = client.post("/fhir/$register", headers=headers, content=(
+        '{"resourceType": "Parameters", "parameter": '
+        '[{"name": "name", "valueString": "Pair \\ud83d\\ude00 Co"}]}'))
+    assert res.status_code == 200
+    assert param_one(res, "organization")["name"] == "Pair \U0001F600 Co"
+
+
+def test_a_lone_surrogate_in_the_code_is_refused_before_it_is_compared(
+        client, monkeypatch):
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
+    res = client.post("/fhir/$register", headers={
+        "Content-Type": "application/fhir+json"}, content=(
+        '{"resourceType": "Parameters", "parameter": [{"name": "name", '
+        '"valueString": "Surr"}, {"name": "code", "valueString": "%s"}]}' % LONE))
+    assert res.status_code == 400
+
+
 # ------------------------------------------------------------ registration code
 
 def test_registration_is_open_by_default(client):
@@ -1941,6 +1996,12 @@ def test_a_document_that_no_longer_parses_says_so(client, monkeypatch):
     assert data["pass"] is True
     assert data["bundle_readable"] is False
     assert data["summary"]["sections"] == []
+    # one stored before lone surrogates were refused reads the same way,
+    # rather than as a 500 once the response is encoded
+    with open(stored, "wb") as fh:
+        fh.write(b'{"resourceType": "Bundle", "id": "\\ud800"}')
+    res = client.get("/ui/documents/%d" % sub["id"])
+    assert res.status_code == 200 and res.json()["bundle_readable"] is False
 
 
 # ----------------------------------------------------------- matchbox client
@@ -2281,6 +2342,43 @@ def test_metadata_describes_the_whole_api(client):
     assert [o["name"] for o in bundles["operation"]] == ["validate"]
 
 
+def test_searchset_full_urls_and_the_base_are_absolute(client, monkeypatch):
+    """R4 requires an absolute fullUrl; '/fhir/Organization/x' fails it."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    add_shot(client, tok_c, "producer")
+    advertise(client, tok_c, endpoint())
+    for path, first in (("/fhir/Organization", "Organization/consumer"),
+                        ("/fhir/Endpoint", "Endpoint/1"),
+                        ("/fhir/DocumentReference", "DocumentReference/1")):
+        entry = client.get(path).json()["entry"][0]
+        assert entry["fullUrl"] == "http://testserver/fhir/" + first, path
+        assert entry["search"] == {"mode": "match"}
+    assert client.get("/fhir/metadata").json()["implementation"]["url"] \
+        == "http://testserver/fhir"
+    # behind Caddy the TLS is Caddy's, and only its header says so
+    behind = {"X-Forwarded-Proto": "https", "Host": "hack.example"}
+    assert client.get("/fhir/Endpoint", headers=behind).json()["entry"][0][
+        "fullUrl"] == "https://hack.example/fhir/Endpoint/1"
+    assert client.get("/fhir/metadata", headers=behind).json()[
+        "implementation"]["url"] == "https://hack.example/fhir"
+    # anything but a scheme the URL can carry is not taken at its word
+    odd = {"X-Forwarded-Proto": "javascript"}
+    assert client.get("/fhir/metadata", headers=odd).json()[
+        "implementation"]["url"] == "http://testserver/fhir"
+
+
+def test_nothing_found_omits_the_array_rather_than_sending_it_empty(client):
+    """FHIR forbids an empty array: no match is no `entry`, no result no
+    `parameter`."""
+    for path in ("/fhir/Organization?name=zzz", "/fhir/Endpoint",
+                 "/fhir/DocumentReference"):
+        body = client.get(path).json()
+        assert body["total"] == 0 and "entry" not in body, path
+    body = client.get("/fhir/$submissions?organization=nope").json()
+    assert body == {"resourceType": "Parameters"}
+    assert app_module.parameters([("gone", None)]) == {"resourceType": "Parameters"}
+
+
 def test_every_error_is_an_operation_outcome(client, monkeypatch):
     """FHIR has one way to say what went wrong, and a client that can read a
     validation failure must not need a second parser for a 404."""
@@ -2345,8 +2443,8 @@ def test_organizations_are_searchable_by_name(client):
 
     def names(query):
         body = client.get("/fhir/Organization?" + query).json()
-        assert body["total"] == len(body["entry"])
-        return [e["resource"]["name"] for e in body["entry"]]
+        assert body["total"] == len(body.get("entry", []))
+        return [e["resource"]["name"] for e in body.get("entry", [])]
 
     assert names("name=aland") == ["Åland Hälsa"]          # case and accents
     assert names("name=health") == []                      # start of the name
@@ -2372,7 +2470,7 @@ def test_a_name_search_in_another_script_does_not_match_everyone(client):
 
     def names(query):
         body = client.get("/fhir/Organization", params=query).json()
-        return [e["resource"]["name"] for e in body["entry"]]
+        return [e["resource"]["name"] for e in body.get("entry", [])]
 
     assert names({"name": "日本"}) == ["日本ヘルス"]
     assert names({"name": "中国"}) == []
@@ -2453,6 +2551,44 @@ def test_openapi_declares_the_team_token_as_a_security_scheme(client):
     names = [p["name"].lower()
              for p in spec["paths"]["/fhir/$exchange"]["get"].get("parameters", [])]
     assert "x-team-token" not in names and "authorization" not in names
+
+
+def test_openapi_documents_what_the_server_really_sends(client):
+    """FastAPI assumes application/json and its own {detail} error shape; the
+    server sends fhir+json, the image itself, and OperationOutcomes."""
+    spec = client.get("/openapi.json").json()
+    outcome = {"application/fhir+json": {
+        "schema": {"$ref": "#/components/schemas/OperationOutcome"}}}
+    assert "HTTPValidationError" not in json.dumps(spec)
+    assert spec["components"]["schemas"]["OperationOutcome"]["properties"][
+        "resourceType"]["enum"] == ["OperationOutcome"]
+    for path, ops in spec["paths"].items():
+        for verb, op in ops.items():
+            responses = op["responses"]
+            assert responses["default"]["content"] == outcome, (path, verb)
+            for status, response in responses.items():
+                assert "application/json" not in response.get("content", {}), \
+                    (path, verb, status)
+                if not status.startswith("2"):
+                    assert response["content"] == outcome, (path, verb, status)
+    submissions = spec["paths"]["/fhir/$submissions"]["get"]["responses"]
+    assert list(submissions["200"]["content"]) == ["application/fhir+json"]
+    assert "422" in submissions          # count=abc
+    res = client.get("/fhir/$submissions?count=abc")
+    assert res.status_code == 422 and diagnostics(res)
+    # an id is a string and a search takes any text, so neither can fail to parse
+    for path, verb in (("/fhir/Binary/{rendering_id}", "get"),
+                       ("/fhir/Endpoint/{endpoint_id}", "put"),
+                       ("/fhir/Organization", "get")):
+        assert "422" not in spec["paths"][path][verb]["responses"], path
+    assert client.get("/fhir/Binary/abc").status_code == 404
+    assert "404" in spec["paths"]["/fhir/Endpoint/{endpoint_id}"]["get"]["responses"]
+    assert "401" in spec["paths"]["/fhir/Endpoint"]["post"]["responses"]
+    assert "401" not in spec["paths"]["/fhir/Endpoint"]["get"]["responses"]
+    # a Binary is the image, as whichever type its bytes proved
+    binary = spec["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
+    assert set(binary["content"]) == {
+        app_module.sniff_image(raw)[0] for raw in (png_bytes(), JPEG, WEBP)}
 
 
 def test_openapi_leaves_the_ui_out(client):
@@ -3208,6 +3344,70 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
         == ["from third"]
     assert shots(client.get("/fhir/DocumentReference?custodian=nobody")) == []
     assert shots(client.get("/fhir/DocumentReference?related=99999")) == []
+    # a Bundle id that is a sample's slug has no screenshots, rather than a 422
+    res = client.get("/fhir/DocumentReference?related=andrea-cross-border")
+    assert res.status_code == 200 and shots(res) == []
+
+
+# Past what SQLite holds; non-ASCII digits str.isdigit() takes but int() either
+# refuses ('²', '①') or maps onto a real id (fullwidth and Arabic-Indic '1');
+# and plain ids that are not numbers at all.
+CRAFTED_IDS = ["99999999999999999999999", str(2 ** 63), "²", "①",
+               "１", "١", "abc"]
+
+
+def test_a_crafted_id_is_a_404_outcome_on_every_read_and_write(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    shot = add_shot(client, tok_c, "producer").json()["id"]
+    ep = advertise(client, tok_c, endpoint()).json()["id"]
+    assert (shot, ep) == ("1", "1")     # so a digit read as 1 would find them
+    auth = {"Authorization": "Bearer " + tok_c}
+    for crafted in CRAFTED_IDS:
+        quoted = urllib.parse.quote(crafted)
+        for res in (
+            client.get("/fhir/Bundle/" + quoted),
+            client.get("/ui/documents/" + quoted),
+            client.get("/fhir/DocumentReference/" + quoted),
+            client.get("/fhir/Binary/" + quoted),
+            client.get("/fhir/Endpoint/" + quoted),
+            client.put("/fhir/DocumentReference/" + quoted, headers=auth,
+                       json={"resourceType": "DocumentReference", "description": "x"}),
+            client.delete("/fhir/DocumentReference/" + quoted, headers=auth),
+            advertise(client, tok_c, endpoint(), quoted),
+            client.delete("/fhir/Endpoint/" + quoted, headers=auth),
+        ):
+            assert res.status_code == 404, (crafted, res.request.url, res.text)
+            assert res.json()["issue"][0]["code"] == "not-found"
+        res = client.get("/fhir/DocumentReference?related=" + quoted)
+        assert res.status_code == 200 and shots(res) == [], crafted
+    # nothing was rewritten or withdrawn on the way
+    assert client.get("/fhir/DocumentReference/1").json().get("description") != "x"
+    assert client.get("/fhir/Endpoint/1").status_code == 200
+    # the download is named from the id the row holds
+    res = client.get("/fhir/Bundle/1")
+    assert res.status_code == 200
+    assert '"producer-1-' in res.headers["content-disposition"]
+
+
+def test_an_endpoint_put_whose_body_names_another_id_is_refused(client):
+    tok = register(client, "Owner")
+    ep = advertise(client, tok, endpoint()).json()["id"]
+    res = advertise(client, tok, dict(endpoint(), id="2"), ep)
+    assert res.status_code == 400
+    assert diagnostics(res) == "The body's id is \"2\" but the URL's is \"1\""
+    # a FHIR id is compared as the string it is, not as the number it reads as
+    assert advertise(client, tok, dict(endpoint(), id="01"), ep).status_code == 400
+    res = advertise(client, tok, dict(endpoint(name="Same"), id=ep), ep)
+    assert res.status_code == 200 and res.json()["name"] == "Same"
+
+
+def test_get_on_validate_is_405_not_an_unknown_bundle(client):
+    res = client.get("/fhir/Bundle/$validate")
+    assert res.status_code == 405
+    assert res.headers["allow"] == "POST"
+    assert res.json()["issue"][0]["code"] == "not-supported"
+    # the same answer as any other method the operation does not take
+    assert client.put("/fhir/Bundle/$validate").status_code == 405
 
 
 def test_renderings_search_takes_references_as_the_resources_carry_them(
@@ -3662,7 +3862,8 @@ def test_endpoints_are_searched_by_company_and_kind(client):
         bundle = client.get("/fhir/Endpoint" + query).json()
         assert bundle["type"] == "searchset"
         return [(e["resource"]["managingOrganization"]["display"],
-                 e["resource"]["connectionType"]["code"]) for e in bundle["entry"]]
+                 e["resource"]["connectionType"]["code"])
+                for e in bundle.get("entry", [])]
 
     # by company name, then oldest first
     assert found() == [("Alpha", "hl7-fhir-rest"), ("Alpha", "web-page"),
@@ -3676,6 +3877,79 @@ def test_endpoints_are_searched_by_company_and_kind(client):
     assert found("?organization=alpha&connection-type="
                  "http://terminology.hl7.org/CodeSystem/endpoint-connection-type"
                  "|hl7-fhir-rest") == [("Alpha", "hl7-fhir-rest")]
+    # a repeat is ANDed - nobody is both companies - whichever comes first
+    assert found("?organization=alpha&organization=beta") == []
+    assert found("?organization=beta&organization=alpha") == []
+    assert found("?connection-type=web-page&organization=alpha,beta"
+                 "&organization=beta") == [("Beta", "web-page")]
+
+
+def test_an_unsupported_modifier_or_chain_is_refused_not_ignored(client):
+    """Ignored, `name:text=fab` answered with every company there is."""
+    register(client, "Fabrikam")
+    register(client, "Litware")
+    for path in ("/fhir/Organization?name:text=fab",
+                 "/fhir/Organization?name:missing=true",
+                 "/fhir/Endpoint?organization:missing=true",
+                 "/fhir/Endpoint?organization.name=x",
+                 "/fhir/DocumentReference?author:missing=true"):
+        res = client.get(path)
+        assert res.status_code == 400, path
+        assert diagnostics(res).startswith("Search parameter `"), path
+    assert diagnostics(client.get("/fhir/Organization?name:text=fab")) == (
+        "Search parameter `name:text` is not supported here; this search "
+        "takes name, name:contains, name:exact")
+
+
+def test_an_unknown_search_parameter_is_passed_over_and_the_self_link_says_so(
+        client):
+    register(client, "Fabrikam")
+    register(client, "Litware")
+    body = client.get("/fhir/Organization?_id=litware&name:contains=a").json()
+    assert body["total"] == 2           # _id is not a search this server has
+    assert body["link"] == [{"relation": "self", "url":
+                             "http://testserver/fhir/Organization?name:contains=a"}]
+    # nothing applied is no query at all, and a blank value is not applied
+    assert client.get("/fhir/Endpoint?bogus=1&organization=").json()["link"][0][
+        "url"] == "http://testserver/fhir/Endpoint"
+    # a client that asks for strict handling gets the refusal instead
+    res = client.get("/fhir/Organization?_id=litware",
+                     headers={"Prefer": "handling=strict"})
+    assert res.status_code == 400
+    assert "`_id`" in diagnostics(res)
+    assert client.get("/fhir/Organization?name=lit", headers={
+        "Prefer": "handling=strict"}).json()["total"] == 1
+    # one preference among others, in any case, is still asked for
+    assert client.get("/fhir/Organization?_id=litware", headers={
+        "Prefer": "return=minimal, Handling=Strict"}).status_code == 400
+    # but a preference that only starts the same way is not
+    assert client.get("/fhir/Organization?_id=litware", headers={
+        "Prefer": "handling=strictish"}).status_code == 200
+
+
+def test_screenshots_are_searched_with_repeats_anded_and_commas_ored(
+        client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    submit(client, tok_d, outcome(), monkeypatch, body=CLINICAL_BODY)
+    add_shot(client, tok_c, "producer")
+    add_shot(client, tok_c, "third")
+    add_shot(client, tok_d, "producer")
+
+    def found(query):
+        return sorted((custodian_of(s), author_of(s))
+                      for s in shots(client.get("/fhir/DocumentReference?" + query)))
+
+    assert found("custodian=producer&custodian=third") == []
+    assert found("custodian=producer,Organization/third&author=consumer") == [
+        ("producer", "consumer"), ("third", "consumer")]
+    assert found("author=consumer&author=third") == []
+    doc = param_entries(client.get("/fhir/$exchange"))
+    producer_doc = next(d["id"] for d in doc if d["organizationSlug"] == "producer")
+    assert found("related=Bundle/%d" % producer_doc) == [
+        ("producer", "consumer"), ("producer", "third")]
+    assert found("related=%d,andrea-cross-border" % producer_doc) \
+        == found("related=%d" % producer_doc)
 
 
 def test_an_endpoint_is_changed_only_by_the_company_advertising_it(client):
@@ -5760,6 +6034,24 @@ def test_requests_are_counted_by_route_template_and_by_who_sent_them(client):
     # A scanner's made-up path is one bucket, not a row per guess.
     assert ("GET", "(no route)", 404, "client", 1) in rows
     assert not [r for r in rows if "wp-login" in r[1]]
+
+
+def test_head_is_get_without_the_body_and_is_logged_as_head(client):
+    """FastAPI routes only the methods named, so HEAD on the front page used
+    to be a 405 to every uptime checker."""
+    for path in ("/", "/fhir/metadata", "/fhir/$status", "/favicon.svg"):
+        get, head = client.get(path), client.head(path)
+        assert head.status_code == 200, path
+        assert head.content == b"", path
+        assert head.headers["content-type"] == get.headers["content-type"], path
+        assert head.headers["content-length"] == get.headers["content-length"], path
+    # what GET would refuse, HEAD is refused the same way
+    assert client.head("/fhir/Bundle/999").status_code == 404
+    res = client.head("/fhir/$register")
+    assert res.status_code == 405 and res.headers["allow"] == "POST"
+    rows = usage(client, "SELECT method, route, status FROM hits "
+                         "WHERE route = '/fhir/metadata'")
+    assert rows == [("GET", "/fhir/metadata", 200), ("HEAD", "/fhir/metadata", 200)]
 
 
 def test_visitors_are_hashed_per_day_and_not_stored_as_addresses(client):
