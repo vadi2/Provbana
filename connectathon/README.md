@@ -489,7 +489,8 @@ curl localhost:8095/fhir/metadata
 ```
 
 Endpoints that write authenticate with `Authorization: Bearer TOKEN` (or
-`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**.
+`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**, with a
+`WWW-Authenticate: Bearer` challenge and a message saying what was wrong with what was sent.
 
 Anything the server computes rather than stores - a ranking, a health check, a token -
 comes back as a `Parameters` resource. That is FHIR's answer for exactly this, and it
@@ -510,8 +511,9 @@ curl -X POST 'localhost:8095/fhir/$register' -H 'Content-Type: application/fhir+
 
 Answers `Parameters` with a `token` and the company as an `Organization`. **400** if the
 name is not 2-40 characters, **403** if `REGISTER_CODE` is set and the `code` parameter
-is wrong or missing, **409** if the name is taken (whitespace-normalised;
-case-insensitive for ASCII letters only).
+is wrong or missing, **409** if the name is taken (whitespace-normalised, NFC-composed
+and with invisible format characters such as zero-width spaces dropped, before both
+checks; case-insensitive for ASCII letters only).
 
 If your system can take documents in directly, say where in the same call: an
 `endpoint` part carrying an [Endpoint](#advertising-where-your-system-takes-documents-in)
@@ -713,7 +715,8 @@ curl -X PUT localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN' \
 curl -X DELETE localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN'
 ```
 
-**400** for an address that is not an absolute http(s) URL or is over 2000 characters, a
+**400** for an address that is not an absolute http(s) URL, is over 2000 characters or
+carries a user name or password (`https://user:pass@host` - this list is public), a
 `connectionType` code other than these two (or with a `system` that is not that code's),
 a `status` other than `active` (delete an endpoint rather than parking it), a top-level
 R5 `description` (R4 has none - use the extension), a `header` (this list is public, so

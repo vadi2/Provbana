@@ -2332,18 +2332,36 @@ async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
 def team_from_token(
     x_team_token: str | None, authorization: str | None
 ) -> sqlite3.Row:
-    """Resolve the X-Team-Token / Bearer credential to a team row or raise 401."""
+    """Resolve the X-Team-Token / Bearer credential to a team row or raise 401.
+
+    Every 401 names what was actually wrong with what was sent - the docs lead
+    with Bearer, so "missing X-Team-Token" would send a team with an unset
+    $TOKEN looking for a header it never used - and carries the
+    WWW-Authenticate challenge HTTP requires of a 401.
+    """
     token = x_team_token
-    if not token and authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
+    if not token and authorization:
+        scheme, _, credentials = authorization.strip().partition(" ")
+        if scheme.lower() != "bearer":
+            raise HTTPException(
+                401, detail="The Authorization header must be `Bearer TOKEN`",
+                headers={"WWW-Authenticate": "Bearer"})
+        token = credentials.strip()
+        if not token:
+            raise HTTPException(
+                401, detail="The Authorization header has no token after `Bearer`",
+                headers={"WWW-Authenticate": "Bearer"})
     if not token:
-        raise HTTPException(401, detail="Missing X-Team-Token header")
+        raise HTTPException(
+            401, detail="No company token - send `Authorization: Bearer TOKEN`",
+            headers={"WWW-Authenticate": "Bearer"})
     with connect() as conn:
         team = conn.execute(
             "SELECT id, name, slug FROM teams WHERE token = ?", (token,)
         ).fetchone()
     if team is None:
-        raise HTTPException(401, detail="Invalid company token")
+        raise HTTPException(401, detail="Invalid company token",
+                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
     return team
 
 
@@ -2467,18 +2485,27 @@ async def parameters_body(request: Request) -> dict:
 )
 def register(params: dict = Depends(parameters_body)) -> Response:
     if REGISTER_CODE:
-        supplied = params.get("code")
+        if "code" not in params:
+            raise HTTPException(403, detail="Registration code required")
+        supplied = params["code"]
         if not isinstance(supplied, str) or not secrets.compare_digest(
             supplied.encode("utf-8"), REGISTER_CODE.encode("utf-8")
         ):
-            raise HTTPException(403, detail="Registration code required")
+            raise HTTPException(403, detail="Registration code is incorrect")
     team = params.get("name")
     if not isinstance(team, str):
         raise HTTPException(
             400, detail="Parameters must carry a `name` with the company name"
         )
     # Collapse runs of whitespace so "Acme  Health" is the same company as
-    # "Acme Health" rather than a way around the one-registration rule.
+    # "Acme Health" rather than a way around the one-registration rule. The
+    # same goes for what cannot be seen at all: a decomposed "Å" is composed,
+    # and invisible format characters (zero-width spaces and joiners, BOMs)
+    # are dropped, or a name of nothing but those would list as a blank row.
+    # Dropped first: one between a letter and its accent would keep the pair
+    # from composing.
+    team = unicodedata.normalize(
+        "NFC", "".join(c for c in team if unicodedata.category(c) != "Cf"))
     team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
         raise HTTPException(400, detail="Company name must be 2-40 characters")
@@ -3824,6 +3851,14 @@ def parse_endpoint(payload: dict) -> dict:
             or any(c.isspace() or not c.isprintable() for c in address)):
         raise HTTPException(
             400, detail="address must be an absolute http or https URL")
+    # https://user:pass@host is a credential, refused for the same reason
+    # Endpoint.header is below. Any "@" before the host counts, an empty
+    # user name included.
+    if "@" in parts.netloc:
+        raise HTTPException(
+            400, detail="address must not carry a user name or password - this "
+                        "list is public. Say how to authenticate in the "
+                        "description instead")
     if len(address) > MAX_ADDRESS_CHARS:
         raise HTTPException(
             400, detail="address is longer than %d characters" % MAX_ADDRESS_CHARS)
@@ -3980,10 +4015,13 @@ def create_endpoint(
         held = conn.execute(
             "SELECT COUNT(*) FROM endpoints WHERE team_id = ?", (team["id"],)
         ).fetchone()[0]
+        # Worded for the page as much as the API: the page shows it as it
+        # comes, under "Add an address" and beside Edit and Remove buttons,
+        # not PUT and DELETE.
         if held >= MAX_ENDPOINTS:
             raise HTTPException(
-                422, detail="A company can advertise %d endpoints - delete one, "
-                            "or PUT over it" % MAX_ENDPOINTS)
+                422, detail="A company can list %d addresses - remove one, "
+                            "or edit one of them instead" % MAX_ENDPOINTS)
         row = fetch_endpoint(conn, insert_endpoint(conn, team["id"], fields))
     return fhir_response(
         endpoint_resource(row),
@@ -4048,10 +4086,16 @@ def update_endpoint(
     payload: dict = Depends(endpoint_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
-    if payload.get("id") not in (None, str(endpoint_id)):
+    body_id = payload.get("id")
+    # A numeric id would otherwise be reported as differing from the URL's
+    # while printing the same digits.
+    if body_id is not None and not isinstance(body_id, str):
         raise HTTPException(
-            400, detail="The body's id is %r but the URL's is %d"
-                        % (payload["id"], endpoint_id))
+            400, detail="The body's id must be a JSON string, as every FHIR id is")
+    if body_id not in (None, str(endpoint_id)):
+        raise HTTPException(
+            400, detail="The body's id is %s but the URL's is \"%d\""
+                        % (json.dumps(body_id), endpoint_id))
     fields = parse_endpoint(payload)
     with connect() as conn:
         # The ownership check and the write see the same row, or a DELETE
@@ -5733,6 +5777,10 @@ $("#reg-btn").addEventListener("click", async () => {
   const errBox = $("#reg-error");
   errBox.style.display = "none";
   $("#token-box").style.display = "none";
+  /* A double click or a second Enter would otherwise send the same name
+     twice, and the loser's 409 would wait in the hidden form. */
+  const btn = $("#reg-btn");
+  btn.disabled = true;
   try {
     const parts = [{ name: "name", valueString: name }];
     if (code) parts.push({ name: "code", valueString: code });
@@ -5765,7 +5813,10 @@ $("#reg-btn").addEventListener("click", async () => {
     if (!res.ok) {
       /* The organisers may gate registration; the field appears the moment the
          server says so, instead of cluttering an open event. */
-      if (res.status === 403) $("#reg-code-row").hidden = false;
+      if (res.status === 403) {
+        $("#reg-code-row").hidden = false;
+        setRegisterCurl(true);
+      }
       errBox.textContent = detailText(data) || ("Registration failed (" + res.status + ")");
       errBox.style.display = "block";
       return;
@@ -5780,6 +5831,8 @@ $("#reg-btn").addEventListener("click", async () => {
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
     errBox.style.display = "block";
+  } finally {
+    btn.disabled = false;
   }
 });
 ["#reg-name", "#reg-code"].forEach((sel) => $(sel).addEventListener("keydown", (ev) => {
@@ -6397,7 +6450,10 @@ async function checkValidator() {
     const h = partsToObject(hRaw.parameter);
     if (h.maxBundleBytes) maxBundleBytes = h.maxBundleBytes;
     if (h.maxNoteChars) maxNote = h.maxNoteChars;
-    if (h.registerCodeRequired) $("#reg-code-row").hidden = false;
+    if (h.registerCodeRequired) {
+      $("#reg-code-row").hidden = false;
+      setRegisterCurl(true);
+    }
     /* NaN if the server sends something unparseable, and NaN fails the
        comparison in updatePracticeNote, so a bad value hides the notice
        rather than showing "Invalid Date". */
@@ -6554,11 +6610,18 @@ $("#submit-btn").addEventListener("click", async () => {
 
 /* ---- curl examples ---- */
 const origin = window.location.origin;
-$("#curl-register").textContent =
-  "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
-  "  -H 'Content-Type: application/fhir+json' \\\n" +
-  "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
-  + "[{\"name\":\"name\",\"valueString\":\"My Company\"}]}'";
+/* Redrawn with a `code` part once the server says registration is gated -
+   without one the example is a 403. */
+function setRegisterCurl(codeRequired) {
+  $("#curl-register").textContent =
+    "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
+    "  -H 'Content-Type: application/fhir+json' \\\n" +
+    "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
+    + "[{\"name\":\"name\",\"valueString\":\"My Company\"}"
+    + (codeRequired ? ",{\"name\":\"code\",\"valueString\":\"REGISTRATION_CODE\"}" : "")
+    + "]}'";
+}
+setRegisterCurl(false);
 $("#curl-submit").textContent =
   "curl -s -D - -X POST " + origin + "/fhir/Bundle/\\$validate \\\n" +
   "  -H 'Content-Type: application/fhir+json' \\\n" +
@@ -7993,6 +8056,9 @@ function showCompanyCard(registering) {
   $("#reg-back").parentNode.hidden = !me;
   $("#reg-replace-name").textContent = me ? "for " + me.name : "";
   $("#reg-replace-token").textContent = saved;
+  /* The box shows the token just registered. Once the field holds another
+     one, it would be telling the participant to save the wrong token. */
+  if ($("#token-value").textContent !== saved) $("#token-box").style.display = "none";
   if (me) $("#company-name").textContent = me.name;
   /* The verdict on the token sits under the token field itself, which is
      often filled from localStorage rather than typed this session. */
@@ -8021,6 +8087,8 @@ async function refreshCompany() {
   await loadEndpoints();
 }
 $("#reg-another").addEventListener("click", () => {
+  /* A fresh form, not the last attempt's complaint. */
+  $("#reg-error").style.display = "none";
   showCompanyCard(true);
   $("#reg-name").focus();
 });

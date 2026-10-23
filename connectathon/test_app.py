@@ -1562,12 +1562,19 @@ def test_registration_is_open_by_default(client):
 
 def test_registration_code_gates_when_set(client, monkeypatch):
     monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
-    assert register_res(client, "Alpha").status_code == 403
-    assert register_res(client, "Alpha", "wrong").status_code == 403
+    res = register_res(client, "Alpha")
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code required"
+    # someone who typed a code is told it is wrong, not that one is needed
+    res = register_res(client, "Alpha", "wrong")
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code is incorrect"
     # a non-string code must be refused, not compared
-    assert client.post("/fhir/$register", json={"resourceType": "Parameters",
+    res = client.post("/fhir/$register", json={"resourceType": "Parameters",
         "parameter": [{"name": "name", "valueString": "Alpha"},
-                      {"name": "code", "valueInteger": 1234}]}).status_code == 403
+                      {"name": "code", "valueInteger": 1234}]})
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code is incorrect"
     assert register_res(client, "Alpha", "s3cret").status_code == 200
 
 
@@ -2309,6 +2316,25 @@ def test_register_collapses_whitespace_and_dedupes_on_it(client):
     assert param_one(res, "organization")["name"] == "Alpha Team"
     for clash in ("alpha team", "ALPHA   TEAM", " Alpha Team"):
         assert register_res(client, clash).status_code == 409, clash
+
+
+def test_register_dedupes_on_what_the_name_looks_like(client):
+    """Two names that render the same are one company, and a name nobody can
+    see is no name at all."""
+    res = register_res(client, "Åland Hälsa")
+    assert res.status_code == 200
+    for clash in ("Åland Hälsa",            # decomposed
+                  "Åland Hälsa​",        # trailing zero-width space
+                  "﻿Åland‍ Hälsa",   # BOM, zero-width joiner
+                  "A​̊land Hälsa"):       # one between letter and accent
+        assert register_res(client, clash).status_code == 409, repr(clash)
+    res = register_res(client, "Hälsa⁠ Co")
+    assert res.status_code == 200
+    assert param_one(res, "organization")["name"] == "Hälsa Co"
+    for blank in ("​​", "​‌⁠", "A​"):
+        res = register_res(client, blank)
+        assert res.status_code == 400, repr(blank)
+        assert diagnostics(res) == "Company name must be 2-40 characters"
 
 
 def test_register_rejects_non_string_and_missing_names(client):
@@ -3267,8 +3293,15 @@ def test_a_put_whose_body_names_another_endpoint_is_refused(client):
     first = advertise(client, tok, endpoint("https://one.example.org")).json()["id"]
     second = advertise(client, tok, endpoint("https://two.example.org")).json()["id"]
     res = advertise(client, tok, endpoint("https://new.example.org", id=second), first)
-    assert res.status_code == 400 and "URL's" in diagnostics(res)
+    assert res.status_code == 400
+    assert diagnostics(res) == "The body's id is \"%s\" but the URL's is \"%s\"" % (second, first)
     assert client.get("/fhir/Endpoint/" + first).json()["address"] == "https://one.example.org"
+    # a number is the wrong type, not a different id - the same digits must
+    # not be reported as a mismatch
+    for wrong_type in (int(first), float(first), True):
+        res = advertise(client, tok, endpoint("https://new.example.org", id=wrong_type), first)
+        assert res.status_code == 400, wrong_type
+        assert diagnostics(res) == "The body's id must be a JSON string, as every FHIR id is"
     # the matching id is fine
     assert advertise(client, tok, endpoint("https://new.example.org", id=first),
                      first).status_code == 200
@@ -3399,6 +3432,9 @@ def test_reset_knows_every_table_the_service_creates(tmp_path, monkeypatch):
     (lambda b: b.update(description="Ask for a token"), DESC_EXT),
     # credentials for the address do not belong on a public list
     (lambda b: b.update(header=["Authorization: Bearer s3cret"]), "public"),
+    (lambda b: b.update(address="https://alice:s3cret@a.example.org/r4"), "public"),
+    (lambda b: b.update(address="https://alice@a.example.org/r4"), "public"),
+    (lambda b: b.update(address="https://@a.example.org/r4"), "public"),
     (lambda b: b.update(extension=[{"url": DESC_EXT, "valueMarkdown": "x"}]),
      "one valueString"),
     (lambda b: b.update(extension=[{"url": DESC_EXT, "valueString": "a"},
@@ -3425,11 +3461,24 @@ def test_an_endpoint_this_server_would_mislabel_is_refused(client, mutate, fragm
             == "https://kept.example.org"
 
 
+def test_an_at_sign_after_the_host_is_not_a_credential(client):
+    tok = register(client, "Mastodon Fans")
+    for address in ("https://a.example.org/@team", "https://a.example.org/r4?who=a@b"):
+        res = advertise(client, tok, endpoint(address))
+        assert res.status_code == 201, address
+        assert res.json()["address"] == address
+
+
 def test_a_company_advertises_only_so_many_endpoints(client):
     tok = register(client, "Busy")
     for _ in range(app_module.MAX_ENDPOINTS):
         assert advertise(client, tok, endpoint()).status_code == 201
-    assert advertise(client, tok, endpoint()).status_code == 422
+    res = advertise(client, tok, endpoint())
+    assert res.status_code == 422
+    # the page shows this as it comes, so it speaks of its Edit and Remove
+    # buttons rather than of HTTP verbs
+    assert diagnostics(res) == ("A company can list %d addresses - remove one, "
+                                "or edit one of them instead" % app_module.MAX_ENDPOINTS)
     assert advertise(client, register(client, "Other"), endpoint()).status_code == 201
 
 
@@ -3476,6 +3525,35 @@ def test_whoami_names_the_company_behind_a_token(client):
     assert org["active"] is True
     assert client.get("/fhir/Organization/$me").status_code == 401
     assert client.get("/fhir/Organization/$me", headers={"X-Team-Token": "nope"}).status_code == 401
+
+
+def test_a_401_says_what_was_wrong_with_the_credential_sent(client):
+    """An unset $TOKEN in the documented curl sends a bare "Bearer"; that is
+    not a missing X-Team-Token header. Every 401 carries the challenge."""
+    tok = register(client, "Alpha")
+    cases = [
+        ({}, "No company token - send `Authorization: Bearer TOKEN`", "Bearer"),
+        ({"Authorization": "Bearer"},
+         "The Authorization header has no token after `Bearer`", "Bearer"),
+        ({"Authorization": "Bearer   "},
+         "The Authorization header has no token after `Bearer`", "Bearer"),
+        ({"Authorization": "Basic abc"},
+         "The Authorization header must be `Bearer TOKEN`", "Bearer"),
+        ({"Authorization": "Bearer nope"}, "Invalid company token",
+         'Bearer error="invalid_token"'),
+        ({"X-Team-Token": "nope"}, "Invalid company token",
+         'Bearer error="invalid_token"'),
+    ]
+    for headers, message, challenge in cases:
+        res = client.get("/fhir/Organization/$me", headers=headers)
+        assert res.status_code == 401, headers
+        assert diagnostics(res) == message, headers
+        assert res.headers["WWW-Authenticate"] == challenge, headers
+    # the scheme is case-insensitive, and X-Team-Token still wins over a
+    # header some proxy in front of the server may have added
+    for headers in ({"Authorization": "bearer " + tok},
+                    {"X-Team-Token": tok, "Authorization": "Basic abc"}):
+        assert client.get("/fhir/Organization/$me", headers=headers).status_code == 200
 
 
 def test_the_interop_tab_offers_screenshots(client):
@@ -3699,6 +3777,116 @@ def test_a_single_finding_is_asked_about_in_the_singular(client):
     # the same count on the banner and in the prompt: no "merged" note
     got = run_explain(client, EXPLAIN_GROUPS, "error", 2)
     assert "The 2 errors:\n\n1. " in got["prompt"]
+
+
+@needs_node
+def test_the_register_curl_carries_a_code_when_registration_is_gated(client, monkeypatch):
+    """The page's example, run through the page's own builder, is a request
+    the server accepts - with and without a registration code."""
+    js = page_script(client)
+    start = js.index("function setRegisterCurl(")
+    builder = js[start:js.index("\n}", start) + 2]
+    harness = builder + r"""
+const node = {};
+const $ = () => node;
+const origin = "http://x";
+setRegisterCurl(false); const open = node.textContent;
+setRegisterCurl(true); console.log(JSON.stringify([open, node.textContent]));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    open_curl, gated_curl = json.loads(proc.stdout)
+
+    def body(curl):
+        return json.loads(re.search(r"-d '(.*)'$", curl).group(1))
+
+    assert client.post("/fhir/$register", json=body(open_curl)).status_code == 200
+    gated = body(gated_curl)
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "REGISTRATION_CODE")
+    gated["parameter"][0]["valueString"] = "Gated Co"
+    assert client.post("/fhir/$register", json=gated).status_code == 200
+    # and the page switches to it whenever it learns registration is gated
+    assert js.count("setRegisterCurl(true)") == 2
+
+
+def page_handler(js, selector, event="click"):
+    """The source of the page's own `$(selector)` listener, ready to register
+    against a stubbed `$`."""
+    start = js.index('$("%s").addEventListener("%s"' % (selector, event))
+    return js[start:js.index("\n});\n", start) + 5]
+
+
+@needs_node
+def test_a_double_click_on_register_sends_one_registration(client):
+    """The register handler run in node against a stubbed page: a second
+    click while the first is in flight finds the button disabled, as a browser
+    would, and so sends nothing. A failed request frees it again."""
+    js = page_script(client)
+    harness = r"""
+const els = {};
+function $(sel) {
+  return els[sel] || (els[sel] = { value: sel === "#reg-name" ? "Acme" : "",
+    style: {}, hidden: true, disabled: false, textContent: "",
+    addEventListener(ev, fn) { this.handler = fn; } });
+}
+""" + page_handler(js, "#reg-btn") + r"""
+const btn = $("#reg-btn");
+const click = () => btn.disabled ? null : btn.handler();
+let calls = 0, settle;
+globalThis.fetch = () => { calls++; return new Promise((r) => { settle = r; }); };
+const detailText = () => "taken";
+(async () => {
+  const first = click();
+  click();
+  const during = [calls, btn.disabled];
+  settle({ ok: false, status: 409, json: async () => ({}) });
+  await first;
+  console.log(JSON.stringify([during, btn.disabled]));
+})();
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [[1, True], False]
+
+
+@needs_node
+def test_the_new_token_box_goes_once_the_field_holds_another_token(client):
+    """Registering shows the new token to save. Pasting a different company's
+    token, or clearing the field, must not leave it on show as if it were the
+    one in use."""
+    js = page_script(client)
+    start = js.index("function showCompanyCard(")
+    harness = js[start:js.index("\n}", start) + 2] + r"""
+const els = {};
+function $(sel) {
+  return els[sel] || (els[sel] = { value: "", style: {}, hidden: false,
+    textContent: "", parentNode: {} });
+}
+let me = { name: "Alpha" }, meState = "ok";
+const shown = [];
+for (const field of ["tB", "tA", ""]) {
+  $("#token-value").textContent = "tB";
+  $("#token-box").style.display = "block";
+  $("#token").value = field;
+  if (!field) me = null;
+  showCompanyCard(false);
+  shown.push($("#token-box").style.display);
+}
+console.log(JSON.stringify(shown));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["block", "none", "none"]
+
+
+def test_register_another_company_starts_from_a_clean_form(client):
+    """An error left from an earlier attempt - a double click's 409, say -
+    is not shown on a form the participant has only just opened."""
+    js = page_script(client)
+    assert '$("#reg-error").style.display = "none";' in page_handler(js, "#reg-another")
 
 
 def test_page_ids_are_unique(client):
