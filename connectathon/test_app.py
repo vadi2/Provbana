@@ -3341,6 +3341,37 @@ def test_a_single_finding_is_asked_about_in_the_singular(client):
     assert "The 2 errors:\n\n1. " in got["prompt"]
 
 
+@needs_node
+def test_the_register_curl_carries_a_code_when_registration_is_gated(client, monkeypatch):
+    """The page's example, run through the page's own builder, is a request
+    the server accepts - with and without a registration code."""
+    js = page_script(client)
+    start = js.index("function setRegisterCurl(")
+    builder = js[start:js.index("\n}", start) + 2]
+    harness = builder + r"""
+const node = {};
+const $ = () => node;
+const origin = "http://x";
+setRegisterCurl(false); const open = node.textContent;
+setRegisterCurl(true); console.log(JSON.stringify([open, node.textContent]));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    open_curl, gated_curl = json.loads(proc.stdout)
+
+    def body(curl):
+        return json.loads(re.search(r"-d '(.*)'$", curl).group(1))
+
+    assert client.post("/fhir/$register", json=body(open_curl)).status_code == 200
+    gated = body(gated_curl)
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "REGISTRATION_CODE")
+    gated["parameter"][0]["valueString"] = "Gated Co"
+    assert client.post("/fhir/$register", json=gated).status_code == 200
+    # and the page switches to it whenever it learns registration is gated
+    assert js.count("setRegisterCurl(true)") == 2
+
+
 def test_page_ids_are_unique(client):
     """$() is querySelector, so of two elements sharing an id only the first is
     ever reached. The EHDS document table and the submit tab's embedded view

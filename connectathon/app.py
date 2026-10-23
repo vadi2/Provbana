@@ -5510,7 +5510,10 @@ $("#reg-btn").addEventListener("click", async () => {
     if (!res.ok) {
       /* The organisers may gate registration; the field appears the moment the
          server says so, instead of cluttering an open event. */
-      if (res.status === 403) $("#reg-code-row").hidden = false;
+      if (res.status === 403) {
+        $("#reg-code-row").hidden = false;
+        setRegisterCurl(true);
+      }
       errBox.textContent = detailText(data) || ("Registration failed (" + res.status + ")");
       errBox.style.display = "block";
       return;
@@ -6142,7 +6145,10 @@ async function checkValidator() {
     const h = partsToObject(hRaw.parameter);
     if (h.maxBundleBytes) maxBundleBytes = h.maxBundleBytes;
     if (h.maxNoteChars) maxNote = h.maxNoteChars;
-    if (h.registerCodeRequired) $("#reg-code-row").hidden = false;
+    if (h.registerCodeRequired) {
+      $("#reg-code-row").hidden = false;
+      setRegisterCurl(true);
+    }
     /* NaN if the server sends something unparseable, and NaN fails the
        comparison in updatePracticeNote, so a bad value hides the notice
        rather than showing "Invalid Date". */
@@ -6299,11 +6305,18 @@ $("#submit-btn").addEventListener("click", async () => {
 
 /* ---- curl examples ---- */
 const origin = window.location.origin;
-$("#curl-register").textContent =
-  "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
-  "  -H 'Content-Type: application/fhir+json' \\\n" +
-  "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
-  + "[{\"name\":\"name\",\"valueString\":\"My Company\"}]}'";
+/* Redrawn with a `code` part once the server says registration is gated -
+   without one the example is a 403. */
+function setRegisterCurl(codeRequired) {
+  $("#curl-register").textContent =
+    "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
+    "  -H 'Content-Type: application/fhir+json' \\\n" +
+    "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
+    + "[{\"name\":\"name\",\"valueString\":\"My Company\"}"
+    + (codeRequired ? ",{\"name\":\"code\",\"valueString\":\"REGISTRATION_CODE\"}" : "")
+    + "]}'";
+}
+setRegisterCurl(false);
 $("#curl-submit").textContent =
   "curl -s -D - -X POST " + origin + "/fhir/Bundle/\\$validate \\\n" +
   "  -H 'Content-Type: application/fhir+json' \\\n" +
