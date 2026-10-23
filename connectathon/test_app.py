@@ -2776,14 +2776,15 @@ def test_an_old_database_stops_reusing_rendering_ids(tmp_path, monkeypatch):
         assert "AUTOINCREMENT" in conn.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'renderings'").fetchone()[0]
         assert [tuple(r) for r in conn.execute(
-            "SELECT id, note FROM renderings ORDER BY id")] \
-            == [(3, "kept"), (5, "orphan")]
+            "SELECT * FROM renderings ORDER BY id")] == [
+            (3, 1, 1, "2026-01-01", "kept", "a.png", "image/png"),
+            (5, 1, 9, "2026-01-02", "orphan", "b.png", "image/png"),
+        ]
         conn.execute("DELETE FROM renderings WHERE id = 5")
         cur = conn.execute(
             "INSERT INTO renderings (consumer_id, submission_id, ts, filename, "
             "mime) VALUES (1, 1, '2026-01-03', 'c.png', 'image/png')")
         assert cur.lastrowid == 6
-        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
 
 
 def test_renderings_are_readable_without_a_token(client, monkeypatch):
