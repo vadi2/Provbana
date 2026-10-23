@@ -8116,6 +8116,33 @@ SUBMIT_RESPONSE_HEADERS = {
     "Content-Location": ("where this bundle is now readable", "string"),
 }
 
+# What every error is, whoever raised it - the two exception handlers turn
+# them all into one - and which FastAPI documents as a {detail: [...]} of its
+# own instead.
+OPERATION_OUTCOME_SCHEMA = {
+    "type": "object",
+    "description": "A FHIR R4 OperationOutcome; `issue[].diagnostics` says "
+                   "what went wrong.",
+    "required": ["resourceType", "issue"],
+    "properties": {
+        "resourceType": {"type": "string", "enum": ["OperationOutcome"]},
+        "issue": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "code": {"type": "string"},
+                    "diagnostics": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+# The types sniff_image() admits, which are the only ones a Binary is served as.
+BINARY_TYPES = ("image/png", "image/jpeg", "image/webp")
+
 # Endpoints that read the token. Anything else is open.
 TOKEN_REQUIRED = {
     ("/fhir/Endpoint", "post"),
@@ -8127,6 +8154,20 @@ TOKEN_REQUIRED = {
     ("/fhir/DocumentReference/{rendering_id}", "put"),
     ("/fhir/DocumentReference/{rendering_id}", "delete"),
 }
+
+
+def _takes_any_text(param: dict) -> bool:
+    """Whether an OpenAPI parameter accepts whatever text it is sent - an
+    optional string, or a list of them - so validating it cannot fail."""
+    if param.get("required") and param.get("in") != "path":
+        return False
+    schema = param.get("schema", {})
+    return all(
+        option.get("type") in ("string", "null")
+        or (option.get("type") == "array"
+            and option.get("items", {}).get("type") == "string")
+        for option in schema.get("anyOf", [schema])
+    )
 
 
 def custom_openapi() -> dict:
@@ -8155,6 +8196,12 @@ def custom_openapi() -> dict:
         routes=app.routes,
     )
     schema["components"] = schema.get("components", {})
+    # Never sent: validation_error_to_outcome answers in an OperationOutcome.
+    for name in ("HTTPValidationError", "ValidationError"):
+        schema["components"].get("schemas", {}).pop(name, None)
+    schema["components"].setdefault("schemas", {})["OperationOutcome"] = \
+        OPERATION_OUTCOME_SCHEMA
+    outcome = {FHIR_JSON: {"schema": {"$ref": "#/components/schemas/OperationOutcome"}}}
     schema["components"]["securitySchemes"] = {
         "TeamToken": {
             "type": "apiKey",
@@ -8179,6 +8226,31 @@ def custom_openapi() -> dict:
                 op["security"] = [{"TeamToken": []}]
             if key in OPENAPI_BODIES:
                 op["requestBody"] = OPENAPI_BODIES[key]
+            responses = op["responses"]
+            # FastAPI assumes application/json; the routes answer through
+            # fhir_response or bundle_response, both fhir+json.
+            for status, response in responses.items():
+                if status.startswith("2") and "application/json" in response.get(
+                        "content", {}):
+                    response["content"] = {FHIR_JSON: {"schema": {"type": "object"}}}
+            # FastAPI lists a 422 on anything with a parameter; only one it
+            # cannot take as given - a number, say - can actually fail.
+            responses.pop("422", None)
+            if any(not _takes_any_text(p) for p in op.get("parameters", [])):
+                responses["422"] = {"description": "A parameter of the wrong type",
+                                    "content": outcome}
+            if key in TOKEN_REQUIRED:
+                responses["401"] = {"description": "No token, or not a company's",
+                                    "content": outcome}
+            if "{" in path:
+                responses["404"] = {"description": "Nothing has that id",
+                                    "content": outcome}
+            responses["default"] = {"description": "Any other error",
+                                    "content": outcome}
+    binary = schema["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
+    binary["content"] = {
+        mime: {"schema": {"type": "string", "format": "binary"}} for mime in BINARY_TYPES
+    }
     submit = schema["paths"]["/fhir/Bundle/$validate"]["post"]["responses"]["200"]
     submit["description"] = "The Matchbox OperationOutcome for this bundle."
     submit["content"] = {"application/fhir+json": {"schema": {"type": "object"}}}

@@ -2115,6 +2115,44 @@ def test_openapi_declares_the_team_token_as_a_security_scheme(client):
     assert "x-team-token" not in names and "authorization" not in names
 
 
+def test_openapi_documents_what_the_server_really_sends(client):
+    """FastAPI assumes application/json and its own {detail} error shape; the
+    server sends fhir+json, the image itself, and OperationOutcomes."""
+    spec = client.get("/openapi.json").json()
+    outcome = {"application/fhir+json": {
+        "schema": {"$ref": "#/components/schemas/OperationOutcome"}}}
+    assert "HTTPValidationError" not in json.dumps(spec)
+    assert spec["components"]["schemas"]["OperationOutcome"]["properties"][
+        "resourceType"]["enum"] == ["OperationOutcome"]
+    for path, ops in spec["paths"].items():
+        for verb, op in ops.items():
+            responses = op["responses"]
+            assert responses["default"]["content"] == outcome, (path, verb)
+            for status, response in responses.items():
+                assert "application/json" not in response.get("content", {}), \
+                    (path, verb, status)
+                if not status.startswith("2"):
+                    assert response["content"] == outcome, (path, verb, status)
+    submissions = spec["paths"]["/fhir/$submissions"]["get"]["responses"]
+    assert list(submissions["200"]["content"]) == ["application/fhir+json"]
+    assert "422" in submissions          # count=abc
+    res = client.get("/fhir/$submissions?count=abc")
+    assert res.status_code == 422 and diagnostics(res)
+    # an id is a string and a search takes any text, so neither can fail to parse
+    for path, verb in (("/fhir/Binary/{rendering_id}", "get"),
+                       ("/fhir/Endpoint/{endpoint_id}", "put"),
+                       ("/fhir/Organization", "get")):
+        assert "422" not in spec["paths"][path][verb]["responses"], path
+    assert client.get("/fhir/Binary/abc").status_code == 404
+    assert "404" in spec["paths"]["/fhir/Endpoint/{endpoint_id}"]["get"]["responses"]
+    assert "401" in spec["paths"]["/fhir/Endpoint"]["post"]["responses"]
+    assert "401" not in spec["paths"]["/fhir/Endpoint"]["get"]["responses"]
+    # a Binary is the image, as whichever type its bytes proved
+    binary = spec["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
+    assert set(binary["content"]) == {
+        app_module.sniff_image(raw)[0] for raw in (png_bytes(), JPEG, WEBP)}
+
+
 def test_openapi_leaves_the_ui_out(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert "/" not in paths and "/favicon.svg" not in paths
