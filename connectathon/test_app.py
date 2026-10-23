@@ -3056,6 +3056,12 @@ def test_an_unknown_search_parameter_is_passed_over_and_the_self_link_says_so(
     assert "`_id`" in diagnostics(res)
     assert client.get("/fhir/Organization?name=lit", headers={
         "Prefer": "handling=strict"}).json()["total"] == 1
+    # one preference among others, in any case, is still asked for
+    assert client.get("/fhir/Organization?_id=litware", headers={
+        "Prefer": "return=minimal, Handling=Strict"}).status_code == 400
+    # but a preference that only starts the same way is not
+    assert client.get("/fhir/Organization?_id=litware", headers={
+        "Prefer": "handling=strictish"}).status_code == 200
 
 
 def test_screenshots_are_searched_with_repeats_anded_and_commas_ored(

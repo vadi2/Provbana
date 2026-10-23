@@ -2148,10 +2148,13 @@ def search_params(request: Request, supported: set[str]) -> list[tuple[str, str]
     searched on, which is what these pairs are for. A client that asks for
     `Prefer: handling=strict` gets the 400 instead. A modifier or a chain is
     another matter: passed over, `name:text=fab` would answer with every
-    company, so one not supported here is refused either way, as FHIR says.
-    A blank value is the same as not asking, and is not applied.
+    company, so one not supported here is refused either way - FHIR requires
+    that of a modifier, and a chain ignored goes wrong the same way. A blank
+    value is the same as not asking, and is not applied.
     """
-    strict = "handling=strict" in request.headers.get("prefer", "").replace(" ", "")
+    # Preference names and values are case-insensitive (RFC 7240).
+    prefer = request.headers.get("prefer", "").lower().replace(" ", "")
+    strict = "handling=strict" in re.split(r"[,;]", prefer)
     applied = []
     for name, value in request.query_params.multi_items():
         if name in supported:
