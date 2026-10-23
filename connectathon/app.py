@@ -5467,9 +5467,9 @@ async function refreshLeaderboard() {
     const rows = paramEntries(await res.json(), "entry").map(leaderboardRow);
     $("#lb-empty").style.display = rows.length ? "none" : "block";
     $("#lb").style.display = rows.length ? "table" : "none";
-    /* No podium for a team that has not scored: at the start, or with fewer
-       than three on the board, rank alone would hand gold to whoever sorts
-       first by name. */
+    /* No podium for a team that has not scored: at the start, or while fewer
+       than three teams have scored, rank alone would hand a medal to whoever
+       sorts first by name. */
     const html = rows.map((r) => `
       <tr class="${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
