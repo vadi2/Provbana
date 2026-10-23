@@ -3014,6 +3014,73 @@ def test_endpoints_are_searched_by_company_and_kind(client):
     assert found("?organization=alpha&connection-type="
                  "http://terminology.hl7.org/CodeSystem/endpoint-connection-type"
                  "|hl7-fhir-rest") == [("Alpha", "hl7-fhir-rest")]
+    # a repeat is ANDed - nobody is both companies - whichever comes first
+    assert found("?organization=alpha&organization=beta") == []
+    assert found("?organization=beta&organization=alpha") == []
+    assert found("?connection-type=web-page&organization=alpha,beta"
+                 "&organization=beta") == [("Beta", "web-page")]
+
+
+def test_an_unsupported_modifier_or_chain_is_refused_not_ignored(client):
+    """Ignored, `name:text=fab` answered with every company there is."""
+    register(client, "Fabrikam")
+    register(client, "Litware")
+    for path in ("/fhir/Organization?name:text=fab",
+                 "/fhir/Organization?name:missing=true",
+                 "/fhir/Endpoint?organization:missing=true",
+                 "/fhir/Endpoint?organization.name=x",
+                 "/fhir/DocumentReference?author:missing=true"):
+        res = client.get(path)
+        assert res.status_code == 400, path
+        assert diagnostics(res).startswith("Search parameter `"), path
+    assert diagnostics(client.get("/fhir/Organization?name:text=fab")) == (
+        "Search parameter `name:text` is not supported here; this search "
+        "takes name, name:contains, name:exact")
+
+
+def test_an_unknown_search_parameter_is_passed_over_and_the_self_link_says_so(
+        client):
+    register(client, "Fabrikam")
+    register(client, "Litware")
+    body = client.get("/fhir/Organization?_id=litware&name:contains=a").json()
+    assert body["total"] == 2           # _id is not a search this server has
+    assert body["link"] == [{"relation": "self", "url":
+                             "http://testserver/fhir/Organization?name:contains=a"}]
+    # nothing applied is no query at all, and a blank value is not applied
+    assert client.get("/fhir/Endpoint?bogus=1&organization=").json()["link"][0][
+        "url"] == "http://testserver/fhir/Endpoint"
+    # a client that asks for strict handling gets the refusal instead
+    res = client.get("/fhir/Organization?_id=litware",
+                     headers={"Prefer": "handling=strict"})
+    assert res.status_code == 400
+    assert "`_id`" in diagnostics(res)
+    assert client.get("/fhir/Organization?name=lit", headers={
+        "Prefer": "handling=strict"}).json()["total"] == 1
+
+
+def test_screenshots_are_searched_with_repeats_anded_and_commas_ored(
+        client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    submit(client, tok_d, outcome(), monkeypatch, body=CLINICAL_BODY)
+    add_shot(client, tok_c, "producer")
+    add_shot(client, tok_c, "third")
+    add_shot(client, tok_d, "producer")
+
+    def found(query):
+        return sorted((custodian_of(s), author_of(s))
+                      for s in shots(client.get("/fhir/DocumentReference?" + query)))
+
+    assert found("custodian=producer&custodian=third") == []
+    assert found("custodian=producer,Organization/third&author=consumer") == [
+        ("producer", "consumer"), ("third", "consumer")]
+    assert found("author=consumer&author=third") == []
+    doc = param_entries(client.get("/fhir/$exchange"))
+    producer_doc = next(d["id"] for d in doc if d["organizationSlug"] == "producer")
+    assert found("related=Bundle/%d" % producer_doc) == [
+        ("producer", "consumer"), ("producer", "third")]
+    assert found("related=%d,andrea-cross-border" % producer_doc) \
+        == found("related=%d" % producer_doc)
 
 
 def test_an_endpoint_is_changed_only_by_the_company_advertising_it(client):

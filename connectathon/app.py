@@ -2020,10 +2020,14 @@ def fhir_base(request: Request) -> str:
     X-Forwarded-Proto; uvicorn believes that header only from 127.0.0.1, and
     Caddy is another container, so it is read here.
     """
+    return str(request.base_url.replace(scheme=_scheme(request))).rstrip("/") \
+        + FHIR_BASE
+
+
+def _scheme(request: Request) -> str:
     proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
-    if proto not in ("http", "https"):
-        proto = request.url.scheme
-    return str(request.base_url.replace(scheme=proto)).rstrip("/") + FHIR_BASE
+    return proto if proto in ("http", "https") else request.url.scheme
+
 
 # HTTP status -> the OperationOutcome issue code FHIR asks for. Anything not
 # listed falls back to "processing", the spec's own catch-all, so an
@@ -2136,17 +2140,47 @@ def parameters(pairs) -> dict:
     return resource
 
 
-def searchset(request: Request, resources: list, total: int | None = None) -> dict:
+def search_params(request: Request, supported: set[str]) -> list[tuple[str, str]]:
+    """The (name, value) pairs of a search that this server applies, in order.
+
+    FHIR lets a server pass over a parameter it does not know - lenient is the
+    default handling - as long as the self link then shows what was really
+    searched on, which is what these pairs are for. A client that asks for
+    `Prefer: handling=strict` gets the 400 instead. A modifier or a chain is
+    another matter: passed over, `name:text=fab` would answer with every
+    company, so one not supported here is refused either way, as FHIR says.
+    A blank value is the same as not asking, and is not applied.
+    """
+    strict = "handling=strict" in request.headers.get("prefer", "").replace(" ", "")
+    applied = []
+    for name, value in request.query_params.multi_items():
+        if name in supported:
+            if value:
+                applied.append((name, value))
+        elif strict or ":" in name or "." in name:
+            raise HTTPException(
+                400, detail="Search parameter `%s` is not supported here; this "
+                            "search takes %s" % (name, ", ".join(sorted(supported))))
+    return applied
+
+
+def searchset(request: Request, resources: list,
+              applied: list[tuple[str, str]], total: int | None = None) -> dict:
     """A searchset Bundle, which is how FHIR returns a list of resources.
 
     `total` defaults to the number carried, which is right whenever the whole
     result is in one page - this server never pages, so it always is. No
-    match is no `entry`, never an empty one, which FHIR forbids.
+    match is no `entry`, never an empty one, which FHIR forbids. The self
+    link carries the `applied` parameters only, so a client can see which of
+    the ones it sent were passed over.
     """
+    self_url = request.url.replace(
+        scheme=_scheme(request), query=urllib.parse.urlencode(applied, safe=":,/"))
     bundle = {
         "resourceType": "Bundle",
         "type": "searchset",
         "total": len(resources) if total is None else total,
+        "link": [{"relation": "self", "url": str(self_url)}],
     }
     if resources:
         base = fhir_base(request)
@@ -2455,6 +2489,7 @@ def search_organizations(
     name_contains: list[str] | None = Query(None, alias="name:contains"),
     name_exact: list[str] | None = Query(None, alias="name:exact"),
 ) -> Response:
+    applied = search_params(request, {"name", "name:contains", "name:exact"})
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
@@ -2467,7 +2502,8 @@ def search_organizations(
                 organization_resource(r, endpoints.get(r["id"], ()))
                 for r in rows
                 if name_matches(r["name"], name, name_contains, name_exact)
-            ]
+            ],
+            applied,
         )
     )
 
@@ -3450,32 +3486,35 @@ def add_rendering(
 )
 def list_renderings(
     request: Request,
-    related: str | None = None,
-    custodian: str | None = None,
-    author: str | None = None,
+    related: list[str] | None = Query(None),
+    custodian: list[str] | None = Query(None),
+    author: list[str] | None = Query(None),
 ) -> Response:
+    applied = search_params(request, {"related", "custodian", "author"})
     where, params = [], []
-    if related:
+    # A reference takes the bare id or Type/id. Repeats are ANDed and the
+    # commas inside one ORed, as FHIR reads every search parameter.
+    for column, values, prefix in (("p.slug", custodian, "Organization/"),
+                                   ("c.slug", author, "Organization/")):
+        for ors in search_terms(values, fold=False):
+            where.append("%s IN (%s)" % (column, ", ".join("?" * len(ors))))
+            params.extend(o.removeprefix(prefix) for o in ors)
+    for ors in search_terms(related, fold=False):
         # A Bundle id that names no submission - a sample's slug, say - is
         # one nobody has screenshotted, not a malformed search.
-        sub_id = row_id(related)
-        if sub_id is None:
-            return fhir_response(searchset(request, []))
-        where.append("r.submission_id = ?")
-        params.append(sub_id)
-    if custodian:
-        where.append("p.slug = ?")
-        params.append(custodian)
-    if author:
-        where.append("c.slug = ?")
-        params.append(author)
+        ids = [i for i in (row_id(o.removeprefix("Bundle/")) for o in ors)
+               if i is not None]
+        if not ids:
+            return fhir_response(searchset(request, [], applied))
+        where.append("r.submission_id IN (%s)" % ", ".join("?" * len(ids)))
+        params.extend(ids)
     sql = RENDERING_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY r.ts DESC, r.id DESC"
     with connect() as conn:
         rows = [documentreference_resource(row) for row in conn.execute(sql, params)]
-    return fhir_response(searchset(request, rows))
+    return fhir_response(searchset(request, rows, applied))
 
 
 @app.get("/fhir/DocumentReference/{rendering_id}",
@@ -3851,24 +3890,26 @@ def create_endpoint(
 )
 def search_endpoints(
     request: Request,
-    organization: str | None = None,
-    connection_type: str | None = Query(None, alias="connection-type"),
+    organization: list[str] | None = Query(None),
+    connection_type: list[str] | None = Query(None, alias="connection-type"),
 ) -> Response:
+    applied = search_params(request, {"organization", "connection-type"})
     # A reference search parameter takes the bare id or Type/id; a token one
     # may carry its system before a |, which is dropped rather than checked.
-    slugs = {v.removeprefix("Organization/") for v in organization.split(",")} \
-        if organization else None
-    kinds = {v.rpartition("|")[2] for v in connection_type.split(",")} \
-        if connection_type else None
+    # Repeats are ANDed, the commas inside one ORed.
+    slugs = [{o.removeprefix("Organization/") for o in ors}
+             for ors in search_terms(organization, fold=False)]
+    kinds = [{o.rpartition("|")[2] for o in ors}
+             for ors in search_terms(connection_type, fold=False)]
     with connect() as conn:
         rows = conn.execute(
             ENDPOINT_SELECT + " ORDER BY t.name COLLATE NOCASE, e.id"
         ).fetchall()
     return fhir_response(searchset(request, [
         endpoint_resource(r) for r in rows
-        if (slugs is None or r["team_slug"] in slugs)
-        and (kinds is None or r["kind"] in kinds)
-    ]))
+        if all(r["team_slug"] in ors for ors in slugs)
+        and all(r["kind"] in ors for ors in kinds)
+    ], applied))
 
 
 @app.get("/fhir/Endpoint/{endpoint_id}",
