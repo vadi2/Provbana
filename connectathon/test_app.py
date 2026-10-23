@@ -2643,6 +2643,42 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
     assert shots(client.get("/fhir/DocumentReference?related=99999")) == []
 
 
+def test_renderings_search_takes_references_as_the_resources_carry_them(
+        client, monkeypatch):
+    """custodian, author and related are reference parameters: the value
+    copied out of a resource (Organization/x, Bundle/1) has to find it, and a
+    comma between values means either - as Endpoint?organization already does."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    submit(client, tok_d, outcome(), monkeypatch)
+    add_shot(client, tok_c, "producer", note="consumer on producer")
+    add_shot(client, tok_c, "third", note="consumer on third")
+    add_shot(client, tok_d, "producer", note="third on producer")
+    entries = param_entries(client.get("/fhir/$exchange"))
+    doc = {e["organizationSlug"]: e["id"] for e in entries}
+
+    def notes(query):
+        res = client.get("/fhir/DocumentReference?" + query)
+        assert res.status_code == 200, res.text
+        return sorted(d["description"] for d in shots(res))
+
+    on_producer = ["consumer on producer", "third on producer"]
+    assert notes("custodian=Organization/producer") == on_producer
+    assert notes("author=Organization/third") == ["third on producer"]
+    assert notes("related=Bundle/%d" % doc["producer"]) == on_producer
+    everything = sorted(on_producer + ["consumer on third"])
+    assert notes("custodian=producer,Organization/third") == everything
+    assert notes("author=consumer,third") == everything
+    assert notes("related=%d,Bundle/%d" % (doc["producer"], doc["third"])) \
+        == everything
+    # the filters still narrow one another
+    assert notes("custodian=Organization/producer&author=Organization/consumer") \
+        == ["consumer on producer"]
+    # an id that cannot be a Bundle matches nothing rather than being refused
+    assert notes("related=Bundle/abc") == []
+    assert notes("related=abc,Bundle/%d" % doc["third"]) == ["consumer on third"]
+
+
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     entry = param_entries(client.get("/fhir/$exchange"))[0]

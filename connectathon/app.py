@@ -3418,25 +3418,37 @@ def add_rendering(
     description=(
         "Newest first, as a searchset. Filter by `related` (a Bundle id), by "
         "`custodian` (the company whose document it is) or by `author` (the "
-        "company that took the screenshot). Unfiltered it is every screenshot "
-        "the event has collected."
+        "company that took the screenshot). Each takes the bare id or "
+        "Type/id, and a comma-separated list matches any of them. Unfiltered "
+        "it is every screenshot the event has collected."
     ),
 )
 def list_renderings(
-    related: int | None = None,
+    related: str | None = None,
     custodian: str | None = None,
     author: str | None = None,
 ) -> Response:
     where, params = [], []
-    if related is not None:
-        where.append("r.submission_id = ?")
-        params.append(related)
+
+    def match(column: str, values: list) -> None:
+        # No value that could be an id here means nothing can match it.
+        if not values:
+            where.append("0")
+            return
+        where.append("%s IN (%s)" % (column, ", ".join("?" * len(values))))
+        params.extend(values)
+
+    # A reference search parameter takes the bare id or Type/id, as on
+    # Endpoint's organization, and a comma between values means either.
+    if related:
+        match("r.submission_id", [
+            int(v) for v in (v.removeprefix("Bundle/") for v in related.split(","))
+            if v.isascii() and v.isdigit()
+        ])
     if custodian:
-        where.append("p.slug = ?")
-        params.append(custodian)
+        match("p.slug", [v.removeprefix("Organization/") for v in custodian.split(",")])
     if author:
-        where.append("c.slug = ?")
-        params.append(author)
+        match("c.slug", [v.removeprefix("Organization/") for v in author.split(",")])
     sql = RENDERING_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
