@@ -5528,6 +5528,11 @@ def mpd_collection(*resources):
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "MedicationRequest",
                      "meta": {"profile": [MPD_REQUEST + "|9.9.9"]}})),
+    # A bare major is not resolved either: Matchbox reports `|1` as "could
+    # not be found", although the loaded package is 1.0.0.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|1"]}})),
     # Only a Medication claims MPD: there is no prescription or dispense at all.
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "Medication", "meta": {"profile": [
@@ -5586,6 +5591,19 @@ def test_an_mpd_bundle_whose_orders_all_claim_mpd_still_earns_the_bonus(client,
         {"resourceType": "Patient"}))
     assert res.headers["X-Pass"] == "true"
     assert res.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+
+def test_an_mpd_claim_at_major_minor_counts_as_checked(client, monkeypatch):
+    """Matchbox resolves `|1.0` to the loaded 1.0.0 profile and checks it in
+    full, so the order was held to the guide and must not be failed as
+    unchecked."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch, body=mpd_collection(
+        {"resourceType": "MedicationRequest",
+         "meta": {"profile": [MPD_REQUEST + "|1.0"]}}))
+    assert res.headers["X-Pass"] == "true"
+    assert not [i for i in res.json()["issue"] if i["severity"] == "error"]
 
 
 def test_the_mpd_claim_check_leaves_other_categories_alone():
