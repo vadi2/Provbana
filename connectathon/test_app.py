@@ -1109,6 +1109,23 @@ def test_index_navigates_through_the_hash(client):
     assert "'<a href=\"#clinical/submission/'" in text
 
 
+def test_index_keeps_a_deep_linked_card_in_view_while_the_tab_loads(client):
+    """A cold #send-direct or #other-documents scrolled once, before the tab's
+    lists arrived; they then filled in above the card and pushed it off screen
+    on any connection slower than localhost."""
+    text = client.get("/").text
+    route = text[text.index("function applyRoute("):]
+    route = route[:route.index("\n}\n")]
+    # the card is pinned when it is scrolled to, and every route starts unpinned
+    assert route.index("pinnedAnchor = null;") < route.index("pinnedAnchor = anchor;")
+    # pinned means scrolled to again whenever the page changes height
+    assert "if (pinnedAnchor) pinnedAnchor.scrollIntoView(" in text
+    assert "}).observe(document.body);" in text
+    # and the reader taking over ends it, so nothing yanks the page back
+    assert ('for (const type of ["wheel", "touchstart", "keydown", "pointerdown"])'
+            in text)
+
+
 def test_index_hides_identifier_assigning_authorities(client):
     """The OID behind a patient identifier is plumbing. The API still carries
     it - machines need it - but no reader is shown it."""

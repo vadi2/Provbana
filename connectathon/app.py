@@ -5437,8 +5437,22 @@ function showTab(name) {
   if (name === "submit") checkValidator();
 }
 
+/* A deep link to a card scrolls to it before the tab's lists have loaded, and
+   they land above it and push it out of view. So the card stays pinned to the
+   top while the page is still growing, until the reader scrolls, clicks or
+   types, or the route moves on. */
+let pinnedAnchor = null;
+new ResizeObserver(() => {
+  if (pinnedAnchor) pinnedAnchor.scrollIntoView({ block: "start" });
+}).observe(document.body);
+for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
+  window.addEventListener(type, () => { pinnedAnchor = null; },
+                          { capture: true, passive: true });
+}
+
 function applyRoute(scroll) {
   const parts = routeParts();
+  pinnedAnchor = null;
   /* A hash that is not a tab may be a deep link to a card inside one, such as
      #other-documents or #send-direct. The card's own tab is shown, a folded
      card is opened, and it is scrolled into view; anything else falls through
@@ -5452,6 +5466,7 @@ function applyRoute(scroll) {
   if (panel) {
     if (anchor.tagName === "DETAILS") anchor.open = true;
     anchor.scrollIntoView({ block: "start" });
+    pinnedAnchor = anchor;
   }
   if (tab !== "clinical") return;
   if (!parts[1]) {
