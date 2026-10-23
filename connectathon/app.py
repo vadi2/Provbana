@@ -4559,6 +4559,10 @@ input[type=file] { font-size: 0.84rem; color: var(--muted); }
 .issue-toolbar { display: flex; align-items: center; justify-content: space-between;
   gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .issue-toolbar .issue-summary { margin-bottom: 0; }
+/* The menu opens leftwards from the button's right edge, so the button stays
+   at the right even when a phone wraps it onto its own line - at the left, the
+   menu started off the screen. */
+.issue-toolbar .menu-wrap { margin-left: auto; }
 .menu-wrap { position: relative; display: inline-block; }
 /* Needed because the rule above is an author rule and outranks the UA sheet's
    [hidden] { display: none } - without this, wrap.hidden = true has no effect

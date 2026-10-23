@@ -1159,6 +1159,16 @@ def test_index_offers_to_explain_the_errors_with_an_assistant(client):
     assert 'id="explain-text"' in text
 
 
+def test_the_explain_menu_opens_on_screen_when_a_phone_wraps_the_toolbar(client):
+    """The menu hangs leftwards from the button's right edge. Wrapped onto its
+    own line at the left on a phone, the button took the menu 47px off the
+    screen - so the button keeps to the right of its line."""
+    text = client.get("/").text
+    assert ".menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0;" in text
+    assert ".issue-toolbar { display: flex;" in text and "flex-wrap: wrap;" in text
+    assert ".issue-toolbar .menu-wrap { margin-left: auto; }" in text
+
+
 # ------------------------------------------------------------- sample documents
 
 
