@@ -943,6 +943,15 @@ def test_a_document_bundle_without_a_composition_still_reports_orphans():
     assert s["sections"] == [] and len(s["unreferenced"]) == 1
 
 
+def test_a_collection_with_nothing_clinical_shows_what_it_has():
+    s = app_module.summarize_bundle({"resourceType": "Bundle", "type": "collection",
+                                     "entry": [{"resource": {"resourceType": "Patient"}},
+                                               {"resource": {"resourceType": "DiagnosticReport",
+                                                             "code": {"text": "CT head"}}}]})
+    assert [[i["label"] for i in sec["items"]] for sec in s["sections"]] == [["CT head"]]
+    assert s["unreferenced"] == []
+
+
 @pytest.mark.parametrize("bundle", [
     {"resourceType": "Bundle", "meta": {"profile": 5}},
     {"resourceType": "Bundle", "entry": 5},

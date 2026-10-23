@@ -1600,9 +1600,13 @@ def summarize_bundle(bundle) -> dict:
         # A collection - a prescription travels as one - has no Composition for
         # its entries to be orphaned from. Its clinical entries are its
         # content; the rest (the prescriber, the RequestGroup tying the orders
-        # together) are their context, as an author is a document's.
-        items = [_render_resource(e["resource"], by_ref) for e in entries
-                 if e["resource"].get("resourceType") in ITEM_CATEGORIES]
+        # together) are their context, as an author is a document's. A bundle
+        # with no clinical entry at all shows what it has rather than nothing.
+        content = [e["resource"] for e in entries
+                   if e["resource"].get("resourceType") not in ("Composition", "Patient")]
+        items = [_render_resource(r, by_ref) for r in content
+                 if r.get("resourceType") in ITEM_CATEGORIES]
+        items = items or [_render_resource(r, by_ref) for r in content]
         if items:
             summary["sections"].append({"title": "Entries", "kind": "other",
                                         "items": items, "empty_reason": None,
