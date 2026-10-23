@@ -1049,6 +1049,11 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     assert 'const CV_DEFAULT = "document";' in text
     assert "let cvMode = CV_DEFAULT;" in text
     assert '+ "/" + CV_DEFAULT);' in text
+    # and a link that names no view (the list's own links, a partner's document)
+    # resets it too, so following one and reloading it show the same view
+    assert ("cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3]"
+            " : CV_DEFAULT;") in text
+    assert "if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode" not in text
     # the switcher is rebuilt with each document rather than parked in the
     # picker card, so it has to come from the render path
     assert "function cvModesHtml(" in text

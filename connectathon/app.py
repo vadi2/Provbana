@@ -5459,7 +5459,9 @@ function applyRoute(scroll) {
     go("clinical/sample/" + DEFAULT_SAMPLE + "/" + CV_DEFAULT, true);
     return;
   }
-  if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode = parts[3];
+  /* A route without a view opens in the default one, not in whichever view
+     the last document was left in, so a link and a reload of it agree. */
+  cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3] : CV_DEFAULT;
   /* The tab link remembers the document you were reading, so a trip to the
      leaderboard and back does not throw your place away. */
   document.querySelector('.tab-btn[data-tab="clinical"]')
