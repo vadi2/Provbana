@@ -5533,6 +5533,13 @@ def mpd_collection(*resources):
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "MedicationRequest",
                      "meta": {"profile": [MPD_REQUEST + "|1"]}})),
+    # A major.minor counts only when it is the loaded 1.0.0's.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|1.1"]}})),
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|9.9"]}})),
     # Claims a profile, but not an MPD one: base R4 is all it is held to.
     ("/fhir/Bundle/$validate",
      mpd_collection({"resourceType": "MedicationRequest", "meta": {"profile": [
