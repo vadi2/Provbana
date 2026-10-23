@@ -2582,6 +2582,61 @@ def test_care_plan_shows_the_activity_not_the_plan(client):
     assert plan["note"]
 
 
+def test_ville_airway_plan_shows_its_steps_and_who_to_ring(client):
+    """The airway plan is what the Ville scenario turns on: every step of it,
+    the plan's own status rather than its first step's, and the Karolinska
+    team it names."""
+    summary = client.get("/ui/documents/ville-difficult-airway").json()["summary"]
+    items = [i for sec in summary["sections"] for i in sec["items"]]
+    airway = next(i for i in items if i["label"].startswith("Luftvägsplan"))
+    assert airway["status"] == "active"
+    assert len(airway["lines"]) == 5
+    assert airway["lines"][2].startswith("Förstahandsval: nasal fiberoptisk intubation")
+    infection = next(i for i in items if i["label"].startswith("Infektionsplan"))
+    assert infection["lines"][0].startswith("Vid feber över 38,5")
+    # three plans name the team; it is shown once, right after the first
+    teams = [i for i in items if i["label"] == "Villes vårdteam på Karolinska"]
+    assert len(teams) == 1 and items.index(teams[0]) == items.index(airway) + 1
+    team = teams[0]
+    assert team["detail"] == "phone +46 8 000 00 10"
+    assert team["lines"][0] == "Dr Hanna Ekholm, Barnreumatolog, patientansvarig läkare"
+    assert "barnanestesijouren +46 8 000 00 11" in team["note"]
+    assert "not coded" not in team["gaps"]
+    text = client.get("/").text
+    assert text.count("+ cvLinesHtml(") == 2      # document and timeline rows
+
+
+def test_a_plan_step_carries_its_own_news():
+    """In a plan of several steps, a cancelled one says so beside it; a team
+    member with no display is named from the resource it points at."""
+    plan = {"resourceType": "CarePlan", "id": "cp", "status": "active",
+            "intent": "plan", "title": "Follow-up", "activity": [
+                {"detail": {"status": "scheduled", "description": "Bloods",
+                            "scheduledString": "monthly"}},
+                {"detail": {"status": "cancelled", "code": {"text": "Echo"}}},
+                {"detail": {"status": "not-started", "description": "Follow-up"}},
+                "junk", {"detail": "junk"}],
+            "careTeam": [{"reference": "CareTeam/t"}, {"reference": "CareTeam/t"},
+                         {"reference": "Patient/p"}, "junk"]}
+    team = {"resourceType": "CareTeam", "id": "t", "participant": [
+        {"member": {"reference": "Practitioner/dr"}},
+        {"role": [{"text": "Nurse"}]}, "junk"],
+        "telecom": [{"value": "123"}, {"system": "email"}]}
+    bundle = _doc("18776-5", "Plan of care", plan)
+    bundle["entry"] += [{"resource": team}, {"resource": {
+        "resourceType": "Practitioner", "id": "dr",
+        "name": [{"given": ["Ann"], "family": "Berg"}]}}]
+    items = _items(bundle)
+    assert [i["label"] for i in items] == ["Follow-up", "Care team"]
+    assert items[0]["status"] == "active"
+    assert items[0]["lines"] == ["Bloods (scheduled monthly)", "Echo (cancelled)"]
+    assert items[1]["lines"] == ["Ann Berg", "Nurse"]
+    assert items[1]["detail"] == "123"
+    # a section that also lists the team itself does not get it twice
+    bundle["entry"][0]["resource"]["section"][0]["entry"].append({"reference": "CareTeam/t"})
+    assert [i["label"] for i in _items(bundle)] == ["Follow-up", "Care team"]
+
+
 def test_device_use_shows_when_the_device_went_in(client):
     summary = client.get("/ui/documents/arne-complex-care").json()["summary"]
     items = [i for sec in summary["sections"] for i in sec.get("items", [])]

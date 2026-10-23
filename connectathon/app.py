@@ -1194,7 +1194,8 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
     status = (item.get("status") or "").strip().lower()
     flags: list = []
     gaps: list = []
-    if not code:
+    # a care team is people and phone numbers, with nothing to code
+    if not code and rtype != "CareTeam":
         gaps.append("not coded")
     if not date and category in DATE_EXPECTED:
         gaps.append("no date")
@@ -1325,6 +1326,7 @@ def _render_resource(resource, by_ref) -> dict:
     rtype = rtype if isinstance(rtype, str) and rtype else "Resource"
     status = resource.get("status") if isinstance(resource.get("status"), str) else None
     detail = None
+    lines: list = []
     if rtype == "MedicationAdministration":
         label = _medication_name(resource, by_ref)
         given = _choice_str(resource, "effective")
@@ -1413,17 +1415,30 @@ def _render_resource(resource, by_ref) -> dict:
         label = label or "Care plan"
         # The activity is what a reader acts on: a plan can be "active" while
         # its one appointment is cancelled, and the cancellation is the news.
-        activity = _first_activity_detail(resource)
+        # A plan of several steps is its steps, each one listed; no one step
+        # speaks for the plan, so its own status stands.
+        activities = _activity_details(resource)
         parts = []
-        if activity is not None:
+        if len(activities) == 1:
+            activity = activities[0]
             act_status = activity.get("status")
             if isinstance(act_status, str) and act_status.strip():
                 status = act_status.strip()
-            scheduled = _period_str(activity.get("scheduledPeriod")) or _first_str(
-                activity, "scheduledString"
-            )
+            scheduled = _activity_scheduled(activity)
             if scheduled:
                 parts.append(f"scheduled {scheduled}")
+        for activity in activities:
+            text = _first_str(activity, "description") or _cc_display(activity.get("code"))
+            if not text or text == label:
+                continue
+            extra = []
+            if len(activities) > 1:
+                if activity.get("status") in ACTIVITY_NEWS:
+                    extra.append(activity["status"])
+                scheduled = _activity_scheduled(activity)
+                if scheduled:
+                    extra.append(f"scheduled {scheduled}")
+            lines.append(text + (f" ({', '.join(extra)})" if extra else ""))
         period = resource.get("period")
         span = _period_str(period)
         if span:
@@ -1434,6 +1449,25 @@ def _render_resource(resource, by_ref) -> dict:
             else:
                 parts.append(f"plan until {span}")
         detail = "; ".join(parts) or None
+    elif rtype == "CareTeam":
+        # Who to ring. summarize_bundle lists a team after the plan that names
+        # it, since no section points at a team directly.
+        label = _first_str(resource, "name") or "Care team"
+        participants = resource.get("participant")
+        for part in participants if isinstance(participants, list) else []:
+            if not isinstance(part, dict):
+                continue
+            who = _member_name(part.get("member"), by_ref)
+            roles = part.get("role")
+            role = _cc_display(roles[0]) if isinstance(roles, list) and roles else None
+            if who or role:
+                lines.append(", ".join(p for p in (who, role) if p))
+        telecoms = resource.get("telecom")
+        detail = "; ".join(
+            f"{t['system']} {t['value']}" if isinstance(t.get("system"), str) else t["value"]
+            for t in (telecoms if isinstance(telecoms, list) else [])
+            if isinstance(t, dict) and isinstance(t.get("value"), str)
+        ) or None
     elif rtype == "Device":
         label = _cc_display(resource.get("type")) or "Device"
     elif rtype == "DeviceUseStatement":
@@ -1471,17 +1505,43 @@ def _render_resource(resource, by_ref) -> dict:
             label = _humanize_type(rtype)
     item = {"label": label, "detail": detail, "status": status,
             "note": _note_text(resource) if rtype != "Flag" else _flag_note(resource)}
+    if lines:
+        # A plan's steps, a team's members: one per line under the item.
+        item["lines"] = lines
     _annotate_item(item, resource, rtype, by_ref)
     return item
 
 
-def _first_activity_detail(resource) -> dict | None:
+# Activity statuses worth printing beside a step of a plan that goes on.
+ACTIVITY_NEWS = ("cancelled", "stopped", "on-hold", "entered-in-error")
+
+
+def _activity_details(resource) -> list:
     activities = resource.get("activity")
-    if isinstance(activities, list):
-        for activity in activities:
-            if isinstance(activity, dict) and isinstance(activity.get("detail"), dict):
-                return activity["detail"]
-    return None
+    if not isinstance(activities, list):
+        return []
+    return [a["detail"] for a in activities
+            if isinstance(a, dict) and isinstance(a.get("detail"), dict)]
+
+
+def _activity_scheduled(activity) -> str | None:
+    return _period_str(activity.get("scheduledPeriod")) or _first_str(
+        activity, "scheduledString")
+
+
+def _member_name(ref, by_ref) -> str | None:
+    """A care-team member by its display, else by the resource it points at."""
+    if not isinstance(ref, dict):
+        return None
+    display = _first_str(ref, "display")
+    if display:
+        return display
+    target = _resolve_reference(ref.get("reference"), by_ref)
+    if not isinstance(target, dict):
+        return None
+    if isinstance(target.get("name"), str):
+        return _first_str(target, "name")
+    return _patient_summary({"name": target.get("name")})["name"]
 
 
 def _note_text(resource) -> str | None:
@@ -1598,6 +1658,7 @@ def summarize_bundle(bundle) -> dict:
     if patient is not None:
         summary["patient"] = _patient_summary(patient)
     reachable: set = set()
+    teams_shown: set = set()
     if composition is not None:
         summary["composition"] = {
             "title": _first_str(composition, "title"),
@@ -1639,8 +1700,27 @@ def summarize_bundle(bundle) -> dict:
                             if not isinstance(ref_entry, dict):
                                 continue
                             target = _resolve_reference(ref_entry.get("reference"), by_ref)
-                            if target is not None:
-                                item = _render_resource(target, by_ref)
+                            if target is None:
+                                continue
+                            if target.get("resourceType") == "CareTeam":
+                                if id(target) in teams_shown:
+                                    continue
+                                teams_shown.add(id(target))
+                            rendered = [_render_resource(target, by_ref)]
+                            # A plan's team is who to ring about it, and no
+                            # section points at it: shown once, after the
+                            # first plan that names it.
+                            teams = target.get("careTeam") \
+                                if target.get("resourceType") == "CarePlan" else None
+                            for team_ref in teams if isinstance(teams, list) else []:
+                                team = _resolve_reference(
+                                    team_ref.get("reference") if isinstance(team_ref, dict)
+                                    else None, by_ref)
+                                if (isinstance(team, dict) and id(team) not in teams_shown
+                                        and team.get("resourceType") == "CareTeam"):
+                                    teams_shown.add(id(team))
+                                    rendered.append(_render_resource(team, by_ref))
+                            for item in rendered:
                                 if sub:
                                     item["subsection"] = sub
                                 items.append(item)
@@ -4886,6 +4966,8 @@ h4.cv-subsec { margin: 12px 0 0; font-size: 0.95rem; }
 .cv-items { list-style: none; padding: 0; margin: 4px 0 10px; }
 .cv-items li { padding: 8px 2px; border-bottom: 1px solid var(--border); }
 .cv-items li:last-child { border-bottom: none; }
+.cv-lines { margin: 4px 0 2px; padding-left: 18px; font-size: 0.85rem; }
+.cv-items .cv-lines li, .cv-lines li { padding: 1px 0; border-bottom: none; }
 .cv-label { font-weight: 600; }
 .cv-detail { font-size: 0.85rem; }
 .cv-note, .tl-note { font-style: italic; }
@@ -6782,8 +6864,17 @@ function cvItemHtml(item) {
     + (item.status ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
     + chips
     + (item.detail ? '<div class="cv-detail muted">' + esc(item.detail) + "</div>" : "")
+    + cvLinesHtml(item)
     + (item.note ? '<div class="cv-note muted">' + esc(item.note) + "</div>" : "")
     + "</li>";
+}
+
+/* A plan's steps or a team's members - the part a reader acts on. */
+function cvLinesHtml(item) {
+  return (item.lines || []).length
+    ? '<ul class="cv-lines">' + item.lines.map((l) => "<li>" + esc(l) + "</li>").join("")
+      + "</ul>"
+    : "";
 }
 
 /* ---- shared helpers for the clinician renderings ---- */
@@ -6883,6 +6974,7 @@ function viewTimeline(d) {
         + (i.status ? " &middot; " + esc(i.status) : "") + "</div>"
         + '<div class="tl-label">' + esc(i.label || "Unnamed item") + cvChips(i) + "</div>"
         + (i.detail ? '<div class="tl-detail">' + esc(i.detail) + "</div>" : "")
+        + cvLinesHtml(i)
         + (i.note ? '<div class="tl-detail tl-note">' + esc(i.note) + "</div>" : "")
         + "</div>";
     });
