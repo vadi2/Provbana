@@ -597,8 +597,11 @@ the track", not "a summary worth nothing", and the submit page says exactly that
 canonical it was therefore checked against. Worth reading first: a team that meant to
 send a lab report and sees `eps` here has its answer before it reads a single finding -
 the bundle never claimed what it was. `?profile=` settles it, and is rejected with
-**400** for any canonical outside the four. A `|version` suffix is ignored, as it is in
-`meta.profile`: the bundle is checked against the version the validator has loaded.
+**400** for any canonical outside the four. It may carry a `|version`, but only the
+version the validator has loaded, or its major.minor (`Bundle-eu-lab|2.0.0` or `|2.0`;
+base R4's `Bundle|4.0.1` for MPD); any other version is a **400** naming the one it has,
+rather than a check against a version you did not ask for. `X-Document-Profile` shows
+the canonical unversioned.
 
 The web form does more with that same outcome than the API can. A location like
 `Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose[x].value` is a locator, and

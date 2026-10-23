@@ -5634,8 +5634,8 @@ def test_the_mpd_claim_check_leaves_other_categories_alone():
 
 
 def test_naming_a_versioned_profile_settles_the_category_too(client, monkeypatch):
-    """A canonical with its version is still that canonical, and a version in
-    meta.profile is already read that way - ?profile= must agree."""
+    """A canonical pinned to the version the validator has is still that
+    canonical."""
     lab = app_module.DOCUMENTS_BY_ID["laboratory"]
     token = register(client, "Alpha")
     seen = {}
