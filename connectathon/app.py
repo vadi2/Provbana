@@ -5440,10 +5440,13 @@ function showTab(name) {
 /* A deep link to a card scrolls to it before the tab's lists have loaded, and
    they land above it and push it out of view. So the card stays pinned to the
    top while the page is still growing, until the reader scrolls, clicks or
-   types, or the route moves on. */
+   types, or the route moves on. Dragging a scrollbar may fire none of those,
+   so the pin also lapses once the loads have had time to arrive. */
+const PIN_MS = 10000;
 let pinnedAnchor = null;
+let pinnedUntil = 0;
 new ResizeObserver(() => {
-  if (pinnedAnchor) pinnedAnchor.scrollIntoView({ block: "start" });
+  if (pinnedAnchor && Date.now() < pinnedUntil) pinnedAnchor.scrollIntoView({ block: "start" });
 }).observe(document.body);
 for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
   window.addEventListener(type, () => { pinnedAnchor = null; },
@@ -5467,6 +5470,7 @@ function applyRoute(scroll) {
     if (anchor.tagName === "DETAILS") anchor.open = true;
     anchor.scrollIntoView({ block: "start" });
     pinnedAnchor = anchor;
+    pinnedUntil = Date.now() + PIN_MS;
   }
   if (tab !== "clinical") return;
   if (!parts[1]) {

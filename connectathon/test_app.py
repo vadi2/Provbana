@@ -1119,8 +1119,11 @@ def test_index_keeps_a_deep_linked_card_in_view_while_the_tab_loads(client):
     # the card is pinned when it is scrolled to, and every route starts unpinned
     assert route.index("pinnedAnchor = null;") < route.index("pinnedAnchor = anchor;")
     # pinned means scrolled to again whenever the page changes height
-    assert "if (pinnedAnchor) pinnedAnchor.scrollIntoView(" in text
+    assert ("if (pinnedAnchor && Date.now() < pinnedUntil)"
+            " pinnedAnchor.scrollIntoView(") in text
     assert "}).observe(document.body);" in text
+    # a scrollbar drag fires no input event, so the pin has to lapse on its own
+    assert "pinnedUntil = Date.now() + PIN_MS;" in route
     # and the reader taking over ends it, so nothing yanks the page back
     assert ('for (const type of ["wheel", "touchstart", "keydown", "pointerdown"])'
             in text)
