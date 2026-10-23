@@ -3372,6 +3372,54 @@ setRegisterCurl(true); console.log(JSON.stringify([open, node.textContent]));
     assert js.count("setRegisterCurl(true)") == 2
 
 
+def page_handler(js, selector, event="click"):
+    """The source of the page's own `$(selector)` listener, ready to register
+    against a stubbed `$`."""
+    start = js.index('$("%s").addEventListener("%s"' % (selector, event))
+    return js[start:js.index("\n});\n", start) + 5]
+
+
+@needs_node
+def test_a_double_click_on_register_sends_one_registration(client):
+    """The register handler run in node against a stubbed page: a second
+    click while the first is in flight finds the button disabled, as a browser
+    would, and so sends nothing. A failed request frees it again."""
+    js = page_script(client)
+    harness = r"""
+const els = {};
+function $(sel) {
+  return els[sel] || (els[sel] = { value: sel === "#reg-name" ? "Acme" : "",
+    style: {}, hidden: true, disabled: false, textContent: "",
+    addEventListener(ev, fn) { this.handler = fn; } });
+}
+""" + page_handler(js, "#reg-btn") + r"""
+const btn = $("#reg-btn");
+const click = () => btn.disabled ? null : btn.handler();
+let calls = 0, settle;
+globalThis.fetch = () => { calls++; return new Promise((r) => { settle = r; }); };
+const detailText = () => "taken";
+(async () => {
+  const first = click();
+  click();
+  const during = [calls, btn.disabled];
+  settle({ ok: false, status: 409, json: async () => ({}) });
+  await first;
+  console.log(JSON.stringify([during, btn.disabled]));
+})();
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [[1, True], False]
+
+
+def test_register_another_company_starts_from_a_clean_form(client):
+    """An error left from an earlier attempt - a double click's 409, say -
+    is not shown on a form the participant has only just opened."""
+    js = page_script(client)
+    assert '$("#reg-error").style.display = "none";' in page_handler(js, "#reg-another")
+
+
 def test_page_ids_are_unique(client):
     """$() is querySelector, so of two elements sharing an id only the first is
     ever reached. The EHDS document table and the submit tab's embedded view

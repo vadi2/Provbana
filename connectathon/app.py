@@ -5478,6 +5478,10 @@ $("#reg-btn").addEventListener("click", async () => {
   const errBox = $("#reg-error");
   errBox.style.display = "none";
   $("#token-box").style.display = "none";
+  /* A double click or a second Enter would otherwise send the same name
+     twice, and the loser's 409 would wait in the hidden form. */
+  const btn = $("#reg-btn");
+  btn.disabled = true;
   try {
     const parts = [{ name: "name", valueString: name }];
     if (code) parts.push({ name: "code", valueString: code });
@@ -5528,6 +5532,8 @@ $("#reg-btn").addEventListener("click", async () => {
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
     errBox.style.display = "block";
+  } finally {
+    btn.disabled = false;
   }
 });
 ["#reg-name", "#reg-code"].forEach((sel) => $(sel).addEventListener("keydown", (ev) => {
@@ -7777,6 +7783,8 @@ async function refreshCompany() {
   await loadEndpoints();
 }
 $("#reg-another").addEventListener("click", () => {
+  /* A fresh form, not the last attempt's complaint. */
+  $("#reg-error").style.display = "none";
   showCompanyCard(true);
   $("#reg-name").focus();
 });
