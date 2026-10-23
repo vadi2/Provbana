@@ -1450,8 +1450,8 @@ def _render_resource(resource, by_ref) -> dict:
                 parts.append(f"plan until {span}")
         detail = "; ".join(parts) or None
     elif rtype == "CareTeam":
-        # Who to ring. summarize_bundle lists a team after the plan that names
-        # it, since no section points at a team directly.
+        # Who to ring. summarize_bundle also lists a team after the first plan
+        # that names it, since a section seldom points at one directly.
         label = _first_str(resource, "name") or "Care team"
         participants = resource.get("participant")
         for part in participants if isinstance(participants, list) else []:
