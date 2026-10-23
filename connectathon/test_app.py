@@ -3459,7 +3459,8 @@ def test_a_token_fetch_cannot_carry_still_reaches_the_server(client):
     js = page_script(client)
     start = js.index("function bearer(")
     fn = js[start:js.index("\n}", start) + 2]
-    tokens = ["da79f71088e8db8c", "“da79f71088e8db8c”", "da79éf71", "☃"]
+    tokens = ["da79f71088e8db8c", "“da79f71088e8db8c”", "da79éf71", "☃",
+              "da79\ud800f71"]                     # a lone surrogate: escaping threw on it
     proc = subprocess.run(
         ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
          ".readFileSync(0, 'utf8')).map((t) => new Headers({ Authorization: bearer(t) })"
@@ -3468,7 +3469,7 @@ def test_a_token_fetch_cannot_carry_still_reaches_the_server(client):
     assert proc.returncode == 0, proc.stderr          # Headers throws as fetch did
     sent = json.loads(proc.stdout)
     assert sent[0] == "Bearer da79f71088e8db8c"        # a real token goes as it is
-    assert sent[1] == "Bearer %E2%80%9Cda79f71088e8db8c%E2%80%9D"
+    assert sent[1] == "Bearer ?da79f71088e8db8c?"
     assert all(s.isascii() for s in sent)
     # no call builds the header any other way
     assert js.count('"Bearer " +') == 1 and js.count("bearer(") >= 8

@@ -6130,10 +6130,11 @@ function renderIssues(issues, bundleText) {
 /* ---- submit ---- */
 /* fetch throws before sending a header with characters it cannot carry - a
    token pasted with smart quotes, say - and every caller read that as a
-   network error. Tokens are plain ASCII, so such a token goes out escaped:
-   the server does not know it either way, and its 401 is the true answer. */
+   network error. Tokens are plain ASCII, so such a token goes out with those
+   characters as "?": the server does not know it either way, and its 401 is
+   the true answer. */
 function bearer(token) {
-  return "Bearer " + (/^[\x21-\x7e]*$/.test(token) ? token : encodeURIComponent(token));
+  return "Bearer " + token.replace(/[^\x21-\x7e]/g, "?");
 }
 
 /* The token is only typed in one place, but localStorage carries it across
