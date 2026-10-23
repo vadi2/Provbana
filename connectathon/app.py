@@ -1522,20 +1522,21 @@ def summarize_bundle(bundle) -> dict:
                 # examinations" under "Laboratory examinations"); their entries
                 # belong to the top-level section, tagged with the sub-section
                 # they came from. Depth-first in document order, and iterative
-                # for the same reason as _collect_references.
-                # Their narratives and emptyReasons speak for the section too
-                # when it has nothing of its own.
+                # for the same reason as _collect_references. A section with
+                # nothing of its own speaks through its sub-sections' emptyReason
+                # or, lacking one, their narrative - as a top-level one does.
                 sub_texts, sub_reasons = [], []
                 stack = [(section, None)]
                 while stack:
                     node, sub = stack.pop()
                     if sub:
-                        text = _section_narrative(node)
-                        if text and not isinstance(node.get("entry"), list):
-                            sub_texts.append(f"{sub}\n{text}")
                         reason = _cc_display(node.get("emptyReason"))
                         if reason:
                             sub_reasons.append(reason)
+                        elif not isinstance(node.get("entry"), list):
+                            text = _section_narrative(node)
+                            if text:
+                                sub_texts.append(f"{sub}\n{text}")
                     refs = node.get("entry")
                     if isinstance(refs, list):
                         for ref_entry in refs:

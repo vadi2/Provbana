@@ -1417,7 +1417,8 @@ def test_an_empty_section_speaks_through_its_sub_sections():
             {"title": "Comment", "text": {"div": "<div>Sample haemolysed</div>"}},
             {"title": "Blood", "emptyReason": {"coding": [{"code": "nilknown"}]}}]},
         {"title": "Allergies", "section": [
-            {"title": "Drug", "emptyReason": {"coding": [{"code": "nilknown"}]}}]},
+            {"title": "Drug", "emptyReason": {"coding": [{"code": "nilknown"}]},
+             "text": {"div": "<div>No known drug allergies</div>"}}]},
         {"title": "Problems", "text": {"div": "<div>See letter</div>"},
          "section": [{"title": "Old", "text": {"div": "<div>Ignored</div>"}}]})))
     results, allergies, problems = s["sections"]
