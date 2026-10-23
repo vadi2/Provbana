@@ -3413,6 +3413,37 @@ const detailText = () => "taken";
     assert json.loads(proc.stdout) == [[1, True], False]
 
 
+@needs_node
+def test_the_new_token_box_goes_once_the_field_holds_another_token(client):
+    """Registering shows the new token to save. Pasting a different company's
+    token, or clearing the field, must not leave it on show as if it were the
+    one in use."""
+    js = page_script(client)
+    start = js.index("function showCompanyCard(")
+    harness = js[start:js.index("\n}", start) + 2] + r"""
+const els = {};
+function $(sel) {
+  return els[sel] || (els[sel] = { value: "", style: {}, hidden: false,
+    textContent: "", parentNode: {} });
+}
+let me = { name: "Alpha" }, meState = "ok";
+const shown = [];
+for (const field of ["tB", "tA", ""]) {
+  $("#token-value").textContent = "tB";
+  $("#token-box").style.display = "block";
+  $("#token").value = field;
+  if (!field) me = null;
+  showCompanyCard(false);
+  shown.push($("#token-box").style.display);
+}
+console.log(JSON.stringify(shown));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["block", "none", "none"]
+
+
 def test_register_another_company_starts_from_a_clean_form(client):
     """An error left from an earlier attempt - a double click's 409, say -
     is not shown on a form the participant has only just opened."""

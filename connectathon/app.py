@@ -7755,6 +7755,9 @@ function showCompanyCard(registering) {
   $("#reg-back").parentNode.hidden = !me;
   $("#reg-replace-name").textContent = me ? "for " + me.name : "";
   $("#reg-replace-token").textContent = saved;
+  /* The box shows the token just registered. Once the field holds another
+     one, it would be telling the participant to save the wrong token. */
+  if ($("#token-value").textContent !== saved) $("#token-box").style.display = "none";
   if (me) $("#company-name").textContent = me.name;
   /* The verdict on the token sits under the token field itself, which is
      often filled from localStorage rather than typed this session. */
