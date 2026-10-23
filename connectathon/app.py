@@ -2360,8 +2360,10 @@ def register(params: dict = Depends(parameters_body)) -> Response:
     # same goes for what cannot be seen at all: a decomposed "Å" is composed,
     # and invisible format characters (zero-width spaces and joiners, BOMs)
     # are dropped, or a name of nothing but those would list as a blank row.
-    team = "".join(c for c in unicodedata.normalize("NFC", team)
-                   if unicodedata.category(c) != "Cf")
+    # Dropped first: one between a letter and its accent would keep the pair
+    # from composing.
+    team = unicodedata.normalize(
+        "NFC", "".join(c for c in team if unicodedata.category(c) != "Cf"))
     team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
         raise HTTPException(400, detail="Company name must be 2-40 characters")

@@ -2240,7 +2240,8 @@ def test_register_dedupes_on_what_the_name_looks_like(client):
     assert res.status_code == 200
     for clash in ("Åland Hälsa",            # decomposed
                   "Åland Hälsa​",        # trailing zero-width space
-                  "﻿Åland‍ Hälsa"):  # BOM, zero-width joiner
+                  "﻿Åland‍ Hälsa",   # BOM, zero-width joiner
+                  "A​̊land Hälsa"):       # one between letter and accent
         assert register_res(client, clash).status_code == 409, repr(clash)
     res = register_res(client, "Hälsa⁠ Co")
     assert res.status_code == 200
