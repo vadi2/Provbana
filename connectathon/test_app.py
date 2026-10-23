@@ -2606,6 +2606,23 @@ def test_ville_airway_plan_shows_its_steps_and_who_to_ring(client):
     assert text.count("+ cvLinesHtml(") == 2      # document and timeline rows
 
 
+def test_the_banner_shows_the_current_name_not_the_first_listed():
+    """A maiden name listed first is still a former name."""
+    def name(names):
+        return app_module._patient_summary({"name": names})["name"]
+    maiden = {"use": "old", "family": "Maidenname", "given": ["Eva"]}
+    official = {"use": "official", "family": "Current", "given": ["Eva"]}
+    assert name([maiden, official]) == "Eva Current"
+    assert name([{"use": "nickname", "text": "Evi"}, {"text": "Eva Current"}]) == "Eva Current"
+    assert name([{"family": "Ended", "period": {"end": "2010-01-01"}},
+                 {"family": "Now"}]) == "Now"
+    assert name([{"text": "Eva Usual", "use": "usual"}, official]) == "Eva Current"
+    # with only a former name, that is still better than none
+    assert name([maiden, {"use": "official"}, "junk"]) == "Eva Maidenname"
+    assert name([{"use": "official", "given": ["A"]}, {"use": "official", "given": ["B"]}]) == "A"
+    assert name("junk") is None
+
+
 def test_a_plan_step_carries_its_own_news():
     """In a plan of several steps, a cancelled one says so beside it; a team
     member with no display is named from the resource it points at."""

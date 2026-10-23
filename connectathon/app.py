@@ -1541,7 +1541,7 @@ def _member_name(ref, by_ref) -> str | None:
         return None
     if isinstance(target.get("name"), str):
         return _first_str(target, "name")
-    return _patient_summary({"name": target.get("name")})["name"]
+    return _human_name(target.get("name"))
 
 
 def _note_text(resource) -> str | None:
@@ -1557,25 +1557,42 @@ def _note_text(resource) -> str | None:
     return None
 
 
+# HumanName.use, best first: the name on the banner is the one the person
+# goes by now, not a maiden name listed before it.
+NAME_USE_RANK = {"official": 0, "usual": 1, None: 2, "temp": 2, "nickname": 3,
+                 "anonymous": 3, "old": 4, "maiden": 4}
+
+
+def _human_name(names) -> str | None:
+    """The current name out of a HumanName list, as text."""
+    if not isinstance(names, list):
+        return None
+    today = datetime.now(timezone.utc).date().isoformat()
+    best = None
+    for index, name in enumerate(names):
+        if not isinstance(name, dict):
+            continue
+        given = name.get("given")
+        parts = [g for g in given if isinstance(g, str)] if isinstance(given, list) else []
+        family = name.get("family")
+        if isinstance(family, str) and family.strip():
+            parts.append(family.strip())
+        text = " ".join(parts) or _first_str(name, "text")
+        if not text:
+            continue
+        use = name.get("use") if isinstance(name.get("use"), str) else None
+        rank = NAME_USE_RANK.get(use, 2)
+        period = name.get("period")
+        end = period.get("end") if isinstance(period, dict) else None
+        if isinstance(end, str) and end[:10] < today:
+            rank = NAME_USE_RANK["old"]   # an ended name is a former one
+        if best is None or (rank, index) < best[:2]:
+            best = (rank, index, text)
+    return best[2] if best else None
+
+
 def _patient_summary(patient) -> dict:
-    name_text = None
-    names = patient.get("name")
-    if isinstance(names, list):
-        for name in names:
-            if not isinstance(name, dict):
-                continue
-            given = name.get("given")
-            parts = [g for g in given if isinstance(g, str)] if isinstance(given, list) else []
-            family = name.get("family")
-            if isinstance(family, str) and family.strip():
-                parts.append(family.strip())
-            if parts:
-                name_text = " ".join(parts)
-                break
-            text = name.get("text")
-            if isinstance(text, str) and text.strip():
-                name_text = text.strip()
-                break
+    name_text = _human_name(patient.get("name"))
     identifiers = []
     ids = patient.get("identifier")
     if isinstance(ids, list):
