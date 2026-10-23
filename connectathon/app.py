@@ -3846,10 +3846,16 @@ def update_endpoint(
     payload: dict = Depends(endpoint_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
-    if payload.get("id") not in (None, str(endpoint_id)):
+    body_id = payload.get("id")
+    # A numeric id would otherwise be reported as differing from the URL's
+    # while printing the same digits.
+    if body_id is not None and not isinstance(body_id, str):
         raise HTTPException(
-            400, detail="The body's id is %r but the URL's is %d"
-                        % (payload["id"], endpoint_id))
+            400, detail="The body's id must be a JSON string, as every FHIR id is")
+    if body_id not in (None, str(endpoint_id)):
+        raise HTTPException(
+            400, detail="The body's id is %s but the URL's is \"%d\""
+                        % (json.dumps(body_id), endpoint_id))
     fields = parse_endpoint(payload)
     with connect() as conn:
         # The ownership check and the write see the same row, or a DELETE

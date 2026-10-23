@@ -2926,8 +2926,15 @@ def test_a_put_whose_body_names_another_endpoint_is_refused(client):
     first = advertise(client, tok, endpoint("https://one.example.org")).json()["id"]
     second = advertise(client, tok, endpoint("https://two.example.org")).json()["id"]
     res = advertise(client, tok, endpoint("https://new.example.org", id=second), first)
-    assert res.status_code == 400 and "URL's" in diagnostics(res)
+    assert res.status_code == 400
+    assert diagnostics(res) == "The body's id is \"%s\" but the URL's is \"%s\"" % (second, first)
     assert client.get("/fhir/Endpoint/" + first).json()["address"] == "https://one.example.org"
+    # a number is the wrong type, not a different id - the same digits must
+    # not be reported as a mismatch
+    for wrong_type in (int(first), float(first), True):
+        res = advertise(client, tok, endpoint("https://new.example.org", id=wrong_type), first)
+        assert res.status_code == 400, wrong_type
+        assert diagnostics(res) == "The body's id must be a JSON string, as every FHIR id is"
     # the matching id is fine
     assert advertise(client, tok, endpoint("https://new.example.org", id=first),
                      first).status_code == 200
