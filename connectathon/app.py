@@ -3113,6 +3113,13 @@ def exchange_list(
             best = best_valid_submission(conn, team["id"])
             if best is None:
                 continue
+            # Screenshots, and the systems they came from: one company can
+            # post several pictures of the same document.
+            shots, systems = conn.execute(
+                "SELECT COUNT(*), COUNT(DISTINCT consumer_id) FROM renderings "
+                "WHERE submission_id = ?",
+                (best["id"],),
+            ).fetchone()
             entries.append(
                 (
                     "entry",
@@ -3124,10 +3131,8 @@ def exchange_list(
                         "recorded": best["ts"],
                         "sections": best["sections"],
                         "resources": best["resources"],
-                        "renderings": conn.execute(
-                            "SELECT COUNT(*) FROM renderings WHERE submission_id = ?",
-                            (best["id"],),
-                        ).fetchone()[0],
+                        "renderings": shots,
+                        "renderingSystems": systems,
                     },
                 )
             )
@@ -5304,7 +5309,7 @@ function submissionRow(e) {
 function partnerRow(e) {
   return { team: e.organization, team_slug: e.organizationSlug,
            exchange_id: e.id, ts: e.recorded, sections: e.sections,
-           resources: e.resources, renderings: e.renderings };
+           resources: e.resources, rendering_systems: e.renderingSystems };
 }
 /* FHIR has no null, so a company that has never submitted has no bestErrors
    part at all rather than one set to null. Absent becomes null here, once, so
@@ -7213,7 +7218,7 @@ async function refreshShotCount(slug) {
       .find((x) => x.team_slug === slug);
     const btn = document.querySelector('.io-partner[data-slug="' + slug
       + '"] [data-shots]');
-    if (p && btn) btn.textContent = shotCountLabel(p.renderings);
+    if (p && btn) btn.textContent = shotCountLabel(p.rendering_systems);
   } catch (e) { /* the count is decoration; the gallery below it is the truth */ }
 }
 
@@ -7228,7 +7233,7 @@ function partnerCard(p) {
     + '" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
     + '<button class="ghost" data-shots="' + p.exchange_id + '">'
-    + shotCountLabel(p.renderings) + "</button>"
+    + shotCountLabel(p.rendering_systems) + "</button>"
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */

@@ -2645,9 +2645,22 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
 
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
-    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 0
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (0, 0)
     add_shot(client, tok_c, "producer")
-    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 1
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (1, 1)
+    # a second picture from the same company is another screenshot, not
+    # another system that has shown the document
+    add_shot(client, tok_c, "producer")
+    add_shot(client, register(client, "Third"), "producer")
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (3, 2)
+    # and "Seen in N other systems" is that count, on the card and on refresh
+    text = client.get("/").text
+    assert "rendering_systems: e.renderingSystems" in text
+    assert text.count("shotCountLabel(p.rendering_systems)") == 2
+    assert "shotCountLabel(p.renderings)" not in text
 
 
 def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monkeypatch):
