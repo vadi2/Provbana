@@ -4880,6 +4880,9 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 /* the gallery: one document, every system that rendered it, side by side */
 .shots { display: grid; gap: 14px; margin-top: 14px;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+/* As with .menu-wrap: display: grid outranks the UA [hidden] rule, and the
+   count button could open the gallery but never fold it away again. */
+.shots[hidden] { display: none; }
 .shot { border: 1px solid var(--border); border-radius: var(--r-card);
   overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
 .shot img { display: block; width: 100%; height: 168px; object-fit: cover;
@@ -4889,6 +4892,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 .shot-note { font-size: 0.84rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .shot-note.empty { color: var(--muted); font-style: italic; }
 .shot-own { display: flex; gap: 6px; margin-top: 2px; }
+/* Hidden while the note is edited, so Withdraw is not beside Save note. */
+.shot-own[hidden] { display: none; }
 .shot-edit textarea { width: 100%; min-height: 62px; font-family: inherit;
   font-size: 0.84rem; }
 .shot-err { font-size: 0.82rem; color: var(--fail); }

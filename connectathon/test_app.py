@@ -2833,6 +2833,29 @@ def test_renderings_are_readable_without_a_token(client, monkeypatch):
                           headers=headers).status_code == 200
 
 
+def test_everything_the_page_hides_can_actually_be_hidden(client):
+    """An author `display:` rule outranks the UA sheet's [hidden] rule, so
+    el.hidden = true does nothing to an element whose class sets one - the
+    screenshot gallery could not be folded away, and Withdraw stayed beside
+    Save note. Every class the page hides that way needs its own [hidden]."""
+    text = client.get("/").text
+    css = text[text.index("<style>"):text.index("</style>")]
+    hidden = set()
+    for m in re.finditer(r'class=\\?"([\w\- ]+)\\?"[^>]*?\bhidden\b', text):
+        hidden.update(m.group(1).split())
+    for m in re.finditer(r'querySelector\("\.([\w-]+)"\)\.hidden\s*=', text):
+        hidden.add(m.group(1))
+    assert {"shots", "shot-own", "menu-wrap"} <= hidden   # the scan finds them
+    displayed = set()
+    for selectors, body in re.findall(r"(?m)^([^{}@/]+)\{([^}]*)\}", css):
+        if re.search(r"display:\s*(?!none)", body):
+            displayed.update(s.strip()[1:] for s in selectors.split(",")
+                             if re.fullmatch(r"\.[\w-]+", s.strip()))
+    for cls in sorted(hidden & displayed):
+        assert re.search(r"\.%s\[hidden\]\s*\{\s*display:\s*none" % re.escape(cls),
+                         css), cls
+
+
 CURLS_HARNESS = r"""
 const out = {};
 const $ = () => out;
