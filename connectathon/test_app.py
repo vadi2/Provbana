@@ -1386,6 +1386,36 @@ def test_a_section_with_no_entry_and_no_empty_reason_asserts_nothing():
     assert s["sections"][0]["empty_reason"] is None
 
 
+def test_sub_section_entries_belong_to_their_top_level_section():
+    """A lab report keeps every result in a sub-section. Dropping them left a
+    valid report showing a heading and nothing else, in every view."""
+    ref = lambda i: [{"reference": f"urn:uuid:res-{i}"}]
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Laboratory examinations", "entry": ref(0),
+         "text": {"div": "<div>Laboratory examinations</div>"}, "section": [
+            {"title": "Urine", "entry": ref(1), "section": [
+                {"code": {"text": "Sediment"}, "entry": ref(2)}]},
+            "not a section",
+            {"title": "Blood", "entry": ref(3)}]},
+        {"title": "Empty parent", "section": [{"title": "Nothing here"}]},
+        resources=4)))
+    lab, empty = s["sections"]
+    assert [(i["label"], i.get("subsection")) for i in lab["items"]] == [
+        ("observation 0", None), ("observation 1", "Urine"),
+        ("observation 2", "Sediment"), ("observation 3", "Blood")]
+    assert lab["narrative"] is None
+    assert empty["items"] == []
+    assert s["unreferenced"] == []
+    assert s["quality"]["items"] == 4
+
+
+def test_document_view_heads_each_sub_section(client):
+    text = client.get("/").text
+    body = text[text.index("function viewDocument("):text.index("const CV_VIEWS")]
+    assert "it.subsection" in body
+    assert '<h4 class="cv-subsec">' in body
+
+
 def test_empty_sections_never_earn_points(client, monkeypatch):
     consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")

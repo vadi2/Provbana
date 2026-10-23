@@ -1518,14 +1518,35 @@ def summarize_bundle(bundle) -> dict:
                     or "Untitled section"
                 )
                 items = []
-                refs = section.get("entry")
-                if isinstance(refs, list):
-                    for ref_entry in refs:
-                        if not isinstance(ref_entry, dict):
-                            continue
-                        target = _resolve_reference(ref_entry.get("reference"), by_ref)
-                        if target is not None:
-                            items.append(_render_resource(target, by_ref))
+                # A lab report keeps its results in sub-sections ("Blood
+                # examinations" under "Laboratory examinations"); their entries
+                # belong to the top-level section, tagged with the sub-section
+                # they came from. Depth-first in document order, and iterative
+                # for the same reason as _collect_references.
+                stack = [(section, None)]
+                while stack:
+                    node, sub = stack.pop()
+                    refs = node.get("entry")
+                    if isinstance(refs, list):
+                        for ref_entry in refs:
+                            if not isinstance(ref_entry, dict):
+                                continue
+                            target = _resolve_reference(ref_entry.get("reference"), by_ref)
+                            if target is not None:
+                                item = _render_resource(target, by_ref)
+                                if sub:
+                                    item["subsection"] = sub
+                                items.append(item)
+                    children = node.get("section")
+                    if isinstance(children, list):
+                        for child in reversed(children):
+                            if not isinstance(child, dict):
+                                continue
+                            # The nearest title only: a path would grow with
+                            # the depth, and the depth is the submitter's.
+                            stack.append((child, _first_str(child, "title")
+                                          or _cc_display(child.get("code"))
+                                          or "Untitled section"))
                 empty_reason = narrative = None
                 if not items:
                     empty_reason = _cc_display(section.get("emptyReason"))
@@ -4727,6 +4748,7 @@ select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   border-radius: var(--r-card); padding: 14px 16px; margin: 12px 0 6px; }
 .patient-name { font-size: var(--fs-large); }
 h3.cv-sec { margin: 22px 0 4px; font-size: var(--fs-large); }
+h4.cv-subsec { margin: 12px 0 0; font-size: 0.95rem; }
 .cv-items { list-style: none; padding: 0; margin: 4px 0 10px; }
 .cv-items li { padding: 8px 2px; border-bottom: 1px solid var(--border); }
 .cv-items li:last-child { border-bottom: none; }
@@ -6985,7 +7007,18 @@ function viewDocument(d) {
   for (const sec of s.sections || []) {
     html += '<h3 class="cv-sec">' + esc(sec.title || "Untitled section") + "</h3>";
     if (sec.items && sec.items.length) {
-      html += '<ul class="cv-items">' + sec.items.map(cvItemHtml).join("") + "</ul>";
+      // a section's own entries come first, then each sub-section's (a lab
+      // report's "Blood examinations") under its own sub-heading
+      const runs = [];
+      sec.items.forEach((it) => {
+        const sub = it.subsection || null;
+        if (!runs.length || runs[runs.length - 1].sub !== sub) runs.push({ sub, items: [] });
+        runs[runs.length - 1].items.push(it);
+      });
+      runs.forEach((r) => {
+        html += (r.sub ? '<h4 class="cv-subsec">' + esc(r.sub) + "</h4>" : "")
+          + '<ul class="cv-items">' + r.items.map(cvItemHtml).join("") + "</ul>";
+      });
     } else if (sec.narrative) {
       // a section that is its narrative (a patient story): the prose is the
       // content, shown as written
