@@ -750,6 +750,47 @@ def test_item_gaps_flag_missing_dose_and_date():
     assert problem["gaps"] == ["not coded", "no date"]
 
 
+def test_a_structured_dose_is_a_dose():
+    """An MPD prescription states its dose only in doseAndRate and
+    timing.repeat; reading text alone flagged every medicine "no dose"."""
+    def med(*dosage):
+        return {"resourceType": "MedicationRequest", "id": "m", "status": "active",
+                "medicationCodeableConcept": {"text": "x"}, "dosageInstruction": list(dosage)}
+    tablet = {"value": 4, "unit": "Tablet", "system": "http://snomed.info/sct"}
+    cases = [
+        ({"doseAndRate": [{"doseQuantity": tablet}], "timing": {"repeat": {
+            "frequency": 1, "period": 1, "periodUnit": "d", "when": ["EVE.late"],
+            "boundsDuration": {"value": 42, "unit": "day", "code": "d"}}}},
+         "4 Tablet, every day, late evening, for 42 days"),
+        ({"doseAndRate": [{"doseQuantity": {"value": 1, "unit": "{tbl}"}}],
+          "timing": {"repeat": {"frequency": 2, "period": 1, "periodUnit": "d"}},
+          "asNeededBoolean": False}, "1 tbl, 2x per day"),
+        ({"doseAndRate": [{"doseRange": {"low": {"value": 1, "unit": "mg"},
+                                         "high": {"value": 2, "unit": "mg"}}}],
+          "timing": {"repeat": {"frequency": 1, "period": 4, "periodMax": 6,
+                                "periodUnit": "h"}},
+          "asNeededCodeableConcept": {"text": "pain"}},
+         "1-2 mg, every 4-6 hours, as needed for pain"),
+        ({"timing": {"repeat": {"frequency": 1, "frequencyMax": 2, "period": 1,
+                                "periodUnit": "wk", "dayOfWeek": ["mon", "thu"],
+                                "timeOfDay": ["08:00:00"],
+                                "boundsPeriod": {"start": "2025-01-01"}}},
+          "asNeededBoolean": True},
+         "1-2x per week, on mon, thu, at 08:00, from 2025-01-01, as needed"),
+        ({"doseAndRate": [{"doseQuantity": {"value": 500, "unit": "mL"},
+                           "rateQuantity": {"value": 100, "unit": "mL/h"}}],
+          "timing": {"repeat": {"boundsDuration": {"value": 1, "code": "d"}}}},
+         "500 mL, at 100 mL/h, for 1 day"),
+    ]
+    for dosage, expected in cases:
+        item = _items(_doc("10160-0", "Medication", med(dosage)))[0]
+        assert item["detail"] == expected, (dosage, item["detail"])
+        assert "no dose" not in item["gaps"], dosage
+    # still a gap when nothing at all is said about the dose
+    bare = _items(_doc("10160-0", "Medication", med({"asNeededBoolean": False})))[0]
+    assert "no dose" in bare["gaps"]
+
+
 def test_observation_abnormal_flag_and_missing_value():
     bundle = {"resourceType": "Bundle", "entry": [
         {"fullUrl": "urn:uuid:c",

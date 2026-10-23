@@ -859,7 +859,22 @@ def _dosage_detail(resource) -> str | None:
         if text:
             parts.append(text)
             continue
+        # No text: a prescription is often structured only ("4 Tablet, once a
+        # day, late evening, for 42 days"), and that is a dose all the same.
         bits = []
+        rates = dosage.get("doseAndRate")
+        for rate in rates if isinstance(rates, list) else []:
+            if not isinstance(rate, dict):
+                continue
+            dose = _quantity_str(rate.get("doseQuantity")) or _range_str(rate.get("doseRange"))
+            if dose:
+                # UCUM annotations ("{tbl}") are units only to a machine.
+                bits.append(re.sub(r"\{([^{}]*)\}", r"\1", dose))
+            speed = (_quantity_str(rate.get("rateQuantity"))
+                     or _ratio_str(rate.get("rateRatio"))
+                     or _range_str(rate.get("rateRange")))
+            if speed:
+                bits.append(f"at {speed}")
         route = _cc_display(dosage.get("route"))
         if route:
             bits.append(route)
@@ -868,9 +883,88 @@ def _dosage_detail(resource) -> str | None:
             when = _cc_display(timing.get("code"))
             if when:
                 bits.append(when)
+            if isinstance(timing.get("repeat"), dict):
+                bits.extend(_timing_repeat_bits(timing["repeat"]))
+        need = _cc_display(dosage.get("asNeededCodeableConcept"))
+        if need:
+            bits.append(f"as needed for {need}")
+        elif dosage.get("asNeededBoolean") is True:
+            bits.append("as needed")
         if bits:
             parts.append(", ".join(bits))
     return "; ".join(parts) or None
+
+
+TIMING_UNITS = {"s": "second", "min": "minute", "h": "hour", "d": "day",
+                "wk": "week", "mo": "month", "a": "year"}
+
+# The common v3 TimingEvent codes in words; anything else shows as its code.
+TIMING_EVENTS = {
+    "MORN": "morning", "MORN.early": "early morning", "MORN.late": "late morning",
+    "NOON": "noon", "AFT": "afternoon", "AFT.early": "early afternoon",
+    "AFT.late": "late afternoon", "EVE": "evening", "EVE.early": "early evening",
+    "EVE.late": "late evening", "NIGHT": "night", "PHS": "after sleep",
+    "HS": "before sleep", "WAKE": "on waking", "C": "with a meal",
+    "CM": "with breakfast", "CD": "with lunch", "CV": "with dinner",
+    "AC": "before a meal", "ACM": "before breakfast", "ACD": "before lunch",
+    "ACV": "before dinner", "PC": "after a meal", "PCM": "after breakfast",
+    "PCD": "after lunch", "PCV": "after dinner",
+}
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _span(n, n_max, unit) -> str:
+    """"4 hours", "4-6 hours", or "day" for a bare 1 of the unit."""
+    word = TIMING_UNITS[unit]
+    if n_max is not None:
+        return f"{n}-{n_max} {word}s"
+    return word if n == 1 else f"{n} {word}s"
+
+
+def _timing_repeat_bits(repeat) -> list:
+    """Timing.repeat as phrases: "2x per day", "every 4-6 hours", "for 42 days"."""
+    def num(key):
+        return repeat.get(key) if _number(repeat.get(key)) else None
+
+    def strings(key):
+        vals = repeat.get(key)
+        return [v for v in vals if isinstance(v, str)] if isinstance(vals, list) else []
+
+    bits = []
+    freq, freq_max = num("frequency"), num("frequencyMax")
+    period, period_max = num("period"), num("periodMax")
+    unit = repeat.get("periodUnit")
+    if period is not None and unit in TIMING_UNITS:
+        span = _span(period, period_max, unit)
+        if freq in (None, 1) and freq_max is None:
+            bits.append(f"every {span}")
+        else:
+            times = f"{freq}-{freq_max}" if freq_max is not None else f"{freq}"
+            bits.append(f"{times}x per {span}")
+    if strings("dayOfWeek"):
+        bits.append("on " + ", ".join(strings("dayOfWeek")))
+    if strings("timeOfDay"):
+        bits.append("at " + ", ".join(t[:5] for t in strings("timeOfDay")))
+    bits.extend(TIMING_EVENTS.get(e, e) for e in strings("when"))
+    bounds = repeat.get("boundsDuration")
+    if isinstance(bounds, dict) and _number(bounds.get("value")):
+        if bounds.get("code") in TIMING_UNITS:
+            value = bounds["value"]
+            word = TIMING_UNITS[bounds["code"]]
+            bits.append(f"for 1 {word}" if value == 1 else f"for {value} {word}s")
+        elif _quantity_str(bounds):
+            bits.append("for " + _quantity_str(bounds))
+    window = repeat.get("boundsPeriod")
+    if isinstance(window, dict):
+        start, end = _first_str(window, "start"), _first_str(window, "end")
+        if start and end:
+            bits.append(f"from {start} to {end}")
+        elif start or end:
+            bits.append(f"from {start}" if start else f"until {end}")
+    return bits
 
 
 def _humanize_type(rtype: str) -> str:
