@@ -5303,10 +5303,14 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .cv-mode:hover { color: var(--accent); background: transparent; }
 .cv-mode.active { background: var(--btn); color: var(--btn-on); }
 /* Floating it here would leave the title a useless sliver, so it goes back to
-   being a full-width row above the document. */
+   being a full-width row above the document. A phone can be narrower than the
+   three labels, so they wrap onto further rows instead of being clipped; the
+   separator is a shadow up and to the left, which the box clips at its edges
+   and so only shows between buttons, across rows as well as along them. */
 @media (max-width: 640px) {
-  .cv-modes { float: none; position: static; margin: 0 0 12px; }
-  .cv-mode { flex: 1; text-align: center; }
+  .cv-modes { float: none; position: static; margin: 0 0 12px; flex-wrap: wrap; }
+  .cv-mode { flex: 1 1 auto; text-align: center; border-left: none;
+    box-shadow: -1px -1px 0 var(--field-border); }
 }
 /* the float is the last thing in the card, so the card has to be told to
    contain it or it collapses behind the buttons */
@@ -5686,7 +5690,6 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <h2>Clinical view of submitted documents</h2>
   <label for="cv-team">Company</label>
   <select id="cv-team"></select>
-  <p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>
   <input type="file" id="cv-file" accept=".json,application/json,application/fhir+json" hidden>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
@@ -6034,8 +6037,34 @@ function showTab(name) {
   if (name === "submit") checkValidator();
 }
 
+/* A deep link to a card scrolls to it before the tab's lists have loaded, and
+   they land above it and push it out of view. So the card stays pinned to the
+   top while the page is still growing, until the reader scrolls, clicks or
+   types, or the route moves on. Dragging a scrollbar may fire none of those,
+   so the pin also lapses once the loads have had time to arrive. */
+const PIN_MS = 10000;
+let pinnedAnchor = null;
+let pinnedUntil = 0;
+new ResizeObserver(() => {
+  if (pinnedAnchor && Date.now() < pinnedUntil) pinnedAnchor.scrollIntoView({ block: "start" });
+}).observe(document.body);
+for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
+  window.addEventListener(type, () => { pinnedAnchor = null; },
+                          { capture: true, passive: true });
+}
+
+/* Set by a link click to the hash it is heading for. A link into another tab
+   lands at the top of the page, like following a link to a new page would,
+   rather than at the old tab's scroll offset; Back and Forward are not link
+   clicks, so the browser still restores where you were. */
+let followedHash = null;
+
 function applyRoute(scroll) {
   const parts = routeParts();
+  pinnedAnchor = null;
+  const followed = followedHash === location.hash;
+  followedHash = null;
+  const from = document.querySelector(".tab-panel.active");
   /* A hash that is not a tab may be a deep link to a card inside one, such as
      #other-documents or #send-direct. The card's own tab is shown, a folded
      card is opened, and it is scrolled into view; anything else falls through
@@ -6046,20 +6075,22 @@ function applyRoute(scroll) {
   const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0]
     : panel ? panel.id.replace(/^tab-/, "") : "leaderboard";
   showTab(tab);
+  if (followed && !panel && from && from.id !== "tab-" + tab) window.scrollTo(0, 0);
   if (panel) {
     if (anchor.tagName === "DETAILS") anchor.open = true;
     anchor.scrollIntoView({ block: "start" });
+    pinnedAnchor = anchor;
+    pinnedUntil = Date.now() + PIN_MS;
   }
   if (tab !== "clinical") return;
   if (!parts[1]) {
     go("clinical/sample/" + DEFAULT_SAMPLE + "/" + CV_DEFAULT, true);
     return;
   }
-  if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode = parts[3];
-  /* The tab link remembers the document you were reading, so a trip to the
-     leaderboard and back does not throw your place away. */
-  document.querySelector('.tab-btn[data-tab="clinical"]')
-    .setAttribute("href", location.hash);
+  /* A route without a view opens in the default one, not in whichever view
+     the last document was left in, so a link and a reload of it agree. */
+  cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3] : CV_DEFAULT;
+  rememberClinicalRoute();
   /* A company route shows that company's list and no document. If the tab was
      already open the picker is moved here; otherwise initClinical, kicked off
      by showTab above, reads the route once the list has loaded. */
@@ -6068,6 +6099,27 @@ function applyRoute(scroll) {
 }
 
 window.addEventListener("hashchange", () => applyRoute(true));
+
+/* A link to the hash already in the address bar fires no hashchange, so a card
+   folded after following one would not open again from it. Those clicks are
+   routed here instead; a modified click (new tab or window) is the browser's. */
+document.addEventListener("click", (ev) => {
+  if (ev.defaultPrevented || ev.button !== 0
+      || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+  const link = ev.target.closest('a[href^="#"]');
+  if (!link || link.target) return;
+  if (link.hash !== location.hash) { followedHash = link.hash; return; }
+  ev.preventDefault();
+  applyRoute(true);
+});
+
+/* The tab link remembers the document you were reading, so a trip to the
+   leaderboard and back does not throw your place away. Anything that rewrites
+   a #clinical hash without a hashchange has to call this itself. */
+function rememberClinicalRoute() {
+  document.querySelector('.tab-btn[data-tab="clinical"]')
+    .setAttribute("href", location.hash);
+}
 
 /* ---- register ---- */
 $("#reg-btn").addEventListener("click", async () => {
@@ -7131,6 +7183,7 @@ $("#cv-team").addEventListener("change", () => {
     if (slug === PREVIEW_TEAM) { renderCvList(); return; }
     history.replaceState(null, "", slug === SAMPLE_TEAM ? "#clinical"
                                                         : "#clinical/company/" + slug);
+    rememberClinicalRoute();
   }
   renderCvList();
 });
@@ -7691,8 +7744,12 @@ $("#cv-doc").addEventListener("click", (ev) => {
 const CV_PREVIEW_KEY = "cv-preview";
 let cvPreview = null;
 
+/* The message lives in the preview pane, so redrawing the list for another
+   company or a document takes an old error away with it; one that arrives
+   after the reader has left the pane has nowhere to go and is dropped. */
 function previewMsg(text) {
   const box = $("#cv-preview-msg");
+  if (!box) return;
   box.textContent = text || "";
   box.style.display = text ? "block" : "none";
 }
@@ -7746,9 +7803,10 @@ function renderPreviewBox(box) {
   box.innerHTML = '<div class="cv-paste">'
     + '<p class="muted" style="margin:0">Pick a Bundle .json or paste one below.'
     + " It is only rendered here, not uploaded to the hackathon.</p>"
-    + '<textarea id="cv-paste" spellcheck="false" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
+    + '<textarea id="cv-paste" spellcheck="false" aria-label="FHIR Bundle JSON to preview" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
     + '<div class="row"><button type="button" id="cv-paste-go">Preview</button>'
     + '<button type="button" class="ghost" id="cv-pick">Choose a file&hellip;</button></div>'
+    + '<p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>'
     + "</div>";
   $("#cv-pick").addEventListener("click", () => {
     $("#cv-file").value = "";  // picking the same file again should still fire

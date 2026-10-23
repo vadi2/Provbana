@@ -1100,6 +1100,27 @@ def test_preview_renders_a_bundle_without_storing_it(client):
     assert client.post("/ui/preview", content=b'{"resourceType": "Patient"}').status_code == 400
 
 
+def test_index_drops_a_preview_error_with_the_preview_pane(client):
+    """A failed preview's message sat above the list, outside what a redraw
+    replaces, so it stayed on screen under another company's list and over
+    any document opened next. It now lives in the preview pane itself."""
+    text = client.get("/").text
+    pane = text[text.index("function renderPreviewBox("):]
+    pane = pane[:pane.index("\n}\n")]
+    assert 'id="cv-preview-msg"' in pane
+    assert text.count('id="cv-preview-msg"') == 1   # not in the static card too
+    # an error that lands after the reader left the pane has nowhere to go
+    assert 'const box = $("#cv-preview-msg");\n  if (!box) return;' in text
+
+
+def test_index_names_the_preview_textarea(client):
+    """Its only text was the placeholder, a JSON fragment, which a screen
+    reader read out as the field's name."""
+    text = client.get("/").text
+    paste = re.search(r'<textarea id="cv-paste"[^>]*>', text).group(0)
+    assert 'aria-label="FHIR Bundle JSON to preview"' in paste
+
+
 # ---------------------------------------------------------------- interop
 
 def interop_setup(client, monkeypatch):
@@ -1249,6 +1270,11 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     assert 'const CV_DEFAULT = "document";' in text
     assert "let cvMode = CV_DEFAULT;" in text
     assert '+ "/" + CV_DEFAULT);' in text
+    # and a link that names no view (the list's own links, a partner's document)
+    # resets it too, so following one and reloading it show the same view
+    assert ("cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3]"
+            " : CV_DEFAULT;") in text
+    assert "if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode" not in text
     # the switcher is rebuilt with each document rather than parked in the
     # picker card, so it has to come from the render path
     assert "function cvModesHtml(" in text
@@ -1286,6 +1312,21 @@ def test_first_pass_flame_names_what_earns_it(client):
     assert "first company to submit a valid document" not in text
 
 
+def test_view_switcher_wraps_rather_than_clips_on_a_phone(client):
+    """The three labels are wider than a phone's card, and the switcher clips
+    what overflows, so on a narrow screen they have to wrap - otherwise the
+    last view cannot be seen, tapped, or told apart as the active one."""
+    text = client.get("/").text
+    base = re.search(r"\n\.cv-modes \{[^}]*\}", text).group(0)
+    assert "overflow: hidden" in base  # the rounded corners rely on it
+    phone = re.search(r"@media \(max-width: 640px\) \{\n  \.cv-modes \{[^}]*\}\n"
+                      r"  \.cv-mode \{[^}]*\}\n\}", text)
+    assert phone, "the switcher's phone layout moved; keep this test pointed at it"
+    assert "flex-wrap: wrap" in phone.group(0)
+    # labels stay whole, so it is the row that wraps rather than the words
+    assert "white-space: nowrap" in re.search(r"\n\.cv-mode \{[^}]*\}", text).group(0)
+
+
 def test_index_navigates_through_the_hash(client):
     text = client.get("/").text
     # tabs are real links, so Back and Forward move between them and a view
@@ -1297,6 +1338,57 @@ def test_index_navigates_through_the_hash(client):
     assert 'const DEFAULT_SAMPLE = "arne-complex-care";' in text
     # and a partner's document is linked, not opened by a click handler
     assert "'<a href=\"#clinical/submission/'" in text
+
+
+def test_index_keeps_a_deep_linked_card_in_view_while_the_tab_loads(client):
+    """A cold #send-direct or #other-documents scrolled once, before the tab's
+    lists arrived; they then filled in above the card and pushed it off screen
+    on any connection slower than localhost."""
+    text = client.get("/").text
+    route = text[text.index("function applyRoute("):]
+    route = route[:route.index("\n}\n")]
+    # the card is pinned when it is scrolled to, and every route starts unpinned
+    assert route.index("pinnedAnchor = null;") < route.index("pinnedAnchor = anchor;")
+    # pinned means scrolled to again whenever the page changes height
+    assert ("if (pinnedAnchor && Date.now() < pinnedUntil)"
+            " pinnedAnchor.scrollIntoView(") in text
+    assert "}).observe(document.body);" in text
+    # a scrollbar drag fires no input event, so the pin has to lapse on its own
+    assert "pinnedUntil = Date.now() + PIN_MS;" in route
+    # and the reader taking over ends it, so nothing yanks the page back
+    assert ('for (const type of ["wheel", "touchstart", "keydown", "pointerdown"])'
+            in text)
+
+
+def test_index_reapplies_a_link_to_the_hash_already_shown(client):
+    """Following #other-documents, folding the card and following the link
+    again left it folded: the hash had not changed, so no hashchange fired and
+    applyRoute, which opens the card, never ran."""
+    text = client.get("/").text
+    handler = text[text.index('document.addEventListener("click", (ev) => {\n'
+                              "  if (ev.defaultPrevented"):]
+    handler = handler[:handler.index("\n});\n")]
+    assert "if (link.hash !== location.hash) {" in handler
+    assert "return; }\n  ev.preventDefault();\n  applyRoute(true);" in handler
+    # new-tab and new-window clicks stay with the browser
+    for key in ("metaKey", "ctrlKey", "shiftKey", "altKey"):
+        assert "ev." + key in handler
+
+
+def test_index_lands_a_link_into_another_tab_at_the_top(client):
+    """"Submit tab" at the foot of Interop kept Interop's scroll offset, so it
+    landed at the bottom of Submit, past the address form it pointed at. Only a
+    link click does this: Back and Forward keep the browser's restored offset."""
+    text = client.get("/").text
+    assert "if (link.hash !== location.hash) { followedHash = link.hash; return; }" in text
+    route = text[text.index("function applyRoute("):]
+    route = route[:route.index("\n}\n")]
+    assert "const followed = followedHash === location.hash;\n  followedHash = null;" in route
+    # measured before showTab swaps the panels, or every route is "the same tab"
+    assert route.index('const from = document.querySelector(".tab-panel.active");') \
+        < route.index("showTab(tab);")
+    assert ('if (followed && !panel && from && from.id !== "tab-" + tab)'
+            " window.scrollTo(0, 0);") in route
 
 
 def test_index_hides_identifier_assigning_authorities(client):
@@ -2368,6 +2460,20 @@ def test_index_links_leaderboard_companies_to_their_documents(client):
     assert 'if (parts[1] === "company") { hideDoc(); selectCompany(parts[2]); return; }' in text
     # a company with nothing submitted has nothing to link to
     assert "${r.attempts" in text
+
+
+def test_index_keeps_the_clinical_tab_link_in_step_with_a_rewritten_hash(client):
+    """The Clinical tab link is where a trip to another tab returns to, and
+    applyRoute keeps it current. replaceState fires no hashchange, so a hash
+    rewritten that way - picking another company on a company route - left the
+    link on the old company, and coming back undid the pick."""
+    text = client.get("/").text
+    assert text.count("function rememberClinicalRoute()") == 1
+    calls = [m.start() for m in re.finditer(r"history\.replaceState\(", text)]
+    assert len(calls) >= 2  # go() and the company picker
+    for at in calls:
+        after = text[at:at + 250]
+        assert "applyRoute(" in after or "rememberClinicalRoute();" in after, after
 
 
 # ---------------------------------------------------------------- samples
