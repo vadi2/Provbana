@@ -3065,6 +3065,9 @@ def test_reset_knows_every_table_the_service_creates(tmp_path, monkeypatch):
     (lambda b: b.update(description="Ask for a token"), DESC_EXT),
     # credentials for the address do not belong on a public list
     (lambda b: b.update(header=["Authorization: Bearer s3cret"]), "public"),
+    (lambda b: b.update(address="https://alice:s3cret@a.example.org/r4"), "public"),
+    (lambda b: b.update(address="https://alice@a.example.org/r4"), "public"),
+    (lambda b: b.update(address="https://@a.example.org/r4"), "public"),
     (lambda b: b.update(extension=[{"url": DESC_EXT, "valueMarkdown": "x"}]),
      "one valueString"),
     (lambda b: b.update(extension=[{"url": DESC_EXT, "valueString": "a"},
@@ -3089,6 +3092,14 @@ def test_an_endpoint_this_server_would_mislabel_is_refused(client, mutate, fragm
         # refused means unchanged, not half-written
         assert client.get("/fhir/Endpoint/" + existing).json()["address"] \
             == "https://kept.example.org"
+
+
+def test_an_at_sign_after_the_host_is_not_a_credential(client):
+    tok = register(client, "Mastodon Fans")
+    for address in ("https://a.example.org/@team", "https://a.example.org/r4?who=a@b"):
+        res = advertise(client, tok, endpoint(address))
+        assert res.status_code == 201, address
+        assert res.json()["address"] == address
 
 
 def test_a_company_advertises_only_so_many_endpoints(client):

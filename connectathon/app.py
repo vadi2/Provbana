@@ -3622,6 +3622,14 @@ def parse_endpoint(payload: dict) -> dict:
             or any(c.isspace() or not c.isprintable() for c in address)):
         raise HTTPException(
             400, detail="address must be an absolute http or https URL")
+    # https://user:pass@host is a credential, refused for the same reason
+    # Endpoint.header is below. Any "@" before the host counts, an empty
+    # user name included.
+    if "@" in parts.netloc:
+        raise HTTPException(
+            400, detail="address must not carry a user name or password - this "
+                        "list is public. Say how to authenticate in the "
+                        "description instead")
     if len(address) > MAX_ADDRESS_CHARS:
         raise HTTPException(
             400, detail="address is longer than %d characters" % MAX_ADDRESS_CHARS)

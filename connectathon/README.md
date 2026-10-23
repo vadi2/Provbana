@@ -702,7 +702,8 @@ curl -X PUT localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN' \
 curl -X DELETE localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN'
 ```
 
-**400** for an address that is not an absolute http(s) URL or is over 2000 characters, a
+**400** for an address that is not an absolute http(s) URL, is over 2000 characters or
+carries a user name or password (`https://user:pass@host` - this list is public), a
 `connectionType` code other than these two (or with a `system` that is not that code's),
 a `status` other than `active` (delete an endpoint rather than parking it), a top-level
 R5 `description` (R4 has none - use the extension), a `header` (this list is public, so
