@@ -4731,7 +4731,7 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .cv-mode:hover { color: var(--accent); background: transparent; }
 .cv-mode.active { background: var(--btn); color: var(--btn-on); }
 /* Floating it here would leave the title a useless sliver, so it goes back to
-   being a full-width row above the document. A phone is narrower than the
+   being a full-width row above the document. A phone can be narrower than the
    three labels, so they wrap onto further rows instead of being clipped; the
    separator is a shadow up and to the left, which the box clips at its edges
    and so only shows between buttons, across rows as well as along them. */
