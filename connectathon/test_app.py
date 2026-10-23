@@ -1105,6 +1105,37 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     assert "html += cvModesHtml();" in text
 
 
+def test_leaderboard_poll_rewrites_only_the_rows_that_changed(client):
+    """Replacing the whole body every five seconds destroyed the focused link
+    and any selected text even when nothing had moved."""
+    text = client.get("/").text
+    script = text[text.index("async function refreshLeaderboard("):]
+    script = script[:script.index("\nrefreshLeaderboard();")]
+    assert '$("#lb-body").innerHTML =' not in script
+    assert "if (h !== lbRowsHtml[i]) body.rows[i].outerHTML = h;" in script
+    assert "lbRowsHtml = html;" in script
+    # A row that did change gets focus put back on the same company's link.
+    assert "if (focusedHref && !active.isConnected)" in script
+    # Trimmed, or each rewritten row would leave a stray text node behind.
+    assert "</tr>`.trim());" in script
+
+
+def test_leaderboard_podium_is_only_for_teams_that_have_scored(client):
+    """At the start every team is on 0, and rank alone would hand gold, silver
+    and bronze to the first three names in the alphabet."""
+    text = client.get("/").text
+    assert '${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}' in text
+    assert '${r.rank <= 3 ? "rank-"' not in text
+
+
+def test_first_pass_flame_names_what_earns_it(client):
+    """The bonus is for the first passing patient summary - a lab report that
+    passed earlier does not win it, so "a valid document" was wrong."""
+    text = client.get("/").text
+    assert "First pass: first company to submit a valid patient summary" in text
+    assert "first company to submit a valid document" not in text
+
+
 def test_index_navigates_through_the_hash(client):
     text = client.get("/").text
     # tabs are real links, so Back and Forward move between them and a view

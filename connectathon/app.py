@@ -5457,6 +5457,8 @@ async function loadDocuments() {
 loadDocuments();
 
 /* ---- leaderboard ---- */
+/* The rows as last written, so a poll can tell which ones actually changed. */
+let lbRowsHtml = [];
 async function refreshLeaderboard() {
   updatePracticeNote();
   try {
@@ -5465,14 +5467,17 @@ async function refreshLeaderboard() {
     const rows = paramEntries(await res.json(), "entry").map(leaderboardRow);
     $("#lb-empty").style.display = rows.length ? "none" : "block";
     $("#lb").style.display = rows.length ? "table" : "none";
-    $("#lb-body").innerHTML = rows.map((r) => `
-      <tr class="${r.rank <= 3 ? "rank-" + r.rank : ""}">
+    /* No podium for a team that has not scored: at the start, or with fewer
+       than three on the board, rank alone would hand gold to whoever sorts
+       first by name. */
+    const html = rows.map((r) => `
+      <tr class="${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
         <td>${r.attempts
           ? `<a href="#clinical/company/${encodeURIComponent(r.team_slug)}"
                title="see this company's documents">${esc(r.team)}</a>`
           : esc(r.team)}${r.first_pass
-          ? ' <span title="First pass: first company to submit a valid document">'
+          ? ' <span title="First pass: first company to submit a valid patient summary">'
             + '\u{1F525}</span>' : ""}</td>
         <td><strong>${r.score}</strong></td>
         <td>${r.passed ? '<span class="badge pass">VALID</span>'
@@ -5485,7 +5490,25 @@ async function refreshLeaderboard() {
         <td>${r.best_resources === null ? "-" : r.best_resources}</td>
         <td>${r.best_errors === null ? "-" : r.best_errors}</td>
         <td class="muted">${r.last_submission ? fmtWhen(r.last_submission) : "-"}</td>
-      </tr>`).join("");
+      </tr>`.trim());
+    /* Only the rows that changed are rewritten. Replacing the whole body every
+       five seconds destroyed the focused link and any selected text even when
+       nothing had moved; a row that did change still loses them, so focus is
+       put back on the same company's link wherever it now sits. */
+    const body = $("#lb-body");
+    const active = document.activeElement;
+    const focusedHref = body.contains(active) ? active.getAttribute("href") : null;
+    if (body.rows.length !== html.length || lbRowsHtml.length !== html.length) {
+      body.innerHTML = html.join("");
+    } else {
+      html.forEach((h, i) => { if (h !== lbRowsHtml[i]) body.rows[i].outerHTML = h; });
+    }
+    lbRowsHtml = html;
+    if (focusedHref && !active.isConnected) {
+      const link = [...body.querySelectorAll("a")]
+        .find((a) => a.getAttribute("href") === focusedHref);
+      if (link) link.focus();
+    }
   } catch (e) { /* transient network error - retry on next tick */ }
 }
 refreshLeaderboard();
