@@ -5462,10 +5462,7 @@ function applyRoute(scroll) {
   /* A route without a view opens in the default one, not in whichever view
      the last document was left in, so a link and a reload of it agree. */
   cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3] : CV_DEFAULT;
-  /* The tab link remembers the document you were reading, so a trip to the
-     leaderboard and back does not throw your place away. */
-  document.querySelector('.tab-btn[data-tab="clinical"]')
-    .setAttribute("href", location.hash);
+  rememberClinicalRoute();
   /* A company route shows that company's list and no document. If the tab was
      already open the picker is moved here; otherwise initClinical, kicked off
      by showTab above, reads the route once the list has loaded. */
@@ -5474,6 +5471,14 @@ function applyRoute(scroll) {
 }
 
 window.addEventListener("hashchange", () => applyRoute(true));
+
+/* The tab link remembers the document you were reading, so a trip to the
+   leaderboard and back does not throw your place away. Anything that rewrites
+   a #clinical hash without a hashchange has to call this itself. */
+function rememberClinicalRoute() {
+  document.querySelector('.tab-btn[data-tab="clinical"]')
+    .setAttribute("href", location.hash);
+}
 
 /* ---- register ---- */
 $("#reg-btn").addEventListener("click", async () => {
@@ -6515,6 +6520,7 @@ $("#cv-team").addEventListener("change", () => {
     if (slug === PREVIEW_TEAM) { renderCvList(); return; }
     history.replaceState(null, "", slug === SAMPLE_TEAM ? "#clinical"
                                                         : "#clinical/company/" + slug);
+    rememberClinicalRoute();
   }
   renderCvList();
 });

@@ -2103,6 +2103,20 @@ def test_index_links_leaderboard_companies_to_their_documents(client):
     assert "${r.attempts" in text
 
 
+def test_index_keeps_the_clinical_tab_link_in_step_with_a_rewritten_hash(client):
+    """The Clinical tab link is where a trip to another tab returns to, and
+    applyRoute keeps it current. replaceState fires no hashchange, so a hash
+    rewritten that way - picking another company on a company route - left the
+    link on the old company, and coming back undid the pick."""
+    text = client.get("/").text
+    assert text.count("function rememberClinicalRoute()") == 1
+    calls = [m.start() for m in re.finditer(r"history\.replaceState\(", text)]
+    assert len(calls) == 2  # go() and the company picker; add new ones here
+    for at in calls:
+        after = text[at:at + 250]
+        assert "applyRoute(" in after or "rememberClinicalRoute();" in after, after
+
+
 # ---------------------------------------------------------------- samples
 
 def test_samples_do_not_code_an_identifier_type_the_value_set_lacks():
