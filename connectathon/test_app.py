@@ -1537,7 +1537,9 @@ def test_a_long_company_name_wraps_wherever_it_is_shown(client):
                   '<code class="co-name">GET /fhir/Organization/',        # its slug
                   """<strong class="co-name">' + esc(g.team)""",          # endpoints
                   """<span class="shot-who co-name">' + esc(s.consumer)""",  # gallery
-                  """'<p class="muted co-name" style="margin:2px 0 0">'\n"""):  # document header
+                  """'<p class="muted co-name" style="margin:2px 0 0">'\n"""
+                  """    + (comp.title && d.doc_type ? esc(docLabel(d.doc_type))"""
+                  """ + " &middot; " : "")\n    + esc(d.team)"""):  # document header
         assert shown in text, shown
 
 
