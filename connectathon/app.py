@@ -1985,7 +1985,7 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
     # row however many bundles there are, and a scanner's thousand made-up
     # paths are one "(no route)" row rather than a thousand.
     route = getattr(request.scope.get("route"), "path", None) or "(no route)"
-    method = request.method
+    method = "HEAD" if request.scope.get(HEAD_AS_GET) else request.method
     # Caddy overwrites X-Real-IP with the connecting address, so it cannot be
     # forged from outside; locally there is no Caddy and the socket says.
     address = request.headers.get("x-real-ip") or (
@@ -2000,6 +2000,40 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
         detail = trace or request.scope.get("usage_error_detail") or "(no detail)"
         record_usage(monitor.record_error, "server", detail,
                      method=method, route=route, status=status)
+
+
+# Set on the scope of a HEAD answered as a GET, so the usage log still says HEAD.
+HEAD_AS_GET = "connectathon.head_as_get"
+
+
+class HeadAsGet:
+    """HEAD is GET without the body (RFC 9110), on every route that has a GET.
+
+    FastAPI registers only the methods a route names, so without this an
+    uptime checker or a link preview gets a 405 for the front page. Answered
+    as the GET would be, headers and all, with the body dropped here rather
+    than left to the server: uvicorn only drops it for a scope that still
+    says HEAD. Outermost, so everything inside sees an ordinary GET.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] != "HEAD":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_without_body(message) -> None:
+            if message["type"] == "http.response.body":
+                message = dict(message, body=b"")
+            await send(message)
+
+        await self.app(dict(scope, method="GET", **{HEAD_AS_GET: True}),
+                       receive, send_without_body)
+
+
+app.add_middleware(HeadAsGet)
 
 
 # ------------------------------------------------------------ FHIR plumbing

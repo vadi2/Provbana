@@ -4860,6 +4860,24 @@ def test_requests_are_counted_by_route_template_and_by_who_sent_them(client):
     assert not [r for r in rows if "wp-login" in r[1]]
 
 
+def test_head_is_get_without_the_body_and_is_logged_as_head(client):
+    """FastAPI routes only the methods named, so HEAD on the front page used
+    to be a 405 to every uptime checker."""
+    for path in ("/", "/fhir/metadata", "/fhir/$status", "/favicon.svg"):
+        get, head = client.get(path), client.head(path)
+        assert head.status_code == 200, path
+        assert head.content == b"", path
+        assert head.headers["content-type"] == get.headers["content-type"], path
+        assert head.headers["content-length"] == get.headers["content-length"], path
+    # what GET would refuse, HEAD is refused the same way
+    assert client.head("/fhir/Bundle/999").status_code == 404
+    res = client.head("/fhir/$register")
+    assert res.status_code == 405 and res.headers["allow"] == "POST"
+    rows = usage(client, "SELECT method, route, status FROM hits "
+                         "WHERE route = '/fhir/metadata'")
+    assert rows == [("GET", "/fhir/metadata", 200), ("HEAD", "/fhir/metadata", 200)]
+
+
 def test_visitors_are_hashed_per_day_and_not_stored_as_addresses(client):
     client.get("/", headers={"Sec-Fetch-Site": "none", "X-Real-IP": "203.0.113.7"})
     client.get("/fhir/$leaderboard", headers={"Sec-Fetch-Site": "same-origin",
