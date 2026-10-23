@@ -775,6 +775,42 @@ def test_observation_abnormal_flag_and_missing_value():
     assert set(mood["gaps"]) == {"not coded", "no date", "no value"}
 
 
+def test_observation_values_keep_comparator_ratio_and_range():
+    """"<5 mg/L" read as "5 mg/L" is a measured value that was never measured,
+    and a valid titre or range must not be flagged as missing its value."""
+    def obs(**value):
+        return {"resourceType": "Observation", "status": "final",
+                "code": {"text": "x"}, **value}
+    cases = [
+        (obs(valueQuantity={"value": 5, "comparator": "<", "unit": "mg/L"}), "<5 mg/L"),
+        (obs(valueQuantity={"value": 90, "comparator": ">", "unit": "mL/min"}),
+         ">90 mL/min"),
+        (obs(valueRatio={"numerator": {"value": 1}, "denominator": {"value": 64}}),
+         "1:64"),
+        (obs(valueRatio={"numerator": {"value": 5, "unit": "mg"},
+                         "denominator": {"value": 1, "unit": "mL"}}), "5 mg / 1 mL"),
+        (obs(valueRange={"low": {"value": 2, "unit": "mmol/L"},
+                         "high": {"value": 4, "unit": "mmol/L"}}), "2-4 mmol/L"),
+        (obs(valueRange={"low": {"value": 2, "unit": "mmol/L"}}), ">=2 mmol/L"),
+        (obs(valueRange={"high": {"value": 4}}), "<=4"),
+        (obs(valueDateTime="2025-03-04"), "2025-03-04"),
+        (obs(valueTime="08:30:00"), "08:30:00"),
+        (obs(valuePeriod={"start": "2025-01-01", "end": "2025-02-01"}),
+         "2025-01-01 to 2025-02-01"),
+        (obs(valueSampledData={"origin": {"value": 0}, "period": 10,
+                               "dimensions": 1, "data": "1 2 3"}), "sampled data"),
+        (obs(component=[{"code": {"text": "Systolic"}, "valueQuantity": {
+            "value": 140, "comparator": ">=", "unit": "mmHg"}},
+                        {"code": {"text": "Titre"}, "valueRatio": {
+            "numerator": {"value": 1}, "denominator": {"value": 8}}}]),
+         "Systolic >=140 mmHg, Titre 1:8"),
+    ]
+    for resource, expected in cases:
+        item = _items(_doc("30954-2", "Results", dict(resource, id="o")))[0]
+        assert item["detail"] == expected, (resource, item["detail"])
+        assert "no value" not in item["gaps"], resource
+
+
 def test_summary_quality_block():
     q = app_module.summarize_bundle(CLINICAL_BUNDLE)["quality"]
     assert q["items"] == 4                  # 2 meds + 1 allergy + 1 orphan

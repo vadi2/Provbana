@@ -676,7 +676,40 @@ def _quantity_str(quantity) -> str | None:
     unit = quantity.get("unit")
     if not isinstance(unit, str):
         unit = quantity.get("code") if isinstance(quantity.get("code"), str) else ""
-    return f"{value} {unit}".strip()
+    # "<5 mg/L" is a different result from "5 mg/L": below the assay's limit,
+    # not a measured 5.
+    comparator = quantity.get("comparator")
+    if comparator not in ("<", "<=", ">=", ">"):
+        comparator = ""
+    return f"{comparator}{value} {unit}".strip()
+
+
+def _ratio_str(ratio) -> str | None:
+    """1:64 for a titre; "5 mg / 1 mL" when the parts carry units."""
+    if not isinstance(ratio, dict):
+        return None
+    num = _quantity_str(ratio.get("numerator"))
+    den = _quantity_str(ratio.get("denominator"))
+    if not (num and den):
+        return None
+    return f"{num}:{den}" if " " not in num + den else f"{num} / {den}"
+
+
+def _range_str(rng) -> str | None:
+    if not isinstance(rng, dict):
+        return None
+    low, high = rng.get("low"), rng.get("high")
+    low_s, high_s = _quantity_str(low), _quantity_str(high)
+    if low_s and high_s:
+        # One unit is enough when both ends share it: "2-4 mmol/L".
+        if (low.get("unit"), low.get("code")) == (high.get("unit"), high.get("code")):
+            low_s = _quantity_str(dict(low, unit="", code=None))
+        return f"{low_s}-{high_s}"
+    if low_s:
+        return f">={low_s}"
+    if high_s:
+        return f"<={high_s}"
+    return None
 
 
 def _period_str(period) -> str | None:
@@ -710,20 +743,34 @@ def _choice_str(resource, prefix) -> str | None:
     )
 
 
-def _observation_value(obs) -> str | None:
+def _value_str(holder) -> str | None:
+    """The value[x] of an Observation or one of its components, as text."""
     value = (
-        _quantity_str(obs.get("valueQuantity"))
-        or _cc_display(obs.get("valueCodeableConcept"))
-        or _first_str(obs, "valueString")
+        _quantity_str(holder.get("valueQuantity"))
+        or _cc_display(holder.get("valueCodeableConcept"))
+        or _first_str(holder, "valueString", "valueDateTime", "valueTime")
+        or _ratio_str(holder.get("valueRatio"))
+        or _range_str(holder.get("valueRange"))
+        or _period_str(holder.get("valuePeriod"))
     )
     if value:
         return value
-    if isinstance(obs.get("valueBoolean"), bool):
-        return "yes" if obs["valueBoolean"] else "no"
-    if isinstance(obs.get("valueInteger"), int) and not isinstance(
-        obs.get("valueInteger"), bool
+    if isinstance(holder.get("valueBoolean"), bool):
+        return "yes" if holder["valueBoolean"] else "no"
+    if isinstance(holder.get("valueInteger"), int) and not isinstance(
+        holder.get("valueInteger"), bool
     ):
-        return str(obs["valueInteger"])
+        return str(holder["valueInteger"])
+    if isinstance(holder.get("valueSampledData"), dict):
+        # A waveform has no one-line rendering, but it is a value all the same.
+        return "sampled data"
+    return None
+
+
+def _observation_value(obs) -> str | None:
+    value = _value_str(obs)
+    if value:
+        return value
     components = obs.get("component")
     if isinstance(components, list):
         parts = []
@@ -731,11 +778,7 @@ def _observation_value(obs) -> str | None:
             if not isinstance(comp, dict):
                 continue
             label = _cc_display(comp.get("code"))
-            val = (
-                _quantity_str(comp.get("valueQuantity"))
-                or _cc_display(comp.get("valueCodeableConcept"))
-                or _first_str(comp, "valueString")
-            )
+            val = _value_str(comp)
             if label and val:
                 parts.append(f"{label} {val}")
             elif val:
