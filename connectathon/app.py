@@ -2343,11 +2343,13 @@ async def parameters_body(request: Request) -> dict:
 )
 def register(params: dict = Depends(parameters_body)) -> Response:
     if REGISTER_CODE:
-        supplied = params.get("code")
+        if "code" not in params:
+            raise HTTPException(403, detail="Registration code required")
+        supplied = params["code"]
         if not isinstance(supplied, str) or not secrets.compare_digest(
             supplied.encode("utf-8"), REGISTER_CODE.encode("utf-8")
         ):
-            raise HTTPException(403, detail="Registration code required")
+            raise HTTPException(403, detail="Registration code is incorrect")
     team = params.get("name")
     if not isinstance(team, str):
         raise HTTPException(

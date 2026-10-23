@@ -1477,12 +1477,19 @@ def test_registration_is_open_by_default(client):
 
 def test_registration_code_gates_when_set(client, monkeypatch):
     monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
-    assert register_res(client, "Alpha").status_code == 403
-    assert register_res(client, "Alpha", "wrong").status_code == 403
+    res = register_res(client, "Alpha")
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code required"
+    # someone who typed a code is told it is wrong, not that one is needed
+    res = register_res(client, "Alpha", "wrong")
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code is incorrect"
     # a non-string code must be refused, not compared
-    assert client.post("/fhir/$register", json={"resourceType": "Parameters",
+    res = client.post("/fhir/$register", json={"resourceType": "Parameters",
         "parameter": [{"name": "name", "valueString": "Alpha"},
-                      {"name": "code", "valueInteger": 1234}]}).status_code == 403
+                      {"name": "code", "valueInteger": 1234}]})
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code is incorrect"
     assert register_res(client, "Alpha", "s3cret").status_code == 200
 
 
