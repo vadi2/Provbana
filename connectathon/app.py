@@ -8243,7 +8243,7 @@ def custom_openapi() -> dict:
                 responses["401"] = {"description": "No token, or not a company's",
                                     "content": outcome}
             if "{" in path:
-                responses["404"] = {"description": "Nothing has that id",
+                responses["404"] = {"description": "Nothing found there",
                                     "content": outcome}
             responses["default"] = {"description": "Any other error",
                                     "content": outcome}
