@@ -4610,6 +4610,19 @@ table.issues td.loc {
    path underneath wraps a syllable at a time. */
 table.issues td.loc, table.issues th.loc-h { min-width: 190px; }
 .loc-where { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+/* A phone has room for one column, not three: severity and that floor took
+   all of it and left the message - what a team reads - past the right edge,
+   behind a scroll nothing showed. Each finding becomes a block instead, the
+   message under its severity and location at full width. */
+@media (max-width: 640px) {
+  table.issues thead { display: none; }
+  table.issues, table.issues tbody { display: block; }
+  table.issues tr { display: flex; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  table.issues tr:last-child { border-bottom: none; }
+  table.issues td { border-bottom: none; }
+  table.issues td.loc { flex: 1; min-width: 0; max-width: none; }
+  table.issues td.msg { flex-basis: 100%; padding-top: 0; }
+}
 .count-badge { display: inline-block; font-size: 0.68rem; font-weight: 600;
   color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 0 6px; margin-left: 4px; white-space: nowrap; }

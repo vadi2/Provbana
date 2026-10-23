@@ -1186,6 +1186,19 @@ def test_the_explain_menu_hands_focus_back_and_closes_when_tabbed_out_of(client)
             "closeExplainMenu();") in focusout
 
 
+def test_a_phone_reads_each_finding_as_a_block(client):
+    """At 375px the location's 190px floor and the severity took the whole
+    table, and the message column sat past the right edge of its scroller."""
+    text = client.get("/").text
+    assert "table.issues td.loc, table.issues th.loc-h { min-width: 190px; }" in text
+    narrow = text[text.index(".loc-where {"):]
+    narrow = narrow[narrow.index("@media (max-width: 640px) {"):]
+    narrow = narrow[:narrow.index("\n}")]
+    assert "table.issues tr { display: flex; flex-wrap: wrap;" in narrow
+    assert "table.issues td.loc { flex: 1; min-width: 0; max-width: none; }" in narrow
+    assert "table.issues td.msg { flex-basis: 100%;" in narrow
+
+
 def test_a_long_company_name_wraps_wherever_it_is_shown(client):
     """A name is any 2-40 characters with no rule about spaces, so one long
     word scrolled the Submit and Interop tabs sideways on a phone and pushed
