@@ -7323,7 +7323,7 @@ function shotTile(s) {
     + '<img loading="lazy" src="' + s.image + '" alt="'
     + esc(s.producer) + "'s document as shown by " + esc(s.consumer) + '"></a>'
     + '<figcaption class="shot-meta">'
-    + '<span class="shot-who">' + esc(s.consumer) + "</span>"
+    + '<span class="shot-who co-name">' + esc(s.consumer) + "</span>"
     + '<span class="muted">' + fmtWhen(s.ts) + "</span>"
     + '<span class="shot-note' + (s.note ? '">' + esc(s.note)
         : ' empty">No note - ask them what it shows.') + "</span>"

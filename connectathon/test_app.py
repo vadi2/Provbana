@@ -1183,6 +1183,7 @@ def test_a_long_company_name_wraps_wherever_it_is_shown(client):
                   """'<strong class="co-name">' + esc(p.team)""",          # partner card
                   '<code class="co-name">GET /fhir/Organization/',        # its slug
                   """<strong class="co-name">' + esc(g.team)""",          # endpoints
+                  """<span class="shot-who co-name">' + esc(s.consumer)""",  # gallery
                   """'<p class="muted co-name" style="margin:2px 0 0">' + esc(d.team)"""):
         assert shown in text, shown
 
