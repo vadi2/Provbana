@@ -3786,10 +3786,13 @@ def create_endpoint(
         held = conn.execute(
             "SELECT COUNT(*) FROM endpoints WHERE team_id = ?", (team["id"],)
         ).fetchone()[0]
+        # Worded for the page as much as the API: the page shows it as it
+        # comes, under "Add an address" and beside Edit and Remove buttons,
+        # not PUT and DELETE.
         if held >= MAX_ENDPOINTS:
             raise HTTPException(
-                422, detail="A company can advertise %d endpoints - delete one, "
-                            "or PUT over it" % MAX_ENDPOINTS)
+                422, detail="A company can list %d addresses - remove one, "
+                            "or edit one of them instead" % MAX_ENDPOINTS)
         row = fetch_endpoint(conn, insert_endpoint(conn, team["id"], fields))
     return fhir_response(
         endpoint_resource(row),

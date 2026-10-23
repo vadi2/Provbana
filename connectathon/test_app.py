@@ -3106,7 +3106,12 @@ def test_a_company_advertises_only_so_many_endpoints(client):
     tok = register(client, "Busy")
     for _ in range(app_module.MAX_ENDPOINTS):
         assert advertise(client, tok, endpoint()).status_code == 201
-    assert advertise(client, tok, endpoint()).status_code == 422
+    res = advertise(client, tok, endpoint())
+    assert res.status_code == 422
+    # the page shows this as it comes, so it speaks of its Edit and Remove
+    # buttons rather than of HTTP verbs
+    assert diagnostics(res) == ("A company can list %d addresses - remove one, "
+                                "or edit one of them instead" % app_module.MAX_ENDPOINTS)
     assert advertise(client, register(client, "Other"), endpoint()).status_code == 201
 
 
