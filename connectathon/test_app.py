@@ -2616,6 +2616,30 @@ def test_an_oversized_screenshot_is_refused_before_it_is_resident(client, monkey
     assert "limit is 1024 bytes" in diagnostics(res)
 
 
+def test_a_screenshot_past_the_envelope_is_refused_in_image_terms(client, monkeypatch):
+    """Most oversized screenshots trip the cap on the base64 body before the
+    image is ever decoded. The 413 still has to name the image limit people
+    were told about, not the envelope's own size and cap."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    monkeypatch.setattr(app_module, "MAX_IMAGE_BYTES", 1024)
+    monkeypatch.setattr(app_module, "MAX_DOCREF_BODY_BYTES", 1024 * 4 // 3 + 8192)
+    image = png_bytes() + b"\x00" * 20_000
+    body = json.dumps(docref("producer", image)).encode()
+    headers = {"X-Team-Token": tok_c, "Content-Type": "application/fhir+json"}
+    res = client.post("/fhir/DocumentReference", content=body, headers=headers)
+    assert res.status_code == 413
+    found = re.fullmatch(r"Screenshot too large \(about (\d+) bytes\); "
+                         r"limit is 1024 bytes", diagnostics(res))
+    assert found, diagnostics(res)
+    assert abs(int(found.group(1)) - len(image)) < 200
+    # sent chunked, the size is never declared - only that it is past the cap
+    res = client.post("/fhir/DocumentReference", headers=headers,
+                      content=(body[i:i + 4096] for i in range(0, len(body), 4096)))
+    assert res.status_code == 413
+    assert diagnostics(res) == \
+        "Screenshot too large (over 1024 bytes); limit is 1024 bytes"
+
+
 def test_a_runaway_note_is_truncated_not_refused(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     res = add_shot(client, tok_c, "producer", note="x" * (app_module.MAX_NOTE_CHARS + 500))

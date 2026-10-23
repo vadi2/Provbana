@@ -3285,7 +3285,25 @@ async def docref_body(
     request: Request, team: sqlite3.Row = Depends(current_team)
 ) -> dict:
     """The uploaded DocumentReference, read only once the uploader is known."""
-    raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
+    try:
+        raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
+    except HTTPException as exc:
+        if exc.status_code != 413:
+            raise
+        # The envelope's size and cap mean nothing to someone holding a 2.2 MB
+        # PNG, so say it as _attachment_bytes would: the image and its limit.
+        # Three bytes of image per four of base64 is close enough for "about";
+        # a chunked body, or one longer than it declared, is only known to be
+        # past the cap.
+        declared = request.headers.get("content-length", "")
+        size = ("about %d" % (int(declared) * 3 // 4)
+                if declared.isdigit() and int(declared) > MAX_DOCREF_BODY_BYTES
+                else "over %d" % MAX_IMAGE_BYTES)
+        raise HTTPException(
+            413,
+            detail="Screenshot too large (%s bytes); limit is %d bytes"
+            % (size, MAX_IMAGE_BYTES),
+        )
     try:
         payload = json.loads(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
