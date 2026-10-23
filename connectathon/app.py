@@ -5053,6 +5053,13 @@ th { text-align: left; color: var(--muted); font-size: 0.76rem;
 td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
 .table-wrap { overflow-x: auto; }
+/* A company name is any 2-40 characters, spaces or not: one long word has to
+   break rather than widen the page on a phone, or the leaderboard's name
+   column on any screen, pushing its last columns out of view. */
+.co-name { overflow-wrap: anywhere; }
+/* That also lets a table shrink the column to a letter: on a phone, where the
+   leaderboard scrolls anyway, ordinary names then broke mid-word. */
+td.co-name { min-width: 8em; }
 tr.rank-1 td { background: var(--gold-bg); }
 tr.rank-2 td { background: var(--silver-bg); }
 tr.rank-3 td { background: var(--bronze-bg); }
@@ -5128,6 +5135,10 @@ input[type=file] { font-size: 0.84rem; color: var(--muted); }
 .issue-toolbar { display: flex; align-items: center; justify-content: space-between;
   gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .issue-toolbar .issue-summary { margin-bottom: 0; }
+/* The menu opens leftwards from the button's right edge, so the button stays
+   at the right even when a phone wraps it onto its own line - at the left, the
+   menu started off the screen. */
+.issue-toolbar .menu-wrap { margin-left: auto; }
 .menu-wrap { position: relative; display: inline-block; }
 /* Needed because the rule above is an author rule and outranks the UA sheet's
    [hidden] { display: none } - without this, wrap.hidden = true has no effect
@@ -5168,6 +5179,19 @@ table.issues td.loc {
    path underneath wraps a syllable at a time. */
 table.issues td.loc, table.issues th.loc-h { min-width: 190px; }
 .loc-where { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+/* A phone has room for one column, not three: severity and that floor took
+   all of it and left the message - what a team reads - past the right edge,
+   behind a scroll nothing showed. Each finding becomes a block instead, the
+   message under its severity and location at full width. */
+@media (max-width: 640px) {
+  table.issues thead { display: none; }
+  table.issues, table.issues tbody { display: block; }
+  table.issues tr { display: flex; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  table.issues tr:last-child { border-bottom: none; }
+  table.issues td { border-bottom: none; }
+  table.issues td.loc { flex: 1; min-width: 0; max-width: none; }
+  table.issues td.msg { flex-basis: 100%; padding-top: 0; }
+}
 .count-badge { display: inline-block; font-size: 0.68rem; font-weight: 600;
   color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 0 6px; margin-left: 4px; white-space: nowrap; }
@@ -5534,7 +5558,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <section class="card" id="register-card">
     <div id="company-view" hidden>
       <h2>Your company</h2>
-      <p class="muted" style="margin:0">Registered as <strong
+      <p class="muted" style="margin:0">Registered as <strong class="co-name"
       id="company-name"></strong>. <button type="button" class="linkish"
       id="reg-another">Register a different company</button></p>
       <h3 class="company-sub">Where others can send you data</h3>
@@ -5600,7 +5624,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <div class="error-note" id="reg-error" role="alert"></div>
     <div id="reg-back-wrap" hidden>
       <p class="muted" style="margin:10px 0 0">Registering replaces the token
-      saved in this browser <strong id="reg-replace-name"></strong> - keep a
+      saved in this browser <strong class="co-name" id="reg-replace-name"></strong> - keep a
       copy first: <code id="reg-replace-token"></code></p>
       <p class="muted" style="margin:6px 0 0"><button type="button"
       class="linkish" id="reg-back">Back to your company</button></p>
@@ -5944,7 +5968,7 @@ async function refreshLeaderboard() {
     const html = rows.map((r) => `
       <tr class="${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
-        <td>${r.attempts
+        <td class="co-name">${r.attempts
           ? `<a href="#clinical/company/${encodeURIComponent(r.team_slug)}"
                title="see this company's documents">${esc(r.team)}</a>`
           : esc(r.team)}${r.first_pass
@@ -6735,7 +6759,19 @@ $("#explain-menu").addEventListener("click", (ev) => {
 });
 document.addEventListener("click", closeExplainMenu);
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") closeExplainMenu();
+  if (ev.key !== "Escape") return;
+  /* Hiding the item that has focus drops focus to <body>; it goes back to
+     the button that opened the menu instead. */
+  const fromMenu = $("#explain-menu").contains(document.activeElement);
+  closeExplainMenu();
+  if (fromMenu) $("#explain-btn").focus();
+});
+/* Tabbing past the last item left the menu open over the table. Only a move
+   to somewhere named closes it: a click on an item in a browser that does not
+   focus buttons reports no target, and closing then would swallow the click -
+   a click anywhere else is the document handler's. */
+$("#explain-wrap").addEventListener("focusout", (ev) => {
+  if (ev.relatedTarget && !ev.currentTarget.contains(ev.relatedTarget)) closeExplainMenu();
 });
 
 function renderIssues(issues, bundleText) {
@@ -6778,6 +6814,15 @@ function renderIssues(issues, bundleText) {
 }
 
 /* ---- submit ---- */
+/* fetch throws before sending a header with characters it cannot carry - a
+   token pasted with smart quotes, say - and every caller read that as a
+   network error. Tokens are plain ASCII, so such a token goes out with those
+   characters as "?": the server does not know it either way, and its 401 is
+   the true answer. */
+function bearer(token) {
+  return "Bearer " + token.replace(/[^\x21-\x7e]/g, "?");
+}
+
 /* The token is only typed in one place, but localStorage carries it across
    reloads so a participant pastes it once for the event. */
 function syncToken(value, from) {
@@ -6822,22 +6867,33 @@ async function checkValidator() {
 }
 checkValidator();
 
+/* The file rounded up and the limit down, so the two never print as the same
+   number: rounded alike, a file a byte over 5 MB read "That file is 5.0 MB;
+   the limit is 5 MB." */
+function tooBigMessage(size, limit) {
+  const tenths = (n, round) => round(n * 10 / 1048576) / 10;
+  return "That file is " + tenths(size, Math.ceil).toFixed(1) + " MB; the limit is "
+    + tenths(limit, Math.floor) + " MB.";
+}
+
 $("#file").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
   if (!f) return;
   const errBox = $("#submit-error");
-  if (f.size > maxBundleBytes) {
-    errBox.textContent = "That file is " + (f.size / 1048576).toFixed(1) + " MB; the limit is "
-      + Math.round(maxBundleBytes / 1048576) + " MB.";
+  /* A refused file takes the previous bundle with it: left in the box, it is
+     what Validate would send, under the new file's name in the picker. */
+  const refuse = (message) => {
+    ev.target.value = "";
+    $("#bundle").value = "";
+    errBox.textContent = message;
     errBox.style.display = "block";
-    return;
-  }
+  };
+  if (f.size > maxBundleBytes) return refuse(tooBigMessage(f.size, maxBundleBytes));
   try {
     $("#bundle").value = await f.text();
     errBox.style.display = "none";
   } catch (e) {
-    errBox.textContent = "Could not read the file: " + e.message;
-    errBox.style.display = "block";
+    refuse("Could not read the file: " + e.message);
   }
 });
 
@@ -6867,7 +6923,7 @@ $("#submit-btn").addEventListener("click", async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/fhir+json",
-        "Authorization": "Bearer " + token,
+        "Authorization": bearer(token),
       },
       body,
     });
@@ -7705,7 +7761,7 @@ function renderClinicalDoc(d) {
   html += cvModesHtml();
   // what kind of document this is, in the title when it has none of its own
   html += "<h2>" + esc(comp.title || docLabel(d.doc_type || "eps")) + "</h2>";
-  html += '<p class="muted" style="margin:2px 0 0">'
+  html += '<p class="muted co-name" style="margin:2px 0 0">'
     + (comp.title && d.doc_type ? esc(docLabel(d.doc_type)) + " &middot; " : "")
     + esc(d.team)
     + (d.preview
@@ -7888,8 +7944,8 @@ async function refreshShotCount(slug) {
 
 function partnerCard(p) {
   return '<div class="io-partner" data-slug="' + esc(p.team_slug) + '">'
-    + "<strong>" + esc(p.team) + "</strong>"
-    + '<p class="muted" style="margin:6px 0 0"><code>GET /fhir/Organization/'
+    + '<strong class="co-name">' + esc(p.team) + "</strong>"
+    + '<p class="muted" style="margin:6px 0 0"><code class="co-name">GET /fhir/Organization/'
     + esc(p.team_slug) + "/$document</code> \u00b7 Document #" + p.exchange_id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
@@ -7957,14 +8013,10 @@ async function whoAmI() {
   const token = $("#token").value.trim();
   const ask = ++meAsked;
   let next = null, state = "none";
-  /* fetch throws before sending a header with characters it cannot carry - a
-     token pasted with smart quotes, say - which would read as the server being
-     down, for ever. Tokens are plain ASCII, so anything else is just wrong. */
-  if (token && !/^[\x21-\x7e]+$/.test(token)) state = "rejected";
-  else if (token) {
+  if (token) {
     try {
       const res = await fetch("/fhir/Organization/$me", {
-        headers: { "Authorization": "Bearer " + token },
+        headers: { "Authorization": bearer(token) },
       });
       /* An Organization: `id` is the slug, `name` the company name. */
       if (res.ok) { next = await res.json(); state = "known"; }
@@ -8011,7 +8063,7 @@ function shotTile(s) {
     + '<img loading="lazy" src="' + s.image + '" alt="'
     + esc(s.producer) + "'s document as shown by " + esc(s.consumer) + '"></a>'
     + '<figcaption class="shot-meta">'
-    + '<span class="shot-who">' + esc(s.consumer) + "</span>"
+    + '<span class="shot-who co-name">' + esc(s.consumer) + "</span>"
     + '<span class="muted">' + fmtWhen(s.ts) + "</span>"
     + '<span class="shot-note' + (s.note ? '">' + esc(s.note)
         : ' empty">No note - ask them what it shows.') + "</span>"
@@ -8058,7 +8110,7 @@ async function uploadShot(slug) {
     const blob = await shrinkImage(file);
     const res = await fetch("/fhir/DocumentReference", {
       method: "POST",
-      headers: { "Authorization": "Bearer " + token,
+      headers: { "Authorization": bearer(token),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify({
         resourceType: "DocumentReference",
@@ -8129,7 +8181,7 @@ async function saveShotNote(id) {
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "PUT",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim(),
+      headers: { "Authorization": bearer($("#token").value.trim()),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify({
         resourceType: "DocumentReference", status: "current", description: next,
@@ -8162,7 +8214,7 @@ async function withdrawShot(id, confirmed) {
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "DELETE",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+      headers: { "Authorization": bearer($("#token").value.trim()) },
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -8285,7 +8337,7 @@ async function loadEndpoints() {
     hint.textContent = groups.length ? ""
       : "No company has advertised an endpoint yet.";
     box.innerHTML = groups.map((g) =>
-      '<div class="io-partner"><strong>' + esc(g.team) + "</strong>"
+      '<div class="io-partner"><strong class="co-name">' + esc(g.team) + "</strong>"
       + g.rows.map((e) => epRow(e, false)).join("") + "</div>").join("");
     $("#my-eps").innerHTML = Object.values(myEndpoints)
       .map((e) => epRow(e, true)).join("");
@@ -8354,7 +8406,7 @@ async function epSave() {
   try {
     const res = await fetch("/fhir/Endpoint" + (epEditing ? "/" + epEditing : ""), {
       method: epEditing ? "PUT" : "POST",
-      headers: { "Authorization": "Bearer " + token,
+      headers: { "Authorization": bearer(token),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify(body),
     });
@@ -8402,7 +8454,7 @@ async function epRemove(btn, confirmed) {
   try {
     const res = await fetch("/fhir/Endpoint/" + id, {
       method: "DELETE",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+      headers: { "Authorization": bearer($("#token").value.trim()) },
     });
     if (res.status === 401) { await refreshCompany(); return; }
     /* 404 is the outcome asked for, reached some other way. */

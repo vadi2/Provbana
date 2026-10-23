@@ -1482,6 +1482,65 @@ def test_index_offers_to_explain_the_errors_with_an_assistant(client):
     assert 'id="explain-text"' in text
 
 
+def test_the_explain_menu_opens_on_screen_when_a_phone_wraps_the_toolbar(client):
+    """The menu hangs leftwards from the button's right edge. Wrapped onto its
+    own line at the left on a phone, the button took the menu 47px off the
+    screen - so the button keeps to the right of its line."""
+    text = client.get("/").text
+    assert ".menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0;" in text
+    assert ".issue-toolbar { display: flex;" in text and "flex-wrap: wrap;" in text
+    assert ".issue-toolbar .menu-wrap { margin-left: auto; }" in text
+
+
+def test_the_explain_menu_hands_focus_back_and_closes_when_tabbed_out_of(client):
+    """Escape on an item dropped focus to <body>, and tabbing past the last
+    item left the menu open over the issue table."""
+    js = page_script(client)
+    esc_handler = js[js.index('if (ev.key !== "Escape") return;'):]
+    esc_handler = esc_handler[:esc_handler.index("\n});")]
+    assert ('const fromMenu = $("#explain-menu").contains(document.activeElement);'
+            in esc_handler)
+    # only from inside the menu: Escape anywhere else must not grab focus
+    assert 'if (fromMenu) $("#explain-btn").focus();' in esc_handler
+    focusout = js[js.index('$("#explain-wrap").addEventListener("focusout"'):]
+    focusout = focusout[:focusout.index("\n});")]
+    # a null target is a click the document handler deals with, not a tab-out
+    assert ("if (ev.relatedTarget && !ev.currentTarget.contains(ev.relatedTarget)) "
+            "closeExplainMenu();") in focusout
+
+
+def test_a_phone_reads_each_finding_as_a_block(client):
+    """At 375px the location's 190px floor and the severity took the whole
+    table, and the message column sat past the right edge of its scroller."""
+    text = client.get("/").text
+    assert "table.issues td.loc, table.issues th.loc-h { min-width: 190px; }" in text
+    narrow = text[text.index(".loc-where {"):]
+    narrow = narrow[narrow.index("@media (max-width: 640px) {"):]
+    narrow = narrow[:narrow.index("\n}")]
+    assert "table.issues tr { display: flex; flex-wrap: wrap;" in narrow
+    assert "table.issues td.loc { flex: 1; min-width: 0; max-width: none; }" in narrow
+    assert "table.issues td.msg { flex-basis: 100%;" in narrow
+
+
+def test_a_long_company_name_wraps_wherever_it_is_shown(client):
+    """A name is any 2-40 characters with no rule about spaces, so one long
+    word scrolled the Submit and Interop tabs sideways on a phone and pushed
+    the leaderboard's last columns out of view on a desktop."""
+    text = client.get("/").text
+    assert ".co-name { overflow-wrap: anywhere; }" in text
+    # with no floor the leaderboard column shrank to a letter on a phone
+    assert "td.co-name { min-width: 8em; }" in text
+    for shown in ('<strong class="co-name"\n      id="company-name">',
+                  '<strong class="co-name" id="reg-replace-name">',
+                  '<td class="co-name">${r.attempts',                     # leaderboard
+                  """'<strong class="co-name">' + esc(p.team)""",          # partner card
+                  '<code class="co-name">GET /fhir/Organization/',        # its slug
+                  """<strong class="co-name">' + esc(g.team)""",          # endpoints
+                  """<span class="shot-who co-name">' + esc(s.consumer)""",  # gallery
+                  """'<p class="muted co-name" style="margin:2px 0 0">'\n"""):  # document header
+        assert shown in text, shown
+
+
 # ------------------------------------------------------------- sample documents
 
 
@@ -4311,6 +4370,67 @@ def test_a_failed_bundle_does_not_show_an_earlier_score(client):
     text = client.get("/").text
     assert '(pass ? score : 0) + " pts</span>"' in text
     assert '+ (score ? " " + standing : "")' in text             # standing on hover
+
+
+def test_a_refused_file_takes_the_previous_bundle_with_it(client):
+    """Picking a file over the limit left the last bundle in the box, and
+    Validate sent and scored that one under the new file's name."""
+    text = client.get("/").text
+    handler = text.split('$("#file").addEventListener("change"', 1)[1]
+    handler = handler[:handler.index("\n});")]
+    refuse = handler[handler.index("const refuse = "):]
+    refuse = refuse[:refuse.index("};")]
+    assert 'ev.target.value = ""' in refuse and '$("#bundle").value = ""' in refuse
+    # both refusals - too big, and unreadable - go through it
+    assert handler.count("refuse(") == 2
+    assert "return refuse(" in handler and 'refuse("Could not read the file: "' in handler
+
+
+@needs_node
+def test_a_file_just_over_the_limit_is_not_said_to_be_the_limit(client):
+    """Both sizes were rounded to tenths alike, so anything up to about 50 KB
+    over 5 MB was refused as "5.0 MB; the limit is 5 MB"."""
+    js = page_script(client)
+    start = js.index("function tooBigMessage(")
+    fn = js[start:js.index("\n}", start) + 2]
+    limit = 5 * 1048576
+    cases = [[limit + 1, limit], [5249983, limit], [5450745, limit],
+             [limit + 1048576 // 2 + 1, limit + 1048576 // 2]]
+    proc = subprocess.run(
+        ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
+         ".readFileSync(0, 'utf8')).map(([s, l]) => tooBigMessage(s, l))));"],
+        input=json.dumps(cases), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "That file is 5.1 MB; the limit is 5 MB.",
+        "That file is 5.1 MB; the limit is 5 MB.",
+        "That file is 5.2 MB; the limit is 5 MB.",
+        "That file is 5.6 MB; the limit is 5.5 MB.",
+    ]
+
+
+@needs_node
+def test_a_token_fetch_cannot_carry_still_reaches_the_server(client):
+    """A token pasted with smart quotes made fetch throw before sending, and
+    Validate reported a "Network error" while the note under the field said
+    the token was wrong. Every authenticated call goes through bearer()."""
+    js = page_script(client)
+    start = js.index("function bearer(")
+    fn = js[start:js.index("\n}", start) + 2]
+    tokens = ["da79f71088e8db8c", "“da79f71088e8db8c”", "da79éf71", "☃",
+              "da79\ud800f71"]                     # a lone surrogate: escaping threw on it
+    proc = subprocess.run(
+        ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
+         ".readFileSync(0, 'utf8')).map((t) => new Headers({ Authorization: bearer(t) })"
+         ".get('Authorization'))));"],
+        input=json.dumps(tokens), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr          # Headers throws as fetch did
+    sent = json.loads(proc.stdout)
+    assert sent[0] == "Bearer da79f71088e8db8c"        # a real token goes as it is
+    assert sent[1] == "Bearer ?da79f71088e8db8c?"
+    assert all(s.isascii() for s in sent)
+    # no call builds the header any other way
+    assert js.count('"Bearer " +') == 1 and js.count("bearer(") >= 8
 
 
 
