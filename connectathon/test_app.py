@@ -935,6 +935,22 @@ def test_the_clinical_view_knows_what_kind_of_document_it_shows(client, monkeypa
     assert "if (aBody) h += dbCard(" in text
 
 
+def test_a_company_document_list_shows_each_type(client, monkeypatch):
+    """A lab report, a prescription and a summary from one company must not
+    look alike in its list - the API says which is which, so the row does."""
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("mpd"))
+    entry, = param_entries(client.get("/fhir/$submissions"))
+    assert entry["documentType"] == "mpd"
+    text = client.get("/").text
+    row = text[text.index("function submissionRow("):text.index("function partnerRow(")]
+    assert "doc_type: e.documentType" in row
+    body = text[text.index("async function renderCvList("):]
+    body = body[:body.index("\n}\n")]
+    assert '<th scope="col">Type</th>' in body
+    assert "esc(docShort(s.doc_type))" in body
+
+
 def test_a_document_bundle_without_a_composition_still_reports_orphans():
     """Only a bundle that is not a document reads as a list of entries; a
     document that lost its Composition is broken, and says so."""

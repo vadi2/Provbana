@@ -5365,7 +5365,7 @@ function submissionRow(e) {
   return { id: e.id, ts: e.recorded, team: e.organization,
            team_slug: e.organizationSlug, pass: e.pass, score: e.score,
            errors: e.errors, warnings: e.warnings, sections: e.sections,
-           resources: e.resources };
+           resources: e.resources, doc_type: e.documentType };
 }
 function partnerRow(e) {
   return { team: e.organization, team_slug: e.organizationSlug,
@@ -6591,12 +6591,15 @@ async function renderCvList() {
     return;
   }
   box.innerHTML = '<div class="table-wrap"><table><thead><tr>'
-    + '<th scope="col">Time</th><th scope="col">Status</th><th scope="col">Score</th>'
+    + '<th scope="col">Time</th><th scope="col">Type</th>'
+    + '<th scope="col">Status</th><th scope="col">Score</th>'
     + '<th scope="col">Sections</th><th scope="col">Resources</th>'
     + "</tr></thead><tbody>"
     + subs.map((s) => '<tr class="cv-row" data-id="' + s.id
       + '" title="click to open"><td><a class="cv-open" href="#clinical/submission/'
       + s.id + '">' + new Date(s.ts).toLocaleString() + "</a></td>"
+      + '<td><span class="cat-chip" title="' + esc(docLabel(s.doc_type)) + '">'
+      + esc(docShort(s.doc_type)) + "</span></td>"
       + "<td>" + (s.pass ? '<span class="badge pass">VALID</span>'
                          : '<span class="badge fail">INVALID</span>') + "</td>"
       + "<td><strong>" + s.score + "</strong></td>"
