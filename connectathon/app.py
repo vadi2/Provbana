@@ -859,7 +859,7 @@ def _dosage_detail(resource) -> str | None:
         if text:
             parts.append(text)
             continue
-        # No text: a prescription is often structured only ("4 Tablet, once a
+        # No text: a prescription is often structured only ("4 Tablet, every
         # day, late evening, for 42 days"), and that is a dose all the same.
         bits = []
         rates = dosage.get("doseAndRate")
