@@ -6085,7 +6085,19 @@ $("#explain-menu").addEventListener("click", (ev) => {
 });
 document.addEventListener("click", closeExplainMenu);
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") closeExplainMenu();
+  if (ev.key !== "Escape") return;
+  /* Hiding the item that has focus drops focus to <body>; it goes back to
+     the button that opened the menu instead. */
+  const fromMenu = $("#explain-menu").contains(document.activeElement);
+  closeExplainMenu();
+  if (fromMenu) $("#explain-btn").focus();
+});
+/* Tabbing past the last item left the menu open over the table. Only a move
+   to somewhere named closes it: a click on an item in a browser that does not
+   focus buttons reports no target, and closing then would swallow the click -
+   a click anywhere else is the document handler's. */
+$("#explain-wrap").addEventListener("focusout", (ev) => {
+  if (ev.relatedTarget && !ev.currentTarget.contains(ev.relatedTarget)) closeExplainMenu();
 });
 
 function renderIssues(issues, bundleText) {

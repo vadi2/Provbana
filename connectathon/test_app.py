@@ -1169,6 +1169,23 @@ def test_the_explain_menu_opens_on_screen_when_a_phone_wraps_the_toolbar(client)
     assert ".issue-toolbar .menu-wrap { margin-left: auto; }" in text
 
 
+def test_the_explain_menu_hands_focus_back_and_closes_when_tabbed_out_of(client):
+    """Escape on an item dropped focus to <body>, and tabbing past the last
+    item left the menu open over the issue table."""
+    js = page_script(client)
+    esc_handler = js[js.index('if (ev.key !== "Escape") return;'):]
+    esc_handler = esc_handler[:esc_handler.index("\n});")]
+    assert ('const fromMenu = $("#explain-menu").contains(document.activeElement);'
+            in esc_handler)
+    # only from inside the menu: Escape anywhere else must not grab focus
+    assert 'if (fromMenu) $("#explain-btn").focus();' in esc_handler
+    focusout = js[js.index('$("#explain-wrap").addEventListener("focusout"'):]
+    focusout = focusout[:focusout.index("\n});")]
+    # a null target is a click the document handler deals with, not a tab-out
+    assert ("if (ev.relatedTarget && !ev.currentTarget.contains(ev.relatedTarget)) "
+            "closeExplainMenu();") in focusout
+
+
 def test_a_long_company_name_wraps_wherever_it_is_shown(client):
     """A name is any 2-40 characters with no rule about spaces, so one long
     word scrolled the Submit and Interop tabs sideways on a phone and pushed
