@@ -1144,6 +1144,22 @@ def test_index_reapplies_a_link_to_the_hash_already_shown(client):
         assert "ev." + key in handler
 
 
+def test_index_lands_a_link_into_another_tab_at_the_top(client):
+    """"Submit tab" at the foot of Interop kept Interop's scroll offset, so it
+    landed at the bottom of Submit, past the address form it pointed at. Only a
+    link click does this: Back and Forward keep the browser's restored offset."""
+    text = client.get("/").text
+    assert "if (link.hash !== location.hash) { followedHash = link.hash; return; }" in text
+    route = text[text.index("function applyRoute("):]
+    route = route[:route.index("\n}\n")]
+    assert "const followed = followedHash === location.hash;\n  followedHash = null;" in route
+    # measured before showTab swaps the panels, or every route is "the same tab"
+    assert route.index('const from = document.querySelector(".tab-panel.active");') \
+        < route.index("showTab(tab);")
+    assert ('if (followed && !panel && from && from.id !== "tab-" + tab)'
+            " window.scrollTo(0, 0);") in route
+
+
 def test_index_hides_identifier_assigning_authorities(client):
     """The OID behind a patient identifier is plumbing. The API still carries
     it - machines need it - but no reader is shown it."""

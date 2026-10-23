@@ -5453,9 +5453,18 @@ for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
                           { capture: true, passive: true });
 }
 
+/* Set by a link click to the hash it is heading for. A link into another tab
+   lands at the top of the page, like following a link to a new page would,
+   rather than at the old tab's scroll offset; Back and Forward are not link
+   clicks, so the browser still restores where you were. */
+let followedHash = null;
+
 function applyRoute(scroll) {
   const parts = routeParts();
   pinnedAnchor = null;
+  const followed = followedHash === location.hash;
+  followedHash = null;
+  const from = document.querySelector(".tab-panel.active");
   /* A hash that is not a tab may be a deep link to a card inside one, such as
      #other-documents or #send-direct. The card's own tab is shown, a folded
      card is opened, and it is scrolled into view; anything else falls through
@@ -5466,6 +5475,7 @@ function applyRoute(scroll) {
   const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0]
     : panel ? panel.id.replace(/^tab-/, "") : "leaderboard";
   showTab(tab);
+  if (followed && !panel && from && from.id !== "tab-" + tab) window.scrollTo(0, 0);
   if (panel) {
     if (anchor.tagName === "DETAILS") anchor.open = true;
     anchor.scrollIntoView({ block: "start" });
@@ -5497,7 +5507,8 @@ document.addEventListener("click", (ev) => {
   if (ev.defaultPrevented || ev.button !== 0
       || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
   const link = ev.target.closest('a[href^="#"]');
-  if (!link || link.target || link.hash !== location.hash) return;
+  if (!link || link.target) return;
+  if (link.hash !== location.hash) { followedHash = link.hash; return; }
   ev.preventDefault();
   applyRoute(true);
 });
