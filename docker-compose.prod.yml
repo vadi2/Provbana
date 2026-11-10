@@ -165,7 +165,7 @@ services:
       WARM_TIMEOUT: ${WARM_TIMEOUT:-600}
     depends_on:
       - matchbox
-    # Four HTTP calls every twenty minutes. The work is all on the validator's
+    # Five HTTP calls every twenty minutes. The work is all on the validator's
     # side; this process holds one bundle in memory.
     mem_limit: 512m
     logging: *logging

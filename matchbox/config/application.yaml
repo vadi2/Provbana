@@ -12,32 +12,25 @@ hapi:
       # and score as if they had passed. /fhir/$status reports that as
       # `degraded` and deploy.sh refuses to finish on it.
       #
-      # eps is the one the event scores; the other three are the EHDS
+      # eps is the one the event scores; the other four are the EHDS
       # categories the service also accepts, and a missing package there costs a
-      # bonus rather than the track, but wrongly - so all four are gated the
+      # bonus rather than the track, but wrongly - so all five are gated the
       # same.
       #
-      # The hospital discharge report guide (hl7.fhir.eu.hdr) is deliberately
-      # absent. Not merely because it fails its own examples - so does imaging,
-      # below, and that one is kept - but because its failure is not one a team
-      # can build around: the guide binds Encounter.status to a value set
-      # enumerating the R4 codes, while the R5 CodeSystem for
-      # http://hl7.org/fhir/encounter-status, shipped by hl7.fhir.uv.xver-r5.r4
-      # which its own dependencies pull in, shadows it. R5 renamed `finished`
-      # to `completed`, so the `finished` a conformant discharge report carries
-      # takes a hard error and drags two spurious "a matching slice is
-      # required" errors with it. Every HDR example in the package hits it, and
-      # it is not fixable from here - it needs the guide or the xver package to
-      # change. Restore this entry, and the one in app.py's EHDS_DOCUMENTS,
-      # once one of them has.
+      # hdr was out of this list while it sat at 0.1.0-ballot: that guide bound
+      # Encounter.status to the R4 codes unversioned, the R5 CodeSystem from
+      # hl7.fhir.uv.xver-r5.r4 shadowed them, and the `finished` a conformant
+      # report carries took a hard error. 1.0.0 pins the value set to
+      # encounter-status|4.0.1, which settles it: all five of its published
+      # example bundles validate with no errors, and `completed` is now the
+      # one rejected.
       #
       # Loading all of them together was verified, not assumed - the guides pin
-      # two different versions of hl7.fhir.eu.base (2.0.0-ballot for imaging,
-      # 2.0.0 for eps and laboratory) and Matchbox loads both side by side
-      # without complaint. Cold boot was about 160s and roughly 40 packages
-      # once the dependencies were resolved, against ~30s for eps alone -
-      # measured with the discharge guide still in the list, so the current set
-      # boots somewhat faster and lighter than that.
+      # three different versions of hl7.fhir.eu.base (2.0.0-ballot for imaging,
+      # 2.0.0 for eps and laboratory, 2.0.1 for hdr) and Matchbox loads them
+      # side by side without complaint. Cold boot was about 160s and roughly 40
+      # packages once the dependencies were resolved, against ~30s for eps
+      # alone.
       eps:
         name: hl7.fhir.eu.eps
         version: 1.0.0-ballot
@@ -50,6 +43,9 @@ hapi:
       imaging:
         name: hl7.fhir.eu.imaging
         version: 1.0.0-ballot
+      hdr:
+        name: hl7.fhir.eu.hdr
+        version: 1.0.0
       sebase:
         name: hl7se.fhir.base
         version: 1.1.0

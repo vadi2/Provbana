@@ -23,7 +23,7 @@ What it buys is the difference between a participant's first imaging report
 taking 0.3s and taking 135s, which at a 60s timeout is a 502 and no stored
 submission at all.
 
-Cheap enough to run often: a warm pass is four sub-second validations. The
+Cheap enough to run often: a warm pass is five sub-second validations. The
 bundle it sends is the event's own sample, which is not a document of most of
 these kinds, so most of them come back invalid. That is fine, and the verdict
 is discarded - compiling the snapshots is the point, and Matchbox does that
