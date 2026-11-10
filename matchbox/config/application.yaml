@@ -27,7 +27,7 @@ hapi:
       #
       # Loading all of them together was verified, not assumed - the guides pin
       # three different versions of hl7.fhir.eu.base (2.0.0-ballot for imaging,
-      # 2.0.0 for eps and laboratory, 2.0.1 for hdr) and Matchbox loads them
+      # 2.0.0 for eps, 2.0.1 for laboratory and hdr) and Matchbox loads them
       # side by side without complaint. Cold boot was about 160s and roughly 40
       # packages once the dependencies were resolved, against ~30s for eps
       # alone.
@@ -36,7 +36,7 @@ hapi:
         version: 1.0.0-ballot
       lab:
         name: hl7.fhir.eu.laboratory
-        version: 2.0.0
+        version: 2.1.0
       mpd:
         name: hl7.fhir.eu.mpd
         version: 1.0.0

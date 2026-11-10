@@ -1612,9 +1612,9 @@ def test_every_category_the_registry_names_is_a_package_the_validator_loads():
     which needs a live Matchbox and a ~160s cold boot, so the answer arrived at
     deploy time rather than here.
 
-    Asserted directionally, not as set equality, because one legitimate
-    asymmetry exists: hl7.fhir.eu.base#2.0.0-ballot is in laboratory's igs and
-    has no yaml entry of its own - it arrives transitively through imaging.
+    Asserted directionally, not as set equality: a category may name a
+    supporting package that reaches the validator through another guide's
+    dependencies rather than a yaml entry of its own.
     """
     yaml_path = os.path.join(os.path.dirname(os.path.abspath(app_module.__file__)),
                              os.pardir, "matchbox", "config", "application.yaml")
@@ -4538,15 +4538,6 @@ def test_documents_says_unknown_rather_than_missing_when_matchbox_is_unreachable
     monkeypatch.setattr(app_module, "loaded_ig_packages", lambda: None)
     docs = param_entries(client.get("/fhir/$documents"))
     assert all("ready" not in d for d in docs)
-
-
-def test_the_laboratory_guide_keeps_the_base_ballot_that_holds_its_missing_profile():
-    """DiagnosticReport-eu-lab points at patient-animal-eu-core, which eu.base
-    2.0.0 dropped and only 2.0.0-ballot still defines. Without the ballot in
-    scope every lab bundle - the IG's own examples included - fails to resolve
-    it and scores 0."""
-    igs = app_module.DOCUMENTS_BY_ID["laboratory"]["igs"]
-    assert "hl7.fhir.eu.base#2.0.0-ballot" in igs
 
 
 # ---------------------------------------------------------------- usage log and monitor
