@@ -5,10 +5,10 @@ Everything behind the FHIR European Patient Summary track of the
 Kista: a validator, a scoring service with a live leaderboard, and synthetic example
 documents for the three clinical scenarios.
 
-The patient summary is the track and what the leaderboard ranks. Three other EHDS
-Article 14 categories - laboratory report, prescription and dispense, imaging report -
-are accepted as well and validated against their own guide, for a flat bonus rather
-than the summary's points.
+The patient summary is the track and what the leaderboard ranks. The four other EHDS
+Article 14 categories HL7 Europe publishes a guide for - laboratory report,
+prescription and dispense, imaging report, discharge report - are accepted as well and
+validated against their own guide, for a flat bonus rather than the summary's points.
 A submission says nothing about which it is; the service reads that off the bundle. See
 [Document types](connectathon/README.md#document-types).
 

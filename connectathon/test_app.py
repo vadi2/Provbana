@@ -1137,7 +1137,7 @@ def test_index_does_not_claim_terminology_is_validated(client):
     assert ("that require a license (such as SNOMED CT,\n  LOINC, WHO ATC) are not checked"
             in text)
     # every guide a submission can be validated against is named on the page
-    for guide in ("eps", "laboratory", "mpd", "imaging"):
+    for guide in ("eps", "laboratory", "mpd", "imaging", "hdr"):
         assert "https://hl7.eu/fhir/%s/" % guide in text
 
 
@@ -4060,8 +4060,8 @@ def secondary_bundle(doc_id):
 
     MPD defines no Bundle profile at all, so it has nothing in `bundles` to
     claim and its evidence has to sit one level down, on an entry. Handling
-    that here rather than at the call sites is what lets a test cover all
-    three secondary categories instead of only the two that are documents.
+    that here rather than at the call sites is what lets a test cover every
+    secondary category instead of only the ones that are documents.
     """
     doc = app_module.DOCUMENTS_BY_ID[doc_id]
     if doc["bundles"]:
@@ -4073,7 +4073,7 @@ def secondary_bundle(doc_id):
 
 # ------------------------------------------------------------ detection
 
-@pytest.mark.parametrize("doc_id", ["eps", "laboratory", "imaging"])
+@pytest.mark.parametrize("doc_id", ["eps", "laboratory", "imaging", "hdr"])
 def test_a_bundle_is_detected_from_the_profile_it_claims(doc_id):
     """The claim is the submitter saying what they built, and it outranks every
     other signal - it is the only one that can tell the two imaging bundle
@@ -4098,7 +4098,8 @@ def test_an_mpd_bundle_is_detected_from_what_its_entries_claim():
 
 
 @pytest.mark.parametrize("code,doc_id", [("60591-5", "eps"),
-                                         ("11502-2", "laboratory")])
+                                         ("11502-2", "laboratory"),
+                                         ("34105-7", "hdr")])
 def test_a_document_claiming_nothing_is_detected_from_its_composition_type(code, doc_id):
     assert app_module.detect_document(doc_bundle(comp_type=code))["id"] == doc_id
 
@@ -4221,10 +4222,10 @@ def test_an_old_database_gains_the_category_column_as_a_patient_summary(tmp_path
 def test_a_retired_category_still_in_the_database_scores_nothing(client, monkeypatch):
     """A category can be dropped from the registry while its rows survive.
 
-    The discharge report was removed after teams had already practised against
-    it, and reset.py only wipes daily until PRACTICE_ENDS while backup.py
-    restores whatever it snapshotted - so a passing `hdr` row can outlive the
-    category itself. The submit header and the leaderboard count the bonus by
+    The discharge report was once removed after teams had already practised
+    against it, and reset.py only wipes daily until PRACTICE_ENDS while
+    backup.py restores whatever it snapshotted - so a passing row can outlive
+    its category. The submit header and the leaderboard count the bonus by
     different means, and they have to agree on what a retired doc_type is
     worth: nothing. Counting it in one place and not the other put a 15-point
     contradiction between a team's banner and the board next to it.
@@ -4237,9 +4238,9 @@ def test_a_retired_category_still_in_the_database_scores_nothing(client, monkeyp
         conn.execute(
             "INSERT INTO submissions (team_id, ts, pass, errors, warnings, infos, "
             "score, sections, resources, doc_type, filename) "
-            "VALUES (?, '2026-01-01', 1, 0, 0, 0, 0, 0, 0, 'hdr', 'old.json')",
+            "VALUES (?, '2026-01-01', 1, 0, 0, 0, 0, 0, 0, 'retired', 'old.json')",
             (team_id,))
-    assert "hdr" not in {d["id"] for d in app_module.EHDS_DOCUMENTS}
+    assert "retired" not in {d["id"] for d in app_module.EHDS_DOCUMENTS}
 
     res = submit(client, token, outcome(), monkeypatch)
     assert res.headers["X-Secondary-Categories"] == "0"
@@ -4274,7 +4275,7 @@ def test_the_page_names_every_category_it_can_be_asked_about(client):
 
 def test_a_company_that_only_sends_summaries_scores_what_it_always_did(client,
                                                                       monkeypatch):
-    """The whole point of the demotion: adding three categories to the service
+    """The whole point of the demotion: adding four categories to the service
     cannot move a single score that existed before them."""
     consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
@@ -4307,15 +4308,10 @@ def test_a_stack_of_other_categories_cannot_out_score_one_good_summary(client,
     less than a single well-built summary, and that has to stay true."""
     consume_first_pass(client, monkeypatch)
     breadth = register(client, "Breadth")
-    for doc_id in ("laboratory", "mpd", "imaging"):
-        doc = app_module.DOCUMENTS_BY_ID[doc_id]
-        body = (doc_body(doc["bundles"][0]) if doc["bundles"]
-                else json.dumps({"resourceType": "Bundle", "type": "collection",
-                                 "entry": [{"resource": {
-                                     "resourceType": "MedicationRequest",
-                                     "meta": {"profile": [doc["entry_profiles"][0]]}}}]}))
-        res = submit(client, breadth, outcome(), monkeypatch, body=body)
-        assert res.headers["X-Document-Type"] == doc_id, res.headers
+    for doc in app_module.SECONDARY_DOCUMENTS:
+        res = submit(client, breadth, outcome(), monkeypatch,
+                     body=secondary_bundle(doc["id"]))
+        assert res.headers["X-Document-Type"] == doc["id"], res.headers
 
     depth = register(client, "Depth")
     res = submit(client, depth, outcome(), monkeypatch,
@@ -4483,11 +4479,12 @@ def test_the_secondary_categories_are_listed_in_registry_order(client, monkeypat
     # Submitted in an order that is neither registry order, nor its reverse,
     # nor alphabetical either way - so no accumulation that merely echoes the
     # submissions can produce the expected list by accident.
-    for doc_id in ("imaging", "laboratory", "mpd"):
+    for doc_id in ("imaging", "laboratory", "hdr", "mpd"):
         submit(client, token, outcome(), monkeypatch, body=secondary_bundle(doc_id))
     row = next(r for r in param_entries(client.get("/fhir/$leaderboard"))
                if r["organizationSlug"] == "alpha")
-    assert part_list(row, "secondaryCategories") == ["laboratory", "mpd", "imaging"]
+    assert part_list(row, "secondaryCategories") == ["laboratory", "mpd", "imaging",
+                                                     "hdr"]
 
 
 def test_the_richness_columns_describe_the_summary_not_the_last_lab_report(client,

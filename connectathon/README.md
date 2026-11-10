@@ -4,7 +4,7 @@ Service for the [Nordic Hackathon 2026](https://nordichackathon2026.blogs.dsv.su
 
 Gamified FHIR hackathon service: teams register, submit European Patient Summary bundles,
 a local [Matchbox](https://github.com/ahdis/matchbox) validates them against HL7 EU EPS, and a live leaderboard keeps score.
-Three other EHDS [document types](#document-types) are accepted too, validated against
+Four other EHDS [document types](#document-types) are accepted too, validated against
 their own HL7 Europe guide - second-class on purpose: the patient summary is the track.
 
 ## Run
@@ -293,7 +293,7 @@ log line, nothing in `$status` to see. Measured locally at about 75 minutes of i
 JVM near its heap ceiling. So a deploy on the Monday leaves the box cold by the Tuesday.
 
 `warm.py --loop` is the answer: every 20 minutes it validates one bundle against every
-category, which is four sub-second calls and nothing else. It runs as its own container
+category, which is five sub-second calls and nothing else. It runs as its own container
 in `docker-compose.prod.yml` for the same reason `backup.py` and `reset.py` do - a thing
 that must keep happening on a schedule should not be sharing a process with the thing
 that serves participants.
@@ -308,7 +308,7 @@ logs nothing, and a line appearing after the first pass is the useful signal: it
 engine had been dropped and had to be rebuilt, so `WARM_INTERVAL` is too long.
 
 The bundle it sends is the event's own patient summary sample, which is not a document
-of most of these kinds and comes back invalid for three of the four. That is fine and the
+of most of these kinds and comes back invalid for four of the five. That is fine and the
 verdict is thrown away - building the snapshots is the entire point, and Matchbox does
 that before it can decide anything about the content.
 
@@ -387,7 +387,7 @@ scores - interop testing is deliberately unscored, so there is nothing to farm. 
 The +15 is flat and paid once per category however many of that kind you send, and a
 non-summary earns no section or resource points at all: richness is measured against
 what a patient summary is meant to carry, and counting sections on a lab report would
-only reward the wrong shape. Passing all three others is worth 45 - less than a
+only reward the wrong shape. Passing all four others is worth 60 - less than a
 middling summary - which is the intent. This is the patient summary track; the rest is
 credit for breadth, not a route around it. A company that only ever submits summaries
 scores exactly what it scored before any of the other categories existed.
@@ -398,8 +398,8 @@ The event is the European Patient Summary. But EHDS ([Regulation (EU)
 2025/327](https://eur-lex.europa.eu/eli/reg/2025/327/oj), Article 14) names six
 priority categories of health data that EHR systems have to exchange, and a team that
 brings a lab report should get it checked properly rather than scored against the
-wrong profile. So four categories are accepted - five of the six, since MPD answers
-for both ePrescription and eDispensation - and the three that are not the summary are
+wrong profile. So five categories are accepted - all six, since MPD answers for both
+ePrescription and eDispensation - and the four that are not the summary are
 deliberately second-class: real validation and real findings, a flat bonus, and no
 place in the page's headline.
 
@@ -409,24 +409,21 @@ place in the page's headline.
 | Medical test result | [Laboratory Report](https://hl7.eu/fhir/laboratory/) | STU 2.0 | +15 |
 | ePrescription / eDispensation | [MPD](https://hl7.eu/fhir/mpd/) | STU 1.0 | +15 |
 | Medical imaging study and report | [Imaging Report](https://hl7.eu/fhir/imaging/) | ballot | +15 |
+| Discharge report | [HDR](https://hl7.eu/fhir/hdr/) | STU 1.0 | +15 |
 
 The imaging row is the *report*: an `ImagingStudy` is not a document, so the images
 themselves have no guide to be validated against.
 
-The sixth category, the hospital discharge report, is left out on purpose. Its guide
-has sat at `0.1.0-ballot` without movement, and as the packages load here a discharge
-report cannot be made to pass by building it correctly: the guide's `Encounter.status`
-value set enumerates the R4 codes, but the R5 CodeSystem its own dependencies pull in
-shadows them, so the `finished` a conformant bundle carries takes a hard error. That is
-what separates it from the imaging guide, which also fails its published examples but
-passes a correctly built report. `matchbox/config/application.yaml` has the detail and
-what would have to change to bring it back.
+The discharge report was left out while its guide sat at `0.1.0-ballot`, where a
+correctly built report could not pass: `Encounter.status` = `finished` was rejected
+against an R5 code system its dependencies pulled in. HDR 1.0.0 (STU 1, October 2026)
+fixed the binding, and all five of its published example bundles validate clean here.
 
 Nothing is selected by the submitter. The category is read off the bundle, strongest
 signal first: `Bundle.meta.profile` naming a guide's bundle profile; an entry claiming
 an MPD profile (a prescription is a collection, not a document, so MPD defines no
-Bundle profile and its evidence sits one level down); `Composition.type`, which EPS
-and laboratory each bind to a single LOINC code; an `ImagingStudy` in the bundle
+Bundle profile and its evidence sits one level down); `Composition.type`, which EPS,
+laboratory and HDR each bind to a single LOINC code; an `ImagingStudy` in the bundle
 (imaging binds `Composition.type` to every LOINC descendant of 18726-0, which needs a
 terminology server to decide, so the study stands in for the code check); and finally
 medications in a bundle with no Composition. Anything unrecognised is treated as a
@@ -442,7 +439,7 @@ requested profile's dependency closure, so a lab report checked with the summary
 packages comes back with its conformance *unchecked* rather than checked and failed -
 a silent pass. The package list per category lives in `EHDS_DOCUMENTS` in `app.py`,
 and each category's own guide must also be in `matchbox/config/application.yaml`.
-Adding a fifth category is an entry in each; `test_every_category_the_registry_names_
+Adding a sixth category is an entry in each; `test_every_category_the_registry_names_
 is_a_package_the_validator_loads` holds the two together. Not every package in the
 registry needs a line in the yaml - `hl7.fhir.eu.base#2.0.0-ballot` is named by the
 laboratory entry but reaches the validator through imaging's dependencies - which is
@@ -578,7 +575,7 @@ the track", not "a summary worth nothing", and the submit page says exactly that
 canonical it was therefore checked against. Worth reading first: a team that meant to
 send a lab report and sees `eps` here has its answer before it reads a single finding -
 the bundle never claimed what it was. `?profile=` settles it, and is rejected with
-**400** for any canonical outside the four.
+**400** for any canonical outside the five.
 
 The web form does more with that same outcome than the API can. A location like
 `Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose[x].value` is a locator, and

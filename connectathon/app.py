@@ -2,9 +2,9 @@
 
 Teams register, submit EPS bundles, Matchbox validates, leaderboard keeps score.
 Other EHDS document categories - laboratory report, prescription and dispense,
-imaging report - are accepted and validated against their own HL7 Europe guide,
-but the patient summary is what the track is about and what the leaderboard
-ranks; the rest are worth a small bonus. See EHDS_DOCUMENTS.
+imaging report, discharge report - are accepted and validated against their own
+HL7 Europe guide, but the patient summary is what the track is about and what
+the leaderboard ranks; the rest are worth a small bonus. See EHDS_DOCUMENTS.
 Stdlib sqlite3 + FastAPI, no other runtime deps.
 """
 
@@ -50,24 +50,12 @@ MATCHBOX_URL = os.environ.get(
 # (Regulation (EU) 2025/327, Article 14) names six priority categories of health
 # data that EHR systems have to exchange, and a team that brings a lab report to
 # the room should get it checked properly rather than scored against the wrong
-# profile. So three others are accepted, detected, and validated against their
+# profile. So four others are accepted, detected, and validated against their
 # own guide - second class by design: they earn SECONDARY_CATEGORY_POINTS apiece
 # and never the richness points or the first-pass bonus. See team_score().
 #
-# Four entries cover five of the six: one of them, MPD, answers for both
-# ePrescription and eDispensation. The sixth is the hospital discharge report,
-# and it is left out deliberately.
-#
-# Not simply because hl7.fhir.eu.hdr fails its own published examples - so does
-# the imaging guide, which is kept. The difference is that a team cannot build
-# around this one. The guide binds Encounter.status to a value set enumerating
-# the R4 codes, which the R5 CodeSystem its own dependencies pull in shadows,
-# and R5 renamed `finished` to `completed` - so the status a conformant
-# discharge report carries takes a hard error whatever the team does. The guide
-# has sat at 0.1.0-ballot without movement, and the fix has to come from it or
-# from hl7.fhir.uv.xver-r5.r4, not from here.
-# matchbox/config/application.yaml records the mechanism in full. Restore the
-# entry, and its package there, once one of them moves.
+# Five entries cover all six: one of them, MPD, answers for both ePrescription
+# and eDispensation.
 #
 # Each entry carries what it takes to check one category:
 #
@@ -186,6 +174,23 @@ EHDS_DOCUMENTS = [
         "loinc": [],
         "maturity": "ballot",
         "spec": "https://hl7.eu/fhir/imaging/",
+    },
+    {
+        "id": "hdr",
+        "label": "Discharge report",
+        "long_label": "Hospital Discharge Report",
+        "short": "HDR",
+        "category": "Discharge report",
+        "primary": False,
+        "profile": "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-eu-hdr",
+        "igs": ["hl7.fhir.eu.hdr#1.0.0"],
+        "bundles": [
+            "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-eu-hdr",
+            "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-obl-eu-hdr",
+        ],
+        "loinc": ["34105-7"],
+        "maturity": "STU 1.0",
+        "spec": "https://hl7.eu/fhir/hdr/",
     },
 ]
 
@@ -1611,7 +1616,7 @@ def detect_document(bundle) -> dict:
          separates the two imaging bundle shapes from anything else.
       2. An entry claiming an MPD profile. A prescription has no bundle-level
          profile to claim, so its evidence is one level down.
-      3. Composition.type. Fixed to one LOINC code by EPS and laboratory,
+      3. Composition.type. Fixed to one LOINC code by EPS, laboratory and HDR,
          and the natural fallback for a document that claims no profile.
       4. An ImagingStudy in the bundle. Imaging's type codes are a LOINC
          subsumption query we cannot answer offline, so this stands in for
@@ -2580,7 +2585,7 @@ def validate_bundle(
         # other.
         # Counted against the registry rather than as "anything that is not
         # eps", so a doc_type the service no longer recognises cannot earn a
-        # bonus here. A category can be retired - the discharge report was -
+        # bonus here. A category can be retired - the discharge report once was -
         # and its rows outlive it: reset.py only wipes daily until
         # PRACTICE_ENDS, and backup.py restores whatever it snapshotted. The
         # leaderboard has always counted this way (see _leaderboard_rows), and
@@ -4925,7 +4930,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <details class="card" id="other-documents">
   <summary>Other EHDS documents we also validate<span class="count-badge"
-    id="other-count">3</span></summary>
+    id="other-count">4</span></summary>
     <p class="muted" style="margin:10px 0">This is the patient summary track,
     and the summary is what the leaderboard ranks. But EHDS
     (<a href="https://eur-lex.europa.eu/eli/reg/2025/327/oj" target="_blank"
@@ -5315,10 +5320,10 @@ function updatePracticeNote() {
    cannot drift apart. Seeded rather than left empty so the first leaderboard
    paint - which can beat the fetch - still renders readable chips. */
 const DOC_SHORT = { eps: "PS", laboratory: "LAB", mpd: "eP/eD",
-                    imaging: "IMG" };
+                    imaging: "IMG", hdr: "HDR" };
 let DOC_LABELS = { eps: "European Patient Summary", laboratory: "Laboratory Report",
                    mpd: "Medication Prescription and Dispense",
-                   imaging: "Imaging Report" };
+                   imaging: "Imaging Report", hdr: "Hospital Discharge Report" };
 const docShort = (id) => DOC_SHORT[id] || id;
 const docLabel = (id) => DOC_LABELS[id] || id;
 
@@ -5922,6 +5927,7 @@ const EXPLAIN_GUIDES = {
   laboratory: ["Laboratory Report", "https://hl7.eu/fhir/laboratory/"],
   mpd: ["Medication Prescription and Dispense", "https://hl7.eu/fhir/mpd/"],
   imaging: ["Imaging Report", "https://hl7.eu/fhir/imaging/"],
+  hdr: ["Hospital Discharge Report", "https://hl7.eu/fhir/hdr/"],
 };
 let explainDoc = "eps";
 
