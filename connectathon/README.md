@@ -406,7 +406,7 @@ place in the page's headline.
 | Category (Article 14) | Guide | Maturity | Scores |
 |---|---|---|---|
 | Patient summary | [EPS](https://hl7.eu/fhir/eps/1.0.0-ballot/) | ballot | 50 + sections + resources |
-| Medical test result | [Laboratory Report](https://hl7.eu/fhir/laboratory/) | STU 2.0 | +15 |
+| Medical test result | [Laboratory Report](https://hl7.eu/fhir/laboratory/) | STU 2.1 | +15 |
 | ePrescription / eDispensation | [MPD](https://hl7.eu/fhir/mpd/) | STU 1.0 | +15 |
 | Medical imaging study and report | [Imaging Report](https://hl7.eu/fhir/imaging/) | ballot | +15 |
 | Discharge report | [HDR](https://hl7.eu/fhir/hdr/) | STU 1.0 | +15 |
@@ -440,10 +440,7 @@ packages comes back with its conformance *unchecked* rather than checked and fai
 a silent pass. The package list per category lives in `EHDS_DOCUMENTS` in `app.py`,
 and each category's own guide must also be in `matchbox/config/application.yaml`.
 Adding a sixth category is an entry in each; `test_every_category_the_registry_names_
-is_a_package_the_validator_loads` holds the two together. Not every package in the
-registry needs a line in the yaml - `hl7.fhir.eu.base#2.0.0-ballot` is named by the
-laboratory entry but reaches the validator through imaging's dependencies - which is
-why that test checks the guides, not the whole list. One of the guides fails its own
+is_a_package_the_validator_loads` holds the two together. One of the guides fails its own
 published examples for reasons outside this repository;
 `matchbox/config/application.yaml` records which and why.
 

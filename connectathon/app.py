@@ -105,22 +105,11 @@ EHDS_DOCUMENTS = [
         "category": "Medical test result",
         "primary": False,
         "profile": "http://hl7.eu/fhir/laboratory/StructureDefinition/Bundle-eu-lab",
-        # hl7.fhir.eu.base#2.0.0-ballot is not a typo and not belt-and-braces.
-        # DiagnosticReport-eu-lab in Laboratory Report 2.0.0 references
-        # http://hl7.eu/fhir/base/StructureDefinition/patient-animal-eu-core,
-        # which existed in eu.base 2.0.0-ballot and was dropped from the 2.0.0
-        # release the IG then pinned. Scoped to its declared closure alone,
-        # every lab bundle - including the IG's own published examples - fails
-        # with "Unable to resolve the profile reference ...patient-animal-eu-core"
-        # and scores 0. Naming the ballot alongside puts the missing definition
-        # back in scope; measured on Bundle-SimpleChemistryResultReport: one
-        # hard error without it, none with it. Remove when eu.base restores the
-        # profile or the lab IG stops pointing at it.
-        "igs": ["hl7.fhir.eu.laboratory#2.0.0", "hl7.fhir.eu.base#2.0.0-ballot"],
+        "igs": ["hl7.fhir.eu.laboratory#2.1.0"],
         "bundles": ["http://hl7.eu/fhir/laboratory/StructureDefinition/Bundle-eu-lab"],
         # The IG binds Composition.type to a value set of exactly one code.
         "loinc": ["11502-2"],
-        "maturity": "STU 2.0",
+        "maturity": "STU 2.1",
         "spec": "https://hl7.eu/fhir/laboratory/",
     },
     {
