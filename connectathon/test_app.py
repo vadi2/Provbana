@@ -832,7 +832,7 @@ def test_summarize_bundle_malformed_never_raises():
         assert isinstance(result, dict)
         assert set(result) == {"patient", "composition", "sections",
                                "unreferenced", "coverage", "quality",
-                               "as_of", "attention"}
+                               "as_of", "attention", "source"}
 
 
 # ---------------------------------------------------------------- submissions API
@@ -2487,6 +2487,112 @@ def test_insulin_is_flagged_by_atc():
     assert "insulin" not in med("A10BA02")["flags"]   # metformin
 
 
+def test_controlled_drug_classes_are_flagged_by_atc():
+    def med(atc):
+        return _items(_doc("10160-0", "Medication", {
+            "resourceType": "MedicationStatement", "id": "m", "status": "active",
+            "medicationCodeableConcept": {"coding": [
+                {"system": "http://www.whocc.no/atc", "code": atc}]}}))[0]
+    for atc in ("N06BA12", "N06BA04", "N02AA01", "N05BA01", "N05CF02", "N07BC02"):
+        assert "controlled drug" in med(atc)["flags"], atc
+    for atc in ("N06BA09", "N06AB06", "N02BE01", "A10AE04"):   # atomoxetine, ...
+        assert "controlled drug" not in med(atc)["flags"], atc
+
+
+def test_conditions_that_change_the_first_minutes_are_high_risk():
+    def problem(status="active", **code):
+        resource = {"resourceType": "Condition", "id": "c", "code": code}
+        if status:
+            resource["clinicalStatus"] = {"coding": [{"code": status}]}
+        return _items(_doc("11450-4", "Problems", resource))[0]
+    sct = lambda display: [{"system": "http://snomed.info/sct", "code": "1",
+                            "display": display}]
+    # the display counts even when the text is in another language
+    assert "high risk" in problem(text="Kronisk hjärtsvikt",
+                                  coding=sct("Chronic congestive heart failure"))["flags"]
+    assert "high risk" in problem(text="Hjärtsvikt")["flags"]
+    assert "high risk" in problem(coding=sct("Type 1 diabetes mellitus"))["flags"]
+    assert "high risk" in problem(text="Haemophilia A")["flags"]
+    assert "high risk" in problem(text="Hemophilia A", status=None)["flags"]
+    assert "high risk" not in problem(coding=sct("Type 2 diabetes mellitus"))["flags"]
+    assert "high risk" not in problem(text="Essential hypertension")["flags"]
+    assert "high risk" not in problem(text="Heart failure", status="resolved")["flags"]
+    assert "high risk" not in problem(text="Heart failure", status="remission")["flags"]
+
+
+def test_a_safety_plan_is_flagged_by_what_it_is_called():
+    def plan(title, activity=None, **fields):
+        return _items(_doc("18776-5", "Plan of care", _plan(
+            activity or {"status": "in-progress"}, title=title, **fields)))[0]
+    assert "safety plan" in plan("Mental health safety plan agreed with clinic")["flags"]
+    assert "safety plan" in plan("Säkerhetsplan vid suicidrisk")["flags"]
+    assert "safety plan" in plan("Krisplan")["flags"]
+    assert "safety plan" not in plan("Annual review of diabetes")["flags"]
+    # a cancelled one is not a plan to act on
+    assert "safety plan" not in plan("Safety plan", {"status": "cancelled"})["flags"]
+    assert "safety plan" not in plan("Safety plan", status="revoked")["flags"]
+
+
+def test_patient_contacts_carry_role_name_and_phone():
+    contacts = lambda *c: app_module._patient_summary(
+        {"resourceType": "Patient", "contact": list(c)})["contacts"]
+    assert contacts() == []
+    assert app_module._patient_summary({"contact": "nobody"})["contacts"] == []
+    assert contacts(
+        {"relationship": [{"text": "Mor (vårdnadshavare)"},
+                          {"coding": [{"display": "Emergency Contact"}]}],
+         "name": {"given": ["Anna"], "family": "Söderberg"},
+         "telecom": [{"system": "email", "value": "a@example.org"},
+                     {"system": "phone", "value": "+46 70 000 00 05"}]},
+        {"name": {"text": "Mikael Bergström"}, "address": {"city": "København",
+                                                           "country": "DK"}},
+        {"relationship": [{"text": "Friend"}]}, None, {"name": 3, "telecom": [None]},
+    ) == [
+        {"name": "Anna Söderberg", "relationship": "Mor (vårdnadshavare), Emergency Contact",
+         "phone": "+46 70 000 00 05", "place": None},
+        {"name": "Mikael Bergström", "relationship": None, "phone": None,
+         "place": "København, DK"},
+    ]
+
+
+def test_document_source_names_author_and_custodian():
+    def source(composition, *resources):
+        return app_module.summarize_bundle({"resourceType": "Bundle", "entry": [
+            {"resource": {"resourceType": "Composition", **composition}},
+            *({"resource": r} for r in resources)]})["source"]
+    role = {"resourceType": "PractitionerRole", "id": "r",
+            "practitioner": {"reference": "Practitioner/d"}}
+    doctor = {"resourceType": "Practitioner", "id": "d",
+              "name": [{"given": ["Märta"], "family": "Lövgren"}]}
+    clinic = {"resourceType": "Organization", "id": "o", "name": "Vårdcentralen",
+              "address": [{"country": "SE"}]}
+    assert source({}) is None
+    assert source({"author": "x", "custodian": 3}) is None
+    assert source({"author": [{"reference": "PractitionerRole/r"}],
+                   "custodian": {"reference": "Organization/o"}},
+                  role, doctor, clinic) == {
+        "authors": ["Märta Lövgren"], "organization": "Vårdcentralen", "country": "SE"}
+    # an organisation that is both author and custodian is named once
+    assert source({"author": [{"reference": "Organization/o"}],
+                   "custodian": {"reference": "Organization/o"}}, clinic) == {
+        "authors": [], "organization": "Vårdcentralen", "country": "SE"}
+    assert source({"author": [{"display": "Dr Who"}]}) == {
+        "authors": ["Dr Who"], "organization": None, "country": None}
+
+
+def test_pregnancy_section_is_marked_inapplicable_only_when_that_is_settled():
+    def applicable(**patient):
+        cov = app_module.summarize_bundle(_eps(patient=patient))["coverage"]
+        return next(c for c in cov if c["code"] == "10162-6").get("applicable", True)
+    assert not applicable(gender="male")
+    assert not applicable(gender="female", birthDate="1943-02-09")
+    assert not applicable(gender="female", birthDate="2015-01-01")
+    assert applicable(gender="female", birthDate="2002-07-25")
+    assert applicable(gender="female")      # age unknown: still worth saying
+    assert applicable()
+    assert applicable(gender="other", birthDate="2002-07-25")
+
+
 def _plan(activity=None, **fields):
     plan = {"resourceType": "CarePlan", "id": "cp", "status": "active",
             "intent": "plan", "title": "Follow-up", **fields}
@@ -2796,9 +2902,11 @@ def test_stale_results_name_the_abnormal_ones_compactly():
     ).endswith("need repeating. Flagged abnormal: Creatinine 118 umol/L, "
                "Hemoglobin A1c 68 umol/L, Albumin/Creatinine 4.1 umol/L.")
     six = [_lab("2025-12-09", f"Analyte {n}, serum", n, abnormal=True) for n in range(6)]
+    # every one of them: the result folded into "and 2 more" is as good as unsent
     assert detail(*six).endswith(
         "Flagged abnormal: Analyte 0 0 umol/L, Analyte 1 1 umol/L, "
-        "Analyte 2 2 umol/L, Analyte 3 3 umol/L and 2 more.")
+        "Analyte 2 2 umol/L, Analyte 3 3 umol/L, Analyte 4 4 umol/L, "
+        "Analyte 5 5 umol/L.")
     assert "abnormal" not in detail(_lab("2025-12-09"))
 
 
@@ -2945,8 +3053,19 @@ def test_arne_sample_follow_up_is_dated_when_it_is_due(client):
     assert attention[0]["title"] == "Newest results are from 2026-06-12"
     assert attention[0]["detail"].startswith("2 months before this document.")
     assert "Creatinine 118 umol/L" in attention[0]["detail"]
-    assert attention[0]["detail"].endswith("and 2 more.")
+    assert "1840 ng/L" in attention[0]["detail"]     # NT-proBNP, not "and 2 more"
+    assert "12.4 ug/L" in attention[0]["detail"]     # PSA
     assert attention[1]["detail"].startswith("10 entries are statements")
+    problems = next(s for s in summary["sections"] if s["kind"] == "problem")["items"]
+    assert [i["code"] for i in problems if "high risk" in i["flags"]] == ["88805009"]
+    assert summary["source"] == {"authors": ["Märta Lövgren"],
+                                 "organization": "Vårdcentralen Kvarnängen",
+                                 "country": "SE"}
+    assert summary["patient"]["contacts"] == [{
+        "name": "Mikael Bergström", "relationship": "Emergency Contact",
+        "phone": "+45 20 00 00 03", "place": "København, DK"}]
+    pregnancy = next(c for c in summary["coverage"] if c["code"] == "10162-6")
+    assert pregnancy["applicable"] is False          # an 83-year-old man
     assert attention[2]["title"] == ("Not in this document: Functional status, "
                                      "Advance directives, Vital signs, Social history")
     assert "pregnancy" not in attention[2]["title"].lower()
@@ -2971,6 +3090,13 @@ def test_andrea_sample_attention_tier_carries_what_went_quiet(client):
     attention = summary["attention"]
     assert [a["kind"] for a in attention] == [
         "cancelled", "noted", "stale-results", "unreconciled", "missing"]
+    safety = next(i for i in plans if "safety plan" in i["flags"])
+    assert safety["label"].startswith("Mental health safety plan")
+    assert "early warning signs" in safety["note"]
+    assert [i["code"] for i in meds if "controlled drug" in i["flags"]] == ["N06BA12"]
+    problems = next(s for s in summary["sections"] if s["kind"] == "problem")["items"]
+    assert [i["code"] for i in problems if "high risk" in i["flags"]] == ["46635009"]
+    assert summary["patient"]["contacts"] == []
     cancelled, noted, stale, unreconciled, missing = attention
     assert cancelled["title"].startswith("Cancelled: Digital follow-up")
     assert cancelled["date"] == "2026-06-03"

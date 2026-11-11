@@ -1005,6 +1005,25 @@ SNOMED_NONE_KNOWN = {
 ANTICOAGULANT_ATC = ("B01AA", "B01AB", "B01AE", "B01AF")
 # Insulins: a high-alert medicine wherever the patient turns up.
 INSULIN_ATC = ("A10A",)
+# Opioids, benzodiazepines, z-drugs and central stimulants: under narcotics
+# control in most countries. Which rules apply is national law, so the flag
+# marks a class to ask about (carrying, prescribing), not a legal status.
+CONTROLLED_ATC = ("N01AH", "N02A", "N05BA", "N05CD", "N05CF", "N07BC",
+                  "N06BA01", "N06BA02", "N06BA03", "N06BA04", "N06BA11", "N06BA12")
+# Conditions that change what is done in the first minutes whatever the
+# presenting complaint. Matched on the coded display and text, since a
+# document bundle carries no hierarchy to test a code against.
+HIGH_RISK_CONDITION = re.compile(
+    r"heart failure|hj.rtsvikt|hjertesvigt|hjertesvikt|herzinsuffizienz"
+    r"|type 1 diabetes|diabetes mellitus type 1|typ 1[- ]diabetes|diabetes (mellitus )?typ 1"
+    r"|adrenal insufficiency|binjurebarksvikt|addison"
+    r"|ha?emophilia|hemofili", re.I)
+CONDITION_OVER = ("resolved", "remission", "inactive")
+# A plan written for the moment things go wrong is read first, not last.
+SAFETY_PLAN = re.compile(
+    r"safety plan|crisis plan|emergency (care )?plan|s.kerhetsplan|krisplan"
+    r"|sikkerhedsplan|sikkerhetsplan|kriseplan|turvasuunnitelma"
+    r"|kriisisuunnitelma|krisenplan|notfallplan", re.I)
 
 # A statement, a prescription, a dispensing and a dose given are different
 # evidence that the patient actually takes the medicine.
@@ -1154,6 +1173,17 @@ def _has_atc(concept, prefixes) -> bool:
 
 def _is_anticoagulant(concept) -> bool:
     return _has_atc(concept, ANTICOAGULANT_ATC)
+
+
+def _concept_words(concept) -> str:
+    """Every human label a CodeableConcept carries, for word matching."""
+    if not isinstance(concept, dict):
+        return ""
+    words = [concept.get("text")]
+    codings = concept.get("coding")
+    if isinstance(codings, list):
+        words += [c.get("display") for c in codings if isinstance(c, dict)]
+    return " | ".join(w for w in words if isinstance(w, str))
 
 
 def _iso_day(value):
@@ -1337,6 +1367,8 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
             flags.append("anticoagulant")
         if _has_atc(concept, INSULIN_ATC):
             flags.append("insulin")
+        if _has_atc(concept, CONTROLLED_ATC):
+            flags.append("controlled drug")
         item["basis"] = MEDICATION_BASIS.get(rtype)
     elif category == "alert":
         if _flag_priority(resource) == "PH":
@@ -1347,6 +1379,9 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
         severity = _cc_display(resource.get("severity"))
         if isinstance(severity, str) and severity.strip().lower() == "severe":
             flags.append("severe")
+        if status not in CONDITION_OVER and HIGH_RISK_CONDITION.search(
+                _concept_words(concept)):
+            flags.append("high risk")
     elif category == "result":
         if _observation_value(resource) is None:
             gaps.append("no value")
@@ -1360,6 +1395,9 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
         cancelled = act_status == "cancelled" or resource.get("status") == "revoked"
         if cancelled:
             flags.append("cancelled")
+        elif SAFETY_PLAN.search(" | ".join(
+                (str(item.get("label") or ""), _concept_words(concept)))):
+            flags.append("safety plan")
         # The appointment is the event; the plan's start only says how long
         # the arrangement has existed.
         scheduled = _activity_scheduled(activity)
@@ -1716,6 +1754,63 @@ def _note_text(resource) -> str | None:
     return None
 
 
+def _patient_contacts(patient) -> list:
+    out = []
+    contacts = patient.get("contact")
+    for contact in contacts if isinstance(contacts, list) else []:
+        if not isinstance(contact, dict):
+            continue
+        name = contact.get("name")
+        name = _human_name([name]) if isinstance(name, dict) else None
+        roles: list = []
+        relationships = contact.get("relationship")
+        for rel in relationships if isinstance(relationships, list) else []:
+            role = _cc_display(rel)
+            if role and role not in roles:
+                roles.append(role)
+        phone = None
+        telecom = contact.get("telecom")
+        for point in telecom if isinstance(telecom, list) else []:
+            if (isinstance(point, dict) and isinstance(point.get("value"), str)
+                    and point.get("system") in (None, "phone", "sms")):
+                phone = point["value"].strip()
+                break
+        address = contact.get("address")
+        place = ", ".join(
+            address[k].strip() for k in ("city", "country")
+            if isinstance(address.get(k), str) and address[k].strip()
+        ) if isinstance(address, dict) else ""
+        if name or phone:
+            out.append({"name": name, "relationship": ", ".join(roles) or None,
+                        "phone": phone, "place": place or None})
+    return out
+
+
+def _document_source(composition, by_ref) -> dict | None:
+    """Who wrote the document and which organisation keeps it."""
+    authors: list = []
+    refs = composition.get("author")
+    for ref in refs if isinstance(refs, list) else []:
+        name = _reference_name(ref, by_ref)
+        if name and name not in authors:
+            authors.append(name)
+    custodian = composition.get("custodian")
+    organization = _reference_name(custodian, by_ref)
+    country = None
+    target = (_resolve_reference(custodian.get("reference"), by_ref)
+              if isinstance(custodian, dict) else None)
+    addresses = target.get("address") if isinstance(target, dict) else None
+    for address in addresses if isinstance(addresses, list) else []:
+        if isinstance(address, dict) and isinstance(address.get("country"), str):
+            country = address["country"].strip() or None
+            break
+    if organization in authors:
+        authors.remove(organization)
+    if not authors and not organization:
+        return None
+    return {"authors": authors, "organization": organization, "country": country}
+
+
 def _patient_summary(patient) -> dict:
     name_text = _human_name(patient.get("name"))
     identifiers = []
@@ -1740,6 +1835,7 @@ def _patient_summary(patient) -> dict:
         if isinstance(patient.get("gender"), str)
         else None,
         "identifiers": identifiers,
+        "contacts": _patient_contacts(patient),
     }
 
 
@@ -1785,6 +1881,19 @@ def _birth_day(value):
         return None
     return (_iso_day(value) or _iso_day(value[:7] + "-01")
             or _iso_day(value[:4] + "-01-01"))
+
+
+def _childbearing(summary):
+    """True or False when sex and age settle it, None when they do not."""
+    patient = summary.get("patient") or {}
+    gender = str(patient.get("gender")).lower()
+    if gender == "male":
+        return False
+    birth = _birth_day(patient.get("birth_date"))
+    as_of = _iso_day(summary.get("as_of"))
+    if gender != "female" or not birth or not as_of:
+        return None
+    return 12 <= _months_between(birth, as_of) // 12 <= 55
 
 
 def _attention(summary) -> list:
@@ -1833,9 +1942,8 @@ def _attention(summary) -> list:
             if "abnormal" in i["flags"] and "no value" not in i["gaps"] and i["detail"]
         ]
         if abnormal:
-            more = len(abnormal) - 4
-            detail += (" Flagged abnormal: " + ", ".join(abnormal[:4])
-                       + (f" and {more} more" if more > 0 else "") + ".")
+            # all of them: the one folded into "and 2 more" is the one that matters
+            detail += " Flagged abnormal: " + ", ".join(abnormal) + "."
         add("stale-results", f"Newest results are from {newest.isoformat()}",
             detail, newest.isoformat())
 
@@ -1857,11 +1965,7 @@ def _attention(summary) -> list:
             "taken and when the last dose was.")
 
     coverage = {c["code"]: c for c in summary.get("coverage") or []}
-    patient = summary.get("patient") or {}
-    birth = _birth_day(patient.get("birth_date"))
-    age = _months_between(birth, as_of) // 12 if birth and as_of else None
-    childbearing = (str(patient.get("gender")).lower() == "female"
-                    and age is not None and 12 <= age <= 55)
+    childbearing = _childbearing(summary) is True
     names, reasons, codes = [], [], []
     for code, reason in DECISIVE_SECTIONS:
         section = coverage.get(code)
@@ -1918,6 +2022,7 @@ def summarize_bundle(bundle) -> dict:
         "quality": _summary_quality({"sections": [], "unreferenced": []}),
         "as_of": None,
         "attention": [],
+        "source": None,
     }
     if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
         return summary
@@ -1989,7 +2094,13 @@ def summarize_bundle(bundle) -> dict:
                         "state": state,
                     }
                 )
+        summary["source"] = _document_source(composition, by_ref)
         summary["coverage"] = _eps_coverage(composition, section_states)
+        if _childbearing(summary) is False:
+            # a section that cannot apply is not one that "was not sent"
+            for section in summary["coverage"] or []:
+                if section["code"] == PREGNANCY_LOINC:
+                    section["applicable"] = False
         # Everything reachable from the Composition (section entries, authors,
         # and transitively from referenced resources) counts as referenced.
         queue = [composition]
@@ -5242,6 +5353,9 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .chip.cvc { margin-left: 5px; text-transform: none; letter-spacing: 0; }
 /* pinned above every view: what is always critical (red), then what is
    outdated or missing and has to be checked now (yellow) */
+.cv-context { margin: 6px 0 0; font-size: 0.85rem; }
+.cv-quality { margin: 16px 0 0; padding-top: 8px; border-top: 1px solid var(--border);
+  font-size: 0.8rem; color: var(--muted); }
 .cv-pinned { margin: 12px 0 4px; }
 .cv-critical, .cv-attention { border: 1px solid var(--fail); background: var(--fail-bg);
   border-radius: var(--r-card); padding: 10px 14px; }
@@ -7132,7 +7246,8 @@ function cvItemHtml(item) {
   const basis = cvBasis(item);
   return "<li>"
     + '<span class="cv-label">' + esc(item.label || "Unnamed item") + "</span>"
-    + (item.status && !loud ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
+    + (item.status && !loud && !routineStatus(item, item.status)
+        ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
     + chips
     + (basis ? '<span class="cv-basis">' + esc(basis) + "</span>" : "")
     + (detail ? '<div class="cv-detail muted">' + esc(detail) + "</div>" : "")
@@ -7167,7 +7282,8 @@ function cvDatesHtml(item) {
 }
 
 /* Prescribed, dispensed, given and "says they take it" are not the same claim. */
-const cvBasis = (i) => (i.category === "medication" && i.basis) || "";
+const cvBasis = (i) => (i.category !== "medication" || !i.basis) ? ""
+  : (i.basis === "stated as taking" && isEnded(i) ? "stated as taken" : i.basis);
 function cvOwnerHtml(i, cls) {
   return i.category === "plan" && i.owner
     ? '<div class="' + cls + '">responsible: ' + esc(i.owner) + "</div>" : "";
@@ -7180,9 +7296,10 @@ const CAT_LABEL = { alert: "Alert", allergy: "Allergy", problem: "Problem",
 const CAT_ORDER = ["alert", "allergy", "problem", "medication", "result", "procedure",
   "immunization", "device", "plan", "other"];
 const RISK_FLAGS = ["high risk", "high priority", "severe", "abnormal", "anticoagulant",
-  "insulin", "cancelled"];
+  "insulin", "cancelled", "safety plan"];
 /* What has to be seen whatever the view, the sort order or the year. */
-const CRITICAL_FLAGS = ["high priority", "high risk", "severe", "anticoagulant", "insulin"];
+const CRITICAL_FLAGS = ["high priority", "high risk", "severe", "anticoagulant", "insulin",
+  "safety plan"];
 const isCritical = (i) => !i.assertion
   && (i.flags || []).some((f) => CRITICAL_FLAGS.indexOf(f) !== -1);
 /* Clinical relevance, not list order: critical first, then abnormal or
@@ -7208,7 +7325,8 @@ const STATE_TEXT = {
 function cvAbsentRest(s) {
   const said = [];
   (s.attention || []).forEach((a) => (a.sections || []).forEach((c) => said.push(c)));
-  const absent = (s.coverage || []).filter((c) => c.state === "absent");
+  const absent = (s.coverage || []).filter((c) => c.state === "absent"
+    && c.applicable !== false);
   return { rest: absent.filter((c) => said.indexOf(c.code) === -1),
            also: absent.some((c) => said.indexOf(c.code) !== -1) };
 }
@@ -7250,7 +7368,9 @@ function routineStatus(i, status) {
 }
 function cvChips(i) {
   let h = "";
-  (i.flags || []).filter((f) => !routineStatus(i, f)).forEach((f) => {
+  const label = String(i.label || "").toLowerCase();
+  (i.flags || []).filter((f) => !routineStatus(i, f)
+    && !(f === "safety plan" && label.indexOf(f) !== -1)).forEach((f) => {
     const kind = RISK_FLAGS.indexOf(f) !== -1 ? "risk" : (f === "active" ? "ok" : "warn");
     h += '<span class="chip cvc ' + kind + '">' + esc(f) + "</span>";
   });
@@ -7301,6 +7421,7 @@ function cvCriticalHtml(s) {
       + (isEnded(i) ? '<span class="cv-status">' + esc(i.status) + "</span>" : "")
       + (sub.length ? '<div class="cv-sub">' + sub.map(esc).join(" &middot; ") + "</div>" : "")
       + cvLastDoseHtml(i, doses)
+      + cvOwnerHtml(i, "cv-sub")
       + (i.note ? '<div class="cv-sub cv-note">' + esc(i.note) + "</div>" : "")
       + "</li>";
   });
@@ -7337,6 +7458,54 @@ function cvAge(birth, on) {
   return a >= 0 && a < 130 ? a : null;
 }
 
+function cvPatientMeta(p, on) {
+  const age = cvAge(p.birth_date, on);
+  return [age !== null ? age + " years" : null, p.gender ? esc(p.gender) : null,
+          p.birth_date ? "born " + esc(shortDate(p.birth_date)) : null]
+    .filter(Boolean).join(" &middot; ");
+}
+
+/* Who wrote it and whom to ring: asked for before anything in the document
+   is acted on, so above the three views rather than inside one of them. */
+function cvContextHtml(s) {
+  const lines = [];
+  const src = s.source;
+  if (src) {
+    const who = (src.authors || []).concat(src.organization
+      ? [src.organization + (src.country ? " (" + src.country + ")" : "")] : []);
+    if (who.length) {
+      lines.push("<strong>Source:</strong> " + who.map(esc).join(" &middot; "));
+    }
+  }
+  ((s.patient || {}).contacts || []).forEach((c) => {
+    lines.push("<strong>" + esc(c.relationship || "Contact") + ":</strong> "
+      + [c.name, c.phone, c.place].filter(Boolean).map(esc).join(" &middot; "));
+  });
+  return lines.length ? '<p class="cv-context">' + lines.join("<br>") + "</p>" : "";
+}
+
+/* The honest last line: what the technical checks do and do not show. */
+function cvQualityHtml(s, mode) {
+  const q = s.quality || {};
+  const total = q.items || 0;
+  const hasPlans = cvItems(s).some((i) => i.category === "plan" && !i.assertion);
+  let text = "";
+  if (total) {
+    text = (q.coded === total && q.dated === total
+      ? "All " + plural(total, "included entry", "included entries") + " "
+        + (total === 1 ? "has" : "have") + " a code and a date."
+      : "Of " + plural(total, "included entry", "included entries") + ", "
+        + (q.coded || 0) + " have a code and " + (q.dated || 0) + " have a date.")
+      + " Currency and clinical completeness have not been assessed.";
+  }
+  // the dashboard says this on its care plan card
+  if (hasPlans && mode !== "dashboard") {
+    text += (text ? " " : "") + "The document records what was planned - not that a"
+      + " receiving provider or municipality has confirmed the handover.";
+  }
+  return text ? '<p class="cv-quality">' + esc(text) + "</p>" : "";
+}
+
 function sectionFor(sections, kind) {
   return (sections || []).find((x) => x.kind === kind) || null;
 }
@@ -7360,6 +7529,13 @@ function tlRows(items) {
       rows.push({ t: tlTime(i.date), date: i.date, item: i });
       own.push(shortDate(i.date));
     }
+    // a medicine stopped in 2023 stopped in 2023, not under the year it began
+    (i.dates || []).forEach((x) => {
+      const day = shortDate(x.value);
+      if (x.kind !== "stopped" || tlTime(day) === null || own.indexOf(day) !== -1) return;
+      own.push(day);
+      rows.push({ t: tlTime(day), date: day, item: i, noted: "", mark: "stopped" });
+    });
     (i.note_dates || []).forEach((n) => {
       const day = shortDate(n.value);
       if (tlTime(day) === null || own.indexOf(day) !== -1) return;
@@ -7376,7 +7552,8 @@ function tlRowHtml(r) {
   if (r.noted !== undefined) {
     return '<div class="tl-row tl-noted c-' + esc(i.category || "other") + '">'
       + '<div class="tl-date">' + esc(shortDate(r.date))
-      + " &middot; date named in the note &middot; " + cat + "</div>"
+      + " &middot; " + esc(r.mark || "date named in the note") + " &middot; " + cat
+      + "</div>"
       + '<div class="tl-label">' + esc(i.label || "Unnamed item") + "</div>"
       + (r.noted ? '<div class="tl-detail tl-note">' + esc(r.noted) + "</div>" : "")
       + "</div>";
@@ -7413,17 +7590,25 @@ function viewTimeline(d) {
   const upcoming = rows.filter((r) => r.t > ref).sort((a, b) => a.t - b.t);
   const past = rows.filter((r) => r.t <= ref).sort((a, b) => b.t - a.t);
   const undated = items.filter((i) => tlTime(i.date) === null);
+  // entries, not rows: an entry with a second row for a date in its note is one
+  const dated = items.length - undated.length;
+  const ahead = items.filter((i) => tlTime(i.date) !== null && tlTime(i.date) > ref).length;
   const cats = CAT_ORDER.filter((c) => items.some((i) => i.category === c));
-  let h = '<div class="tl-legend">' + cats.map((c) =>
+  const p = s.patient;
+  let h = p ? '<p class="cv-context"><strong>' + esc(p.name || "Unnamed patient")
+    + "</strong>" + [cvPatientMeta(p, docDate)].concat((p.identifiers || [])
+        .map((i) => esc(i.value))).filter(Boolean).map((x) => " &middot; " + x).join("")
+    + "</p>" : "";
+  h += '<div class="tl-legend">' + cats.map((c) =>
     '<span class="c-' + esc(c) + '"><i class="cdot"></i>' + esc(CAT_LABEL[c] || c)
     + " (" + cvCat(items, c).length + ")</span>").join("") + "</div>";
   h += '<p class="muted" style="margin:8px 0 0">'
-    + plural(past.length, "dated entry", "dated entries")
+    + plural(dated, "dated entry", "dated entries")
     + (past.length ? ", " + esc(shortDate(past[past.length - 1].date)) + " to "
         + esc(shortDate(past[0].date)) : "")
     + (hasDoc ? " &middot; document date " + esc(docDate)
         : rows.length ? " &middot; no document date, so upcoming is counted from today" : "")
-    + (upcoming.length ? " &middot; " + upcoming.length + " upcoming" : "")
+    + (ahead ? " &middot; " + ahead + " upcoming" : "")
     + (undated.length ? " &middot; " + undated.length + " undated" : "") + "</p>";
 
   if (rows.length) {
@@ -7460,8 +7645,7 @@ function viewTimeline(d) {
       + " with nothing known to report</strong>"
       + '<p class="muted" style="margin:2px 0 4px;font-size:0.8rem">Nothing to'
       + " place on the timeline. Not the same as information missing, but not"
-      + " proof of absence either: no recorded procedures does not mean none"
-      + " were done.</p>"
+      + " proof of absence either.</p>"
       + '<ul class="cv-items">' + asserted.map((x) => "<li>"
           + esc(x.title || "Untitled section") + '<span class="chip cvc warn">'
           + (x.state === "stated-none" ? "stated: none known"
@@ -7627,14 +7811,13 @@ function viewDashboard(d) {
   const docDate = (s.composition || {}).date;
   let h = '<div class="db-grid">';
 
-  const age = p ? cvAge(p.birth_date, docDate) : null;
   h += dbCard("Patient",
     '<div class="db-big">' + esc((p && p.name) || "Unnamed") + "</div>"
-    + '<div class="db-sub">'
-    + [age !== null ? age + " years" : null, p && p.gender ? esc(p.gender) : null,
-       p && p.birth_date ? "born " + esc(shortDate(p.birth_date)) : null]
-      .filter(Boolean).join(" &middot; ")
-    + "</div>", p && p.name ? "" : "alert");
+    + '<div class="db-sub">' + (p ? cvPatientMeta(p, docDate) : "") + "</div>"
+    + (p && p.identifiers && p.identifiers.length
+        ? '<div class="db-more">' + p.identifiers.map((i) => esc(i.value))
+            .join(" &middot; ") + "</div>" : ""),
+    p && p.name ? "" : "alert");
 
   /* The author's own "read this first": a difficult airway, an
      immunosuppressant. Straight after the patient, before the allergies the
@@ -7716,14 +7899,14 @@ function viewDashboard(d) {
         ? dbList(byRelevance(active), DB_FULL, dbActiveRow)
           + dbQuiet("Not marked active", notActive, dbStatusRow)
         : dbList(byRelevance(problems), DB_FULL, dbStatusRow)),
-    problems.filter((x) => hasFlag(x, "severe")).length ? "alert" : "");
+    problems.some(isCritical) ? "alert" : "");
 
   const activeMeds = meds.filter((x) => hasFlag(x, "active"));
   const medsShown = activeMeds.length ? activeMeds : meds;
   const noDose = countGap(medsShown, "no dose");
   /* the basis is only worth a line per row when the rows differ in it */
   const mixedBasis = new Set(meds.map((m) => m.basis).filter(Boolean)).size > 1;
-  const medRow = (i) => dbRowHtml(i, !hasFlag(i, "active"), mixedBasis ? i.basis : "");
+  const medRow = (i) => dbRowHtml(i, !hasFlag(i, "active"), mixedBasis ? cvBasis(i) : "");
   h += dbCard("Current medication",
     '<div class="db-big">' + (activeMeds.length || meds.length) + "</div>"
     + '<div class="db-sub">' + (activeMeds.length
@@ -7839,14 +8022,6 @@ function viewDashboard(d) {
       + '<span class="chip cvc gap">' + gaps[g] + "</span></li>");
     dq += '<p class="db-more">These check only that fields are filled in - not'
       + " whether a code or binding is valid, nor how current an entry is.</p>";
-  } else if (total && q.coded === total && q.dated === total) {
-    dq += '<p class="db-more">All ' + plural(total, "included entry", "included entries")
-      + " " + (total === 1 ? "has" : "have") + " a code and a date. Currency and"
-      + " clinical completeness have not been assessed.</p>";
-  } else if (total) {
-    dq += '<p class="db-more">No expected field is empty in ' + plural(total, "entry",
-      "entries") + ". That checks presence only - currency and clinical completeness"
-      + " have not been assessed.</p>";
   }
   h += dbCard("Technical checks (" + total + " entries)", dq,
     total && pctOf((q.items || 0) - (q.with_gaps || 0), total) < 60 ? "alert" : "");
@@ -7981,8 +8156,9 @@ function renderClinicalDoc(d) {
         + ' <span class="cv-sub">(when it was assembled - not how current'
         + " each entry is)</span>" : "")
     + "</p>";
-  html += cvCriticalHtml(s);
-  html += (Object.hasOwn(CV_VIEWS, cvMode) ? CV_VIEWS[cvMode] : CV_VIEWS.document).fn(d);
+  const mode = Object.hasOwn(CV_VIEWS, cvMode) ? cvMode : "document";
+  html += cvContextHtml(s) + cvCriticalHtml(s);
+  html += CV_VIEWS[mode].fn(d) + cvQualityHtml(s, mode);
   const doc = $("#cv-doc");
   doc.innerHTML = html;
   doc.style.display = "block";
