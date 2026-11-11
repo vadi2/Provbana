@@ -94,6 +94,7 @@ EHDS_DOCUMENTS = [
         "igs": ["hl7.fhir.eu.eps#1.0.0-ballot", "hl7se.fhir.base#1.1.0"],
         "bundles": ["http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"],
         "loinc": ["60591-5"],
+        "ehds_from": 2029,
         "maturity": "ballot",
         "spec": "https://hl7.eu/fhir/eps/1.0.0-ballot/",
     },
@@ -109,6 +110,7 @@ EHDS_DOCUMENTS = [
         "bundles": ["http://hl7.eu/fhir/laboratory/StructureDefinition/Bundle-eu-lab"],
         # The IG binds Composition.type to a value set of exactly one code.
         "loinc": ["11502-2"],
+        "ehds_from": 2031,
         "maturity": "STU 2.1",
         "spec": "https://hl7.eu/fhir/laboratory/",
     },
@@ -138,6 +140,7 @@ EHDS_DOCUMENTS = [
             "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd",
             "http://hl7.eu/fhir/mpd/StructureDefinition/Medication-eu-mpd",
         ],
+        "ehds_from": 2029,
         "maturity": "STU 1.0",
         "spec": "https://hl7.eu/fhir/mpd/",
     },
@@ -161,6 +164,7 @@ EHDS_DOCUMENTS = [
         # code. So an imaging report is recognised by its profile claim, or by
         # carrying an ImagingStudy (see detect_document), never by its type code.
         "loinc": [],
+        "ehds_from": 2031,
         "maturity": "ballot",
         "spec": "https://hl7.eu/fhir/imaging/",
     },
@@ -178,6 +182,7 @@ EHDS_DOCUMENTS = [
             "http://hl7.eu/fhir/hdr/StructureDefinition/bundle-obl-eu-hdr",
         ],
         "loinc": ["34105-7"],
+        "ehds_from": 2031,
         "maturity": "STU 1.0",
         "spec": "https://hl7.eu/fhir/hdr/",
     },
@@ -629,7 +634,7 @@ MEDICATION_TYPES = ("MedicationStatement", "MedicationRequest", "MedicationDispe
 # none of those are what a clinician wants to read, so the lookup is keyed on a
 # squashed form that all three spellings collapse into.
 EMPTY_REASON_LABELS = {
-    "nilknown": "None reported",
+    "nilknown": "None known",
     "notasked": "Not asked",
     "withheld": "Information withheld",
     "unavailable": "Unavailable",
@@ -942,6 +947,77 @@ EVENT_DATE_FIELDS = {
 }
 DEFAULT_DATE_FIELDS = ("date", "effectiveDateTime", "recordedDate")
 
+# Onset, recording, verification, plan start and the event itself are
+# different facts; each date is shown under the name of the field it came from.
+DATE_FIELD_LABELS = {
+    "onsetDateTime": "onset",
+    "onsetPeriod": "onset",
+    "abatementDateTime": "resolved",
+    "recordedDate": "recorded",
+    "recorded": "recorded",
+    "recordedOn": "recorded",
+    "lastOccurrence": "last reaction",
+    "dateAsserted": "asserted",
+    "issued": "issued",
+    "performedDateTime": "performed",
+    "performedPeriod": "performed",
+    "occurrenceDateTime": "given",
+    "authoredOn": "prescribed",
+    "whenHandedOver": "dispensed",
+    "whenPrepared": "prepared",
+    "created": "plan created",
+    "timingDateTime": "in use since",
+    "timingPeriod": "in use since",
+    "date": "dated",
+}
+DATE_FIELD_LABELS_BY_TYPE = {
+    "Observation": {"effectiveDateTime": "taken", "effectivePeriod": "taken"},
+    "MedicationStatement": {"effectiveDateTime": "taking since",
+                            "effectivePeriod": "taking since"},
+    "MedicationAdministration": {"effectiveDateTime": "given",
+                                 "effectivePeriod": "given"},
+    "Flag": {"period": "since"},
+    "CarePlan": {"period": "plan start"},
+}
+# Every date a reader may need, not only the one the item sorts by.
+ALL_DATE_FIELDS = {
+    "Condition": ("onsetDateTime", "onsetPeriod", "abatementDateTime", "recordedDate"),
+    "AllergyIntolerance": ("onsetDateTime", "lastOccurrence", "recordedDate"),
+    "Immunization": ("occurrenceDateTime", "recorded"),
+    "Observation": ("effectiveDateTime", "effectivePeriod", "issued"),
+    "MedicationStatement": ("effectiveDateTime", "effectivePeriod", "dateAsserted"),
+    "CarePlan": ("period", "created"),
+    "DeviceUseStatement": ("timingDateTime", "timingPeriod", "recordedOn"),
+}
+
+# IPS absent/unknown statements. A "no known X" entry is the author's explicit
+# negative statement; a "no X info" entry says the information is missing.
+IPS_ABSENT_SYSTEM = "http://hl7.org/fhir/uv/ips/CodeSystem/absent-unknown-uv-ips"
+SNOMED_NONE_KNOWN = {
+    "716186003",  # No known allergy
+    "409137002",  # No known drug allergy
+    "428607008",  # No known environmental allergy
+    "429625007",  # No known food allergy
+    "160245001",  # No current problems or disability
+}
+
+# ATC groups whose presence changes what a surgeon or anaesthetist does next.
+ANTICOAGULANT_ATC = ("B01AA", "B01AB", "B01AE", "B01AF")
+# Insulins: a high-alert medicine wherever the patient turns up.
+INSULIN_ATC = ("A10A",)
+
+# A statement, a prescription, a dispensing and a dose given are different
+# evidence that the patient actually takes the medicine.
+MEDICATION_BASIS = {
+    "MedicationStatement": "stated as taking",
+    "MedicationRequest": "prescribed",
+    "MedicationDispense": "dispensed",
+    "MedicationAdministration": "given",
+}
+MEDICATION_ENDED = ("completed", "stopped")
+
+ISO_DAY = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")
+
 
 def _code_system_label(system) -> str | None:
     if not isinstance(system, str) or not system.strip():
@@ -1012,17 +1088,188 @@ def _primary_concept(resource, rtype, by_ref):
     return resource.get("code")
 
 
-def _event_date(resource, rtype) -> str | None:
-    """Sortable ISO date for the item, taking a period's start."""
-    for key in EVENT_DATE_FIELDS.get(rtype, DEFAULT_DATE_FIELDS):
-        val = resource.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-        if isinstance(val, dict):
-            start = val.get("start")
-            if isinstance(start, str) and start.strip():
-                return start.strip()
+def _date_value(resource, key) -> str | None:
+    val = resource.get(key)
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if isinstance(val, dict):
+        start = val.get("start")
+        if isinstance(start, str) and start.strip():
+            return start.strip()
     return None
+
+
+def _date_label(rtype, key) -> str:
+    return DATE_FIELD_LABELS_BY_TYPE.get(rtype, {}).get(key) or DATE_FIELD_LABELS.get(
+        key, "dated")
+
+
+def _event_date(resource, rtype) -> tuple[str | None, str | None]:
+    """(sortable ISO date, what that date is), taking a period's start."""
+    for key in EVENT_DATE_FIELDS.get(rtype, DEFAULT_DATE_FIELDS):
+        val = _date_value(resource, key)
+        if val:
+            return val, _date_label(rtype, key)
+    return None, None
+
+
+def _all_dates(resource, rtype) -> list:
+    out = []
+    for key in ALL_DATE_FIELDS.get(rtype, EVENT_DATE_FIELDS.get(rtype, ())):
+        val = _date_value(resource, key)
+        label = _date_label(rtype, key)
+        if val and not any(d["kind"] == label for d in out):
+            out.append({"kind": label, "value": val})
+    return out
+
+
+def _absent_statement(cc) -> str | None:
+    """"none-known" for an explicit "no known X" entry, "no-info" for an entry
+    that only says the information is unavailable, None for real data."""
+    if not isinstance(cc, dict) or not isinstance(cc.get("coding"), list):
+        return None
+    for coding in cc["coding"]:
+        if not isinstance(coding, dict):
+            continue
+        code = str(coding.get("code") or "")
+        if coding.get("system") == IPS_ABSENT_SYSTEM:
+            if code.startswith("no-known-"):
+                return "none-known"
+            if code.endswith("-info"):
+                return "no-info"
+        if coding.get("system") == "http://snomed.info/sct" and code in SNOMED_NONE_KNOWN:
+            return "none-known"
+    return None
+
+
+def _has_atc(concept, prefixes) -> bool:
+    if not isinstance(concept, dict) or not isinstance(concept.get("coding"), list):
+        return False
+    return any(
+        isinstance(c, dict) and c.get("system") == "http://www.whocc.no/atc"
+        and str(c.get("code") or "").startswith(prefixes)
+        for c in concept["coding"]
+    )
+
+
+def _is_anticoagulant(concept) -> bool:
+    return _has_atc(concept, ANTICOAGULANT_ATC)
+
+
+def _iso_day(value):
+    """The calendar day a FHIR date or dateTime starts with, or None when it
+    is partial, malformed or not a real date."""
+    if not isinstance(value, str) or not ISO_DAY.match(value):
+        return None
+    try:
+        return datetime.strptime(value[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _activity_scheduled(activity) -> str | None:
+    """When the plan's activity is due, if the document says so as a date."""
+    if not isinstance(activity, dict):
+        return None
+    period = activity.get("scheduledPeriod")
+    candidates = [period.get("start") if isinstance(period, dict) else None]
+    text = activity.get("scheduledString")
+    if _iso_day(text):
+        candidates.append(text)
+    timing = activity.get("scheduledTiming")
+    events = timing.get("event") if isinstance(timing, dict) else None
+    if isinstance(events, list) and events:
+        candidates.append(events[0])
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _human_name(names) -> str | None:
+    if not isinstance(names, list):
+        return None
+    for name in names:
+        if not isinstance(name, dict):
+            continue
+        given = name.get("given")
+        parts = [g for g in given if isinstance(g, str)] if isinstance(given, list) else []
+        family = name.get("family")
+        if isinstance(family, str) and family.strip():
+            parts.append(family.strip())
+        if parts:
+            return " ".join(parts)
+        text = name.get("text")
+        if isinstance(text, str) and text.strip():
+            return text.strip()
+    return None
+
+
+def _reference_name(ref, by_ref, follow=True) -> str | None:
+    """Who a Reference points at: its display, else the name of the resource
+    it resolves to (a PractitionerRole is named by its practitioner or
+    organisation)."""
+    if not isinstance(ref, dict):
+        return None
+    display = ref.get("display")
+    if isinstance(display, str) and display.strip():
+        return display.strip()
+    target = _resolve_reference(ref.get("reference"), by_ref)
+    if not isinstance(target, dict):
+        return None
+    name = target.get("name")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    human = _human_name(name)
+    if human or not follow:
+        return human
+    for key in ("practitioner", "organization"):
+        found = _reference_name(target.get(key), by_ref, follow=False)
+        if found:
+            return found
+    return None
+
+
+def _plan_owner(resource, activity, by_ref) -> str | None:
+    refs: list = []
+    for source, key in ((activity, "performer"), (resource, "author"),
+                        (resource, "careTeam"), (resource, "contributor")):
+        value = source.get(key) if isinstance(source, dict) else None
+        refs.extend(value if isinstance(value, list) else [value])
+    for ref in refs:
+        name = _reference_name(ref, by_ref)
+        if name:
+            return name
+    return None
+
+
+def _medication_end(resource, rtype) -> str | None:
+    if rtype == "MedicationStatement":
+        period = resource.get("effectivePeriod")
+        return _first_str(period, "end") if isinstance(period, dict) else None
+    dosages = resource.get("dosageInstruction")
+    for dosage in dosages if isinstance(dosages, list) else []:
+        timing = dosage.get("timing") if isinstance(dosage, dict) else None
+        repeat = timing.get("repeat") if isinstance(timing, dict) else None
+        bounds = repeat.get("boundsPeriod") if isinstance(repeat, dict) else None
+        end = _first_str(bounds, "end") if isinstance(bounds, dict) else None
+        if end:
+            return end
+    return None
+
+
+def _note_dates(note, own) -> list:
+    """Dates an author wrote into the free text ("no readings since
+    2026-06-02") that no coded field carries, each with its sentence."""
+    if not isinstance(note, str):
+        return []
+    out = []
+    for sentence in re.split(r"(?<=\.)\s+", note):
+        for value in ISO_DAY.findall(sentence):
+            entry = {"value": value, "text": sentence.strip()}
+            if _iso_day(value) and value not in own and entry not in out:
+                out.append(entry)
+    return out
 
 
 def _observation_abnormal(resource) -> bool:
@@ -1046,16 +1293,24 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
     category, sortable date, coding provenance, salience flags, and the
     missing-information gaps that decide whether the item is actually usable."""
     category = ITEM_CATEGORIES.get(rtype, "other")
-    system, code = _concept_coding(_primary_concept(resource, rtype, by_ref))
-    date = _event_date(resource, rtype)
+    concept = _primary_concept(resource, rtype, by_ref)
+    system, code = _concept_coding(concept)
+    date, date_kind = _event_date(resource, rtype)
+    dates = _all_dates(resource, rtype)
     status = (item.get("status") or "").strip().lower()
+    # "No known medications" is coded on the medication, not on a `code`.
+    absent = _absent_statement(
+        concept if rtype in MEDICATION_TYPES else resource.get("code"))
     flags: list = []
     gaps: list = []
     if not code:
         gaps.append("not coded")
-    if not date and category in DATE_EXPECTED:
+    if not date and category in DATE_EXPECTED and not absent:
         gaps.append("no date")
-    if category == "allergy":
+    if absent:
+        # "No known allergies" has no reaction or criticality to be missing.
+        item["assertion"] = absent
+    elif category == "allergy":
         criticality = _first_str(resource, "criticality")
         if criticality == "high":
             flags.append("high risk")
@@ -1074,6 +1329,15 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
                 gaps.append("no dose")
             if status == "active":
                 flags.append("active")
+            if (rtype in ("MedicationStatement", "MedicationRequest")
+                    and status in MEDICATION_ENDED
+                    and not _medication_end(resource, rtype)):
+                gaps.append("no stop date")
+        if _is_anticoagulant(concept):
+            flags.append("anticoagulant")
+        if _has_atc(concept, INSULIN_ATC):
+            flags.append("insulin")
+        item["basis"] = MEDICATION_BASIS.get(rtype)
     elif category == "alert":
         if _flag_priority(resource) == "PH":
             flags.append("high priority")
@@ -1088,8 +1352,37 @@ def _annotate_item(item, resource, rtype, by_ref) -> None:
             gaps.append("no value")
         if _observation_abnormal(resource):
             flags.append("abnormal")
+    elif category == "plan":
+        activity = _first_activity_detail(resource)
+        act_status = activity.get("status") if activity else None
+        if act_status in ("scheduled", "not-started"):
+            flags.append("planned")
+        cancelled = act_status == "cancelled" or resource.get("status") == "revoked"
+        if cancelled:
+            flags.append("cancelled")
+        # The appointment is the event; the plan's start only says how long
+        # the arrangement has existed.
+        scheduled = _activity_scheduled(activity)
+        if scheduled:
+            date, date_kind = scheduled, "was scheduled" if cancelled else "scheduled"
+            dates.insert(0, {"kind": date_kind, "value": scheduled})
+        item["owner"] = _plan_owner(resource, activity, by_ref)
+        if not item["owner"]:
+            gaps.append("no named owner")
+    if category in ("allergy", "problem"):
+        verification = _cc_display(resource.get("verificationStatus"))
+        if verification:
+            item["verification"] = verification
+    if rtype in ("MedicationStatement", "MedicationRequest"):
+        ended = _medication_end(resource, rtype)
+        if ended:
+            dates.append({"kind": "stopped", "value": ended})
     item["category"] = category
     item["date"] = date
+    item["date_kind"] = date_kind
+    item["dates"] = dates
+    own = {str(d["value"])[:10] for d in dates} | {str(date)[:10]}
+    item["note_dates"] = _note_dates(item.get("note"), own)
     item["code"] = code
     item["code_system"] = system
     item["flags"] = flags
@@ -1143,8 +1436,77 @@ SECTION_LOINC_KINDS = {
     "11369-6": "immunization",
     "46264-8": "device",
     "18776-5": "plan",
-    "42348-3": "plan",
+    "42348-3": "directive",
 }
+
+# Every section the EPS Composition (1.0.0-ballot) defines, required ones
+# first. Coverage is measured against this, not against whatever sections the
+# document happens to carry - otherwise the sections that are missing are
+# exactly the ones that never show up as gaps.
+EPS_SECTIONS = [
+    ("11450-4", "Problems", True),
+    ("48765-2", "Allergies and intolerances", True),
+    ("10160-0", "Medication summary", True),
+    ("47519-4", "History of procedures", True),
+    ("46264-8", "Medical devices", True),
+    ("104605-1", "Alerts", False),
+    ("11369-6", "Immunizations", False),
+    ("30954-2", "Results", False),
+    ("8716-3", "Vital signs", False),
+    ("18776-5", "Plan of care", False),
+    ("47420-5", "Functional status", False),
+    ("42348-3", "Advance directives", False),
+    ("29762-2", "Social history", False),
+    ("10162-6", "History of pregnancy", False),
+    ("11329-0", "Patient history", False),
+    ("10182-4", "Travel history", False),
+    ("81338-6", "Patient story", False),
+]
+PATIENT_SUMMARY_LOINC = "60591-5"
+NIL_KNOWN = "nilknown"
+
+
+def _section_codes(section) -> set:
+    code = section.get("code")
+    if not isinstance(code, dict) or not isinstance(code.get("coding"), list):
+        return set()
+    return {str(c.get("code")) for c in code["coding"] if isinstance(c, dict)}
+
+
+def _section_state(section, items, narrative) -> str:
+    """data | stated-none | none-known | missing.
+
+    stated-none: an explicit "no known X" entry. none-known: emptyReason
+    nilknown - nothing known, but no record that anyone asked. missing: no
+    data and no statement, or a statement that the information is
+    unavailable."""
+    if narrative or any(not i.get("assertion") for i in items):
+        return "data"
+    if any(i.get("assertion") == "none-known" for i in items):
+        return "stated-none"
+    reason = section.get("emptyReason")
+    if not items and isinstance(reason, dict):
+        codes = {_squash(str(c.get("code") or "")) for c in reason.get("coding") or []
+                 if isinstance(c, dict)}
+        if NIL_KNOWN in codes or _squash(_cc_display(reason) or "") == NIL_KNOWN:
+            return "none-known"
+    return "missing"
+
+
+def _eps_coverage(composition, states: dict) -> list | None:
+    """Per EPS section: present with data, stated none, nil known, present but
+    missing, or absent. None when the document is not a patient summary."""
+    ctype = composition.get("type")
+    codes = set()
+    if isinstance(ctype, dict) and isinstance(ctype.get("coding"), list):
+        codes = {str(c.get("code")) for c in ctype["coding"] if isinstance(c, dict)}
+    if PATIENT_SUMMARY_LOINC not in codes:
+        return None
+    return [
+        {"code": code, "name": name, "required": required,
+         "state": states.get(code, "absent")}
+        for code, name, required in EPS_SECTIONS
+    ]
 
 SECTION_TITLE_KINDS = (
     ("alert", "alert|uppm.rksamhet|varning|warnung"),
@@ -1287,7 +1649,7 @@ def _render_resource(resource, by_ref) -> dict:
             if " to " in span:
                 parts.append(f"plan {span}")
             elif period.get("start"):
-                parts.append(f"plan since {span}")
+                parts.append(f"plan start {span}")
             else:
                 parts.append(f"plan until {span}")
         detail = "; ".join(parts) or None
@@ -1355,24 +1717,7 @@ def _note_text(resource) -> str | None:
 
 
 def _patient_summary(patient) -> dict:
-    name_text = None
-    names = patient.get("name")
-    if isinstance(names, list):
-        for name in names:
-            if not isinstance(name, dict):
-                continue
-            given = name.get("given")
-            parts = [g for g in given if isinstance(g, str)] if isinstance(given, list) else []
-            family = name.get("family")
-            if isinstance(family, str) and family.strip():
-                parts.append(family.strip())
-            if parts:
-                name_text = " ".join(parts)
-                break
-            text = name.get("text")
-            if isinstance(text, str) and text.strip():
-                name_text = text.strip()
-                break
+    name_text = _human_name(patient.get("name"))
     identifiers = []
     ids = patient.get("identifier")
     if isinstance(ids, list):
@@ -1396,6 +1741,142 @@ def _patient_summary(patient) -> dict:
         else None,
         "identifiers": identifiers,
     }
+
+
+# EPS sections a receiving clinician decides on, each with what its absence
+# leaves unknown.
+PREGNANCY_LOINC = "10162-6"
+DECISIVE_SECTIONS = (
+    ("47420-5", "prior function, ADL and cognition unknown"),
+    ("42348-3", "limitations of treatment unknown - not to be assumed from age "
+                "or comorbidity"),
+    ("8716-3", "no weight, so weight-based dosing cannot be checked"),
+    ("29762-2", "living situation and support unknown"),
+    (PREGNANCY_LOINC, "pregnancy status not stated"),
+)
+RESULTS_REFERENCE_DAYS = 30   # older than this: not a current basis for decisions
+RESULTS_OUTDATED_DAYS = 180   # older than this: repeat them
+NOTED_WITHIN_DAYS = 365
+
+
+def _months_between(earlier, later) -> int:
+    months = (later.year - earlier.year) * 12 + later.month - earlier.month
+    return months - 1 if later.day < earlier.day else months
+
+
+def _age_words(earlier, later) -> str:
+    months = max(1, _months_between(earlier, later))
+    if months >= 24:
+        return f"{months // 12} years"
+    return "1 month" if months == 1 else f"{months} months"
+
+
+def _short_label(label) -> str:
+    """A LOINC long name cut down to the analyte. A slash is only cut at when
+    the name is still long: "Albumin/Creatinine" is the name of a ratio."""
+    short = re.split(r" \[|,", label, maxsplit=1)[0].strip()
+    if len(short) > 40:
+        short = short.split("/", 1)[0].strip()
+    return short or label
+
+
+def _birth_day(value):
+    if not isinstance(value, str):
+        return None
+    return (_iso_day(value) or _iso_day(value[:7] + "-01")
+            or _iso_day(value[:4] + "-01-01"))
+
+
+def _attention(summary) -> list:
+    """What is outdated or missing and has to be checked before the document
+    is relied on, in the order a reader should take it."""
+    items = [i for sec in summary["sections"] for i in sec["items"]]
+    items += summary["unreferenced"]
+    as_of = _iso_day(summary.get("as_of"))
+    out: list = []
+
+    def add(kind, title, detail=None, date=None, **extra):
+        out.append({"kind": kind, "title": title, "detail": detail, "date": date,
+                    **extra})
+
+    for item in items:
+        if "cancelled" not in item["flags"]:
+            continue
+        was = (f"Was scheduled {item['date'][:10]}."
+               if item["date_kind"] == "was scheduled" else None)
+        add("cancelled", f"Cancelled: {item['label']}",
+            " ".join(p for p in (was, item.get("note")) if p) or None, item["date"])
+
+    for item in items if as_of else []:
+        if item["category"] not in ("device", "plan") or "cancelled" in item["flags"]:
+            continue
+        for noted in item["note_dates"]:
+            day = _iso_day(noted["value"])
+            if day and 0 <= (as_of - day).days <= NOTED_WITHIN_DAYS:
+                add("noted", item["label"], noted["text"], noted["value"])
+
+    # An Observation outside the results sections (smoking status, say) is
+    # not a lab result, unless the document files its results nowhere else.
+    results = [i for sec in summary["sections"] if sec["kind"] == "result"
+               for i in sec["items"] if i["category"] == "result"]
+    results = results or [i for i in items if i["category"] == "result"]
+    days = [day for day in (_iso_day(i["date"]) for i in results) if day]
+    if as_of and days and (as_of - max(days)).days > RESULTS_REFERENCE_DAYS:
+        newest = max(days)
+        detail = f"{_age_words(newest, as_of)} before this document. " + (
+            "They are out of date and need repeating."
+            if (as_of - newest).days > RESULTS_OUTDATED_DAYS
+            else "They are reference values, not a current basis for decisions.")
+        abnormal = [
+            _short_label(i["label"]) + " " + i["detail"].split("; ")[0]
+            for i in results
+            if "abnormal" in i["flags"] and "no value" not in i["gaps"] and i["detail"]
+        ]
+        if abnormal:
+            more = len(abnormal) - 4
+            detail += (" Flagged abnormal: " + ", ".join(abnormal[:4])
+                       + (f" and {more} more" if more > 0 else "") + ".")
+        add("stale-results", f"Newest results are from {newest.isoformat()}",
+            detail, newest.isoformat())
+
+    meds = [i for i in items
+            if i["category"] == "medication" and not i.get("assertion")]
+    if meds and not any(i.get("basis") in ("given", "dispensed") for i in meds):
+        stated = any(i.get("basis") == "stated as taking" for i in meds)
+        prescribed = any(i.get("basis") == "prescribed" for i in meds)
+        if len(meds) == 1:
+            count = ("The one entry is a statement of what is taken" if stated
+                     else "The one entry is a prescription")
+        else:
+            count = f"{len(meds)} entries are " + " and ".join(
+                what for what, present in (("statements of what is taken", stated),
+                                           ("prescriptions", prescribed)) if present)
+        add("unreconciled", "Medication list not reconciled",
+            f"{count}. The document carries no last-dose, dispensing or "
+            "reconciliation date - confirm with the patient what is actually "
+            "taken and when the last dose was.")
+
+    coverage = {c["code"]: c for c in summary.get("coverage") or []}
+    patient = summary.get("patient") or {}
+    birth = _birth_day(patient.get("birth_date"))
+    age = _months_between(birth, as_of) // 12 if birth and as_of else None
+    childbearing = (str(patient.get("gender")).lower() == "female"
+                    and age is not None and 12 <= age <= 55)
+    names, reasons, codes = [], [], []
+    for code, reason in DECISIVE_SECTIONS:
+        section = coverage.get(code)
+        if not section or section["state"] not in ("absent", "missing"):
+            continue
+        if code == PREGNANCY_LOINC and not childbearing:
+            continue
+        names.append(section["name"])
+        reasons.append(reason)
+        codes.append(code)
+    if names:
+        detail = "; ".join(reasons)
+        add("missing", "Not in this document: " + ", ".join(names),
+            detail[0].upper() + detail[1:] + ".", sections=codes)
+    return out
 
 
 def _collect_references(value, out: list) -> None:
@@ -1433,7 +1914,10 @@ def summarize_bundle(bundle) -> dict:
         "composition": None,
         "sections": [],
         "unreferenced": [],
+        "coverage": None,
         "quality": _summary_quality({"sections": [], "unreferenced": []}),
+        "as_of": None,
+        "attention": [],
     }
     if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
         return summary
@@ -1458,7 +1942,10 @@ def summarize_bundle(bundle) -> dict:
             "title": _first_str(composition, "title"),
             "date": _first_str(composition, "date"),
         }
+        as_of = _iso_day(summary["composition"]["date"])
+        summary["as_of"] = as_of.isoformat() if as_of else None
         sections = composition.get("section")
+        section_states: dict = {}
         if isinstance(sections, list):
             for section in sections:
                 if not isinstance(section, dict):
@@ -1489,6 +1976,9 @@ def summarize_bundle(bundle) -> dict:
                         # content is its narrative (a patient story), so the
                         # views show that rather than "No entries".
                         narrative = _section_narrative(section)
+                state = _section_state(section, items, narrative)
+                for code in _section_codes(section):
+                    section_states.setdefault(code, state)
                 summary["sections"].append(
                     {
                         "title": title,
@@ -1496,8 +1986,10 @@ def summarize_bundle(bundle) -> dict:
                         "items": items,
                         "empty_reason": empty_reason,
                         "narrative": narrative,
+                        "state": state,
                     }
                 )
+        summary["coverage"] = _eps_coverage(composition, section_states)
         # Everything reachable from the Composition (section entries, authors,
         # and transitively from referenced resources) counts as referenced.
         queue = [composition]
@@ -1519,6 +2011,7 @@ def summarize_bundle(bundle) -> dict:
             continue
         summary["unreferenced"].append(_render_resource(resource, by_ref))
     summary["quality"] = _summary_quality(summary)
+    summary["attention"] = _attention(summary)
     return summary
 
 
@@ -2859,6 +3352,10 @@ SAMPLES = [
             "the last labs are eight months old and the follow-up that would "
             "have refreshed them was cancelled and never rebooked."
         ),
+        "horizon": (
+            "Future scenario: under the EHDS Regulation, cross-border exchange "
+            "of patient summaries is required from around 2029."
+        ),
         "language": "English",
         "scenario_name": "The Andrea Scenario",
         "scenario_url":
@@ -2870,8 +3367,14 @@ SAMPLES = [
         "tagline": "Multimorbid, admitted after a fall in Copenhagen",
         "scenario": (
             "A Swedish pensioner falls while visiting his son in Denmark and "
-            "needs surgery. Ten conditions, ten medicines and a high-criticality "
-            "penicillin anaphylaxis have to survive the border."
+            "needs surgery. Ten conditions, ten medicines including the "
+            "anticoagulant apixaban, and a high-criticality penicillin allergy "
+            "with anaphylaxis have to survive the border."
+        ),
+        "horizon": (
+            "Future scenario: under the EHDS Regulation, cross-border exchange "
+            "of patient summaries is required from around 2029, and of lab "
+            "results and discharge reports only from around 2031."
         ),
         "language": "Swedish",
         "scenario_name": "The Arne Scenario",
@@ -2890,6 +3393,7 @@ SAMPLES = [
             "airway plan, the last anaesthetic, the last doses and who to "
             "ring at Karolinska - before anyone reaches for a laryngoscope."
         ),
+        "horizon": None,
         "language": "Swedish",
         "scenario_name": "The Ville Scenario",
         "scenario_url":
@@ -2985,6 +3489,7 @@ def list_samples() -> Response:
                         "scenario": sample["scenario"],
                         "scenarioName": sample["scenario_name"],
                         "scenarioUrl": sample["scenario_url"],
+                        "horizon": sample["horizon"],
                         "language": sample["language"],
                         "available": read_sample_bytes(sample["id"]) is not None,
                     },
@@ -4059,6 +4564,7 @@ def documents() -> Response:
                 "profile": doc["profile"],
                 "ig": list(doc["igs"]),
                 "maturity": doc["maturity"],
+                "crossBorderFrom": doc["ehds_from"],
                 "spec": doc["spec"],
                 "points": (
                     "best submission: %d + %d per section (max %d) + %d per "
@@ -4734,6 +5240,28 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
    contain it or it collapses behind the buttons */
 #cv-doc::after { content: ""; display: block; clear: both; }
 .chip.cvc { margin-left: 5px; text-transform: none; letter-spacing: 0; }
+/* pinned above every view: what is always critical (red), then what is
+   outdated or missing and has to be checked now (yellow) */
+.cv-pinned { margin: 12px 0 4px; }
+.cv-critical, .cv-attention { border: 1px solid var(--fail); background: var(--fail-bg);
+  border-radius: var(--r-card); padding: 10px 14px; }
+.cv-attention { border-color: var(--warn); background: var(--warn-bg); }
+.cv-critical + .cv-attention { margin-top: 6px; }
+.cv-crit-head { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.1em;
+  font-weight: 700; color: var(--fail); margin-bottom: 4px; }
+.cv-attention .cv-crit-head { color: var(--warn); }
+.cv-pinned ul { list-style: none; margin: 0; padding: 0; }
+.cv-pinned li { padding: 4px 0; border-bottom: 1px solid var(--border); }
+.cv-pinned li:last-child { border-bottom: none; }
+.cv-crit-gap { color: var(--fail); }
+.cv-critical .cv-note { color: var(--text); }
+.cv-att-date { font-size: 0.8rem; color: var(--muted); margin-left: 4px;
+  font-variant-numeric: tabular-nums; }
+.cv-basis { font-size: 0.72rem; color: var(--muted); margin-left: 8px;
+  vertical-align: middle; }
+.cv-crit-cat { font-size: 0.72rem; color: var(--muted); font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em; margin-right: 4px; }
+.cv-horizon { margin-top: 4px; font-style: italic; }
 .chip.risk { color: var(--fail); background: var(--fail-bg); }
 .chip.warn { color: var(--warn); background: var(--warn-bg); }
 .chip.ok { color: var(--pass); background: var(--pass-bg); }
@@ -4770,16 +5298,24 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .tl-row::before { content: ""; position: absolute; left: -20px; top: 13px;
   width: 10px; height: 10px; border-radius: 50%; background: var(--cat, var(--accent));
   border: 2px solid var(--card); }
+.tl-year.tl-upcoming::before { background: var(--accent); }
+/* hollow dot: the date comes from the free text, not from a coded field */
+.tl-row.tl-noted::before { background: var(--card);
+  border-color: var(--cat, var(--accent)); }
+.tl-pin { color: var(--fail); font-weight: 600; }
 .tl-date { font-size: 0.74rem; color: var(--muted); font-variant-numeric: tabular-nums; }
 .tl-label { font-weight: 600; }
 .tl-detail { font-size: 0.83rem; color: var(--muted); }
 .tl-undated { border: 1px dashed var(--warn); border-radius: var(--r-card); padding: 10px 14px;
   margin-top: 18px; background: var(--warn-bg); }
-.tl-asserted { border: 1px dashed var(--pass); border-radius: var(--r-card);
-  padding: 10px 14px; margin-top: 18px; background: var(--pass-bg); }
+.tl-asserted { border: 1px dashed var(--border); border-radius: var(--r-card);
+  padding: 10px 14px; margin-top: 18px; background: var(--code-bg); }
 /* C - dashboard */
 .db-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: 12px; margin-top: 12px; }
+  gap: 12px; margin-top: 12px; align-items: start; }
+/* problems, medication and responsibility are read against each other */
+.db-grid.db-trio {
+  grid-template-columns: repeat(auto-fit, minmax(min(280px, 100%), 1fr)); }
 .db-card { border: 1px solid var(--border); border-radius: var(--r-card); padding: 12px 14px;
   background: var(--bg); }
 .db-card.alert { border-color: var(--fail); background: var(--fail-bg); }
@@ -4792,6 +5328,23 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .db-list li { padding: 4px 0; border-bottom: 1px solid var(--border); }
 .db-list li:last-child { border-bottom: none; }
 .db-more { font-size: 0.76rem; color: var(--muted); margin-top: 5px; }
+.db-list li > .db-more { margin-top: 0; }
+.db-list li > .db-note { margin: 2px 0 0; }
+.db-detail { font-size: 0.8rem; }
+.db-subhead { font-size: 0.72rem; font-weight: 700; color: var(--muted);
+  margin: 12px 0 0; }
+.db-list.db-quiet { font-size: 0.8rem; margin-top: 2px; }
+.db-quiet .db-detail { color: var(--muted); }
+.db-state { color: var(--muted); }
+.db-plan-label { font-weight: 600; }
+.db-fact { font-size: 0.8rem; }
+.db-k { display: inline-block; min-width: 3.6em; font-size: 0.7rem; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.db-cancelled .db-status { color: var(--fail); font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em; }
+.db-currency { font-size: 0.8rem; color: var(--muted); margin: 6px 0 0; }
+.db-currency.stale { color: var(--warn); background: var(--warn-bg);
+  border-radius: var(--r-ctl); padding: 5px 8px; font-weight: 600; }
 .mt { margin-top: 9px; }
 .mt-top { display: flex; justify-content: space-between; font-size: 0.78rem;
   font-weight: 600; }
@@ -4933,6 +5486,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
       <thead><tr>
         <th scope="col">EHDS category</th><th scope="col">Guide</th>
         <th scope="col">Maturity</th>
+        <th scope="col" title="When the EHDS Regulation requires cross-border exchange of this category">Cross-border from</th>
       </tr></thead>
       <tbody id="doc-types-body"></tbody>
     </table>
@@ -5336,7 +5890,8 @@ async function loadDocuments() {
       + '<td><a href="' + esc(d.spec) + '" target="_blank" rel="noopener">'
       + esc(d.label) + "</a> <span class=\"cat-chip\">" + esc(d.abbreviation)
       + "</span></td>"
-      + "<td>" + esc(d.maturity) + "</td></tr>"
+      + "<td>" + esc(d.maturity) + "</td>"
+      + "<td>" + (d.crossBorderFrom ? "around " + esc(d.crossBorderFrom) : "") + "</td></tr>"
   ).join("");
 }
 loadDocuments();
@@ -6447,6 +7002,7 @@ function renderSampleList(box) {
             ? ' <a href="' + esc(s.scenarioUrl) + '" target="_blank" rel="noopener">'
               + esc(s.scenarioName || "Read the scenario") + " \u2197</a>"
             : "")
+        + (s.horizon ? '<div class="cv-sub cv-horizon">' + esc(s.horizon) + "</div>" : "")
         + "</td></tr>").join("")
     + "</tbody></table></div>"
     + '<p class="muted sample-note">' + esc(cvDisclaimer) + "</p>";
@@ -6565,18 +7121,56 @@ function showDocMessage(text) {
 }
 
 function cvItemHtml(item) {
-  // the status pill already says "active"; a flag chip repeating it is noise
-  const chips = item.status
+  // the status pill already says "active"; a flag chip repeating it is noise -
+  // unless the chip is a risk ("cancelled"), then the chip stays and the pill goes
+  const loud = RISK_FLAGS.indexOf(item.status) !== -1 && hasFlag(item, item.status);
+  const chips = item.status && !loud
     ? cvChips(Object.assign({}, item,
         { flags: (item.flags || []).filter((f) => f !== item.status) }))
     : cvChips(item);
+  const detail = cvDetailText(item);
+  const basis = cvBasis(item);
   return "<li>"
     + '<span class="cv-label">' + esc(item.label || "Unnamed item") + "</span>"
-    + (item.status ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
+    + (item.status && !loud ? '<span class="cv-status">' + esc(item.status) + "</span>" : "")
     + chips
-    + (item.detail ? '<div class="cv-detail muted">' + esc(item.detail) + "</div>" : "")
+    + (basis ? '<span class="cv-basis">' + esc(basis) + "</span>" : "")
+    + (detail ? '<div class="cv-detail muted">' + esc(detail) + "</div>" : "")
+    + cvDatesHtml(item)
+    + cvOwnerHtml(item, "cv-detail muted")
     + (item.note ? '<div class="cv-note muted">' + esc(item.note) + "</div>" : "")
     + "</li>";
+}
+
+/* A detail segment that is only a date phrase ("onset 2012-09-04", or a bare
+   date) gives way to the dates line, which names every date with its kind. */
+function cvDetailText(item) {
+  const vals = (item.dates || []).map((x) => String(x.value));
+  return String(item.detail || "").split("; ").filter((seg) => {
+    const v = vals.find((x) => x && seg.endsWith(x));
+    return !(v !== undefined && /^[A-Za-z ]*$/.test(seg.slice(0, seg.length - v.length)));
+  }).join("; ");
+}
+
+/* Onset, recording, plan start and the event itself are different facts, so
+   each date is printed with its kind; one the detail still names is not repeated. */
+function cvDateParts(item) {
+  const detail = cvDetailText(item);
+  return (item.dates || []).filter((x) => detail.indexOf(x.value) === -1)
+    .map((x) => (x.kind ? x.kind + " " : "") + shortDate(x.value));
+}
+function cvDatesHtml(item) {
+  const parts = cvDateParts(item);
+  return parts.length
+    ? '<div class="cv-detail muted">' + parts.map(esc).join(" &middot; ") + "</div>"
+    : "";
+}
+
+/* Prescribed, dispensed, given and "says they take it" are not the same claim. */
+const cvBasis = (i) => (i.category === "medication" && i.basis) || "";
+function cvOwnerHtml(i, cls) {
+  return i.category === "plan" && i.owner
+    ? '<div class="' + cls + '">responsible: ' + esc(i.owner) + "</div>" : "";
 }
 
 /* ---- shared helpers for the clinician renderings ---- */
@@ -6585,7 +7179,41 @@ const CAT_LABEL = { alert: "Alert", allergy: "Allergy", problem: "Problem",
   immunization: "Vaccination", plan: "Care plan", device: "Device", other: "Other" };
 const CAT_ORDER = ["alert", "allergy", "problem", "medication", "result", "procedure",
   "immunization", "device", "plan", "other"];
-const RISK_FLAGS = ["high risk", "high priority", "severe", "abnormal"];
+const RISK_FLAGS = ["high risk", "high priority", "severe", "abnormal", "anticoagulant",
+  "insulin", "cancelled"];
+/* What has to be seen whatever the view, the sort order or the year. */
+const CRITICAL_FLAGS = ["high priority", "high risk", "severe", "anticoagulant", "insulin"];
+const isCritical = (i) => !i.assertion
+  && (i.flags || []).some((f) => CRITICAL_FLAGS.indexOf(f) !== -1);
+/* Clinical relevance, not list order: critical first, then abnormal or
+   active, then the rest - stable, so the author's order breaks ties. */
+function relevance(i) {
+  if (isCritical(i)) return 0;
+  if (hasFlag(i, "abnormal")) return 1;
+  if (hasFlag(i, "active") || hasFlag(i, "planned")) return 2;
+  return 3;
+}
+function byRelevance(arr) {
+  return arr.map((it, n) => [it, n])
+    .sort((a, b) => relevance(a[0]) - relevance(b[0]) || a[1] - b[1])
+    .map((x) => x[0]);
+}
+/* The three states an empty section can be in, kept apart. */
+const STATE_TEXT = {
+  "stated-none": "Stated by the author as none known.",
+  "none-known": "Recorded as none known - which does not show that anyone asked.",
+  missing: "Information missing - neither data nor a statement about it.",
+};
+/* Absent sections the "outdated or missing" box has not already named. */
+function cvAbsentRest(s) {
+  const said = [];
+  (s.attention || []).forEach((a) => (a.sections || []).forEach((c) => said.push(c)));
+  const absent = (s.coverage || []).filter((c) => c.state === "absent");
+  return { rest: absent.filter((c) => said.indexOf(c.code) === -1),
+           also: absent.some((c) => said.indexOf(c.code) !== -1) };
+}
+const datedText = (i) => i.date
+  ? (i.date_kind ? i.date_kind + " " : "") + shortDate(i.date) : "";
 
 /* Split deliberately: a resource the document never references is not part of
    any section, so counting it under one contradicts that section's own
@@ -6612,16 +7240,90 @@ const plural = (n, one, many) => n + " " + (n === 1 ? one : (many || one + "s"))
 const pctOf = (n, d) => (d ? Math.round((n / d) * 100) : 0);
 const shortDate = (dt) => String(dt || "").slice(0, 10);
 
+/* A status that only repeats what the date already says is left out. */
+function routineStatus(i, status) {
+  const st = String(status || "").toLowerCase();
+  return st === String(i.date_kind || "").toLowerCase()
+    || (i.category === "result" && st === "final")
+    || ((i.category === "immunization" || i.category === "procedure"
+         || i.basis === "given") && st === "completed");
+}
 function cvChips(i) {
   let h = "";
-  (i.flags || []).forEach((f) => {
+  (i.flags || []).filter((f) => !routineStatus(i, f)).forEach((f) => {
     const kind = RISK_FLAGS.indexOf(f) !== -1 ? "risk" : (f === "active" ? "ok" : "warn");
     h += '<span class="chip cvc ' + kind + '">' + esc(f) + "</span>";
   });
+  if (i.verification && i.verification.toLowerCase() !== "confirmed") {
+    h += '<span class="chip cvc warn">' + esc(i.verification) + "</span>";
+  }
   (i.gaps || []).forEach((g) => {
     h += '<span class="chip cvc gap">' + esc(g) + "</span>";
   });
   return h;
+}
+
+/* A status that says the entry is over: pinned still, but not "applies today". */
+const ENDED_STATUS = ["completed", "stopped", "resolved", "inactive", "cancelled",
+  "ended", "not-taken", "entered-in-error"];
+const isEnded = (i) => ENDED_STATUS.indexOf(String(i.status || "").toLowerCase()) !== -1;
+
+/* When an anticoagulant or insulin was last taken decides what can be done
+   now, so its absence is said rather than left to be noticed. Where doses are
+   recorded but none matches this medicine, the line is left out, not guessed. */
+function cvLastDoseHtml(i, doses) {
+  if (i.category !== "medication" || hasFlag(i, "last dose")) return "";
+  const same = doses.find((x) => (i.code && x.code === i.code)
+    || (i.label && x.label === i.label));
+  if (same) {
+    return '<div class="cv-sub">Last dose: '
+      + (same.date ? esc(shortDate(same.date)) : "recorded without a date") + "</div>";
+  }
+  return doses.length ? ""
+    : '<div class="cv-sub cv-crit-gap">Last dose: not recorded</div>';
+}
+
+function cvCriticalHtml(s) {
+  const all = cvItems(s);
+  const crit = byRelevance(all.filter(isCritical));
+  const doses = all.filter((i) => i.category === "medication" && hasFlag(i, "last dose"));
+  const cov = s.coverage || [];
+  const allergy = cov.find((c) => c.code === "48765-2");
+  const lines = crit.map((i) => {
+    const when = cvDateParts(i);
+    const basis = cvBasis(i);
+    // "prescribed 2020-01-01" already says the basis
+    const said = when.some((x) => x.indexOf(basis + " ") === 0);
+    const sub = [cvDetailText(i), said ? "" : basis].concat(when).filter(Boolean);
+    return "<li>"
+      + '<span class="cv-crit-cat">' + esc(CAT_LABEL[i.category] || "Entry") + "</span> "
+      + "<strong>" + esc(i.label || "Unnamed item") + "</strong>" + cvChips(i)
+      + (isEnded(i) ? '<span class="cv-status">' + esc(i.status) + "</span>" : "")
+      + (sub.length ? '<div class="cv-sub">' + sub.map(esc).join(" &middot; ") + "</div>" : "")
+      + cvLastDoseHtml(i, doses)
+      + (i.note ? '<div class="cv-sub cv-note">' + esc(i.note) + "</div>" : "")
+      + "</li>";
+  });
+  if (allergy && (allergy.state === "missing" || allergy.state === "absent")) {
+    lines.push('<li><span class="cv-crit-cat">Allergy</span> <strong>Allergy'
+      + " status unknown</strong>"
+      + '<div class="cv-sub">No allergy and no statement that none is known.</div></li>');
+  }
+  const attention = (s.attention || []).map((a) => "<li>"
+    + "<strong>" + esc(a.title || "Check") + "</strong>"
+    + (a.date && ((a.title || "") + (a.detail || "")).indexOf(shortDate(a.date)) === -1
+        ? ' <span class="cv-att-date">' + esc(shortDate(a.date)) + "</span>" : "")
+    + (a.detail ? '<div class="cv-sub">' + esc(a.detail) + "</div>" : "")
+    + "</li>");
+  if (!lines.length && !attention.length) return "";
+  return '<div class="cv-pinned">'
+    + (lines.length
+        ? '<div class="cv-critical"><div class="cv-crit-head">Critical</div><ul>'
+          + lines.join("") + "</ul></div>" : "")
+    + (attention.length
+        ? '<div class="cv-attention"><div class="cv-crit-head">Missing and possibly'
+          + " outdated</div><ul>" + attention.join("") + "</ul></div>" : "")
+    + "</div>";
 }
 
 function cvAge(birth, on) {
@@ -6647,37 +7349,94 @@ function tlTime(v) {
   return isNaN(t) ? null : t;
 }
 
+/* One row per item at its own date, plus one per date its note names: "no
+   readings since 2026-06-02" belongs in June 2026, not under the year the
+   device was fitted. */
+function tlRows(items) {
+  const rows = [];
+  items.forEach((i) => {
+    const own = [];
+    if (tlTime(i.date) !== null) {
+      rows.push({ t: tlTime(i.date), date: i.date, item: i });
+      own.push(shortDate(i.date));
+    }
+    (i.note_dates || []).forEach((n) => {
+      const day = shortDate(n.value);
+      if (tlTime(day) === null || own.indexOf(day) !== -1) return;
+      own.push(day);
+      rows.push({ t: tlTime(day), date: day, item: i, noted: n.text || "" });
+    });
+  });
+  return rows;
+}
+
+function tlRowHtml(r) {
+  const i = r.item;
+  const cat = esc(CAT_LABEL[i.category] || "Entry");
+  if (r.noted !== undefined) {
+    return '<div class="tl-row tl-noted c-' + esc(i.category || "other") + '">'
+      + '<div class="tl-date">' + esc(shortDate(r.date))
+      + " &middot; date named in the note &middot; " + cat + "</div>"
+      + '<div class="tl-label">' + esc(i.label || "Unnamed item") + "</div>"
+      + (r.noted ? '<div class="tl-detail tl-note">' + esc(r.noted) + "</div>" : "")
+      + "</div>";
+  }
+  const detail = cvDetailText(i);
+  const basis = cvBasis(i);
+  const others = (i.dates || []).filter((x) => !(x.value === i.date
+    && (x.kind || null) === (i.date_kind || null)) && detail.indexOf(x.value) === -1)
+    .map((x) => (x.kind ? x.kind + " " : "") + shortDate(x.value));
+  return '<div class="tl-row c-' + esc(i.category || "other") + '">'
+    + '<div class="tl-date">' + esc(datedText(i)) + " &middot; " + cat
+    + (i.status && !routineStatus(i, i.status) ? " &middot; " + esc(i.status) : "")
+    + (basis && basis !== i.date_kind ? " &middot; " + esc(basis) : "")
+    + (isCritical(i) && !isEnded(i)
+        ? ' &middot; <span class="tl-pin">still applies today</span>' : "")
+    + "</div>"
+    + '<div class="tl-label">' + esc(i.label || "Unnamed item") + cvChips(i) + "</div>"
+    + (detail ? '<div class="tl-detail">' + esc(detail) + "</div>" : "")
+    + (others.length
+        ? '<div class="tl-detail">' + others.map(esc).join(" &middot; ") + "</div>" : "")
+    + cvOwnerHtml(i, "tl-detail")
+    + (i.note ? '<div class="tl-detail tl-note">' + esc(i.note) + "</div>" : "")
+    + "</div>";
+}
+
 function viewTimeline(d) {
   const s = d.summary || {};
-  const q = s.quality || {};
-  const items = cvItems(s);
-  const dated = items.filter((i) => tlTime(i.date) !== null)
-    .sort((a, b) => tlTime(b.date) - tlTime(a.date));
+  const items = cvItems(s).filter((i) => !i.assertion);
+  const docDate = shortDate(s.as_of || (s.composition || {}).date);
+  const hasDoc = tlTime(docDate) !== null;
+  const ref = hasDoc ? tlTime(docDate) : tlTime(new Date().toISOString());
+  const rows = tlRows(items);
+  // sort is stable, so entries sharing a day keep the document's order
+  const upcoming = rows.filter((r) => r.t > ref).sort((a, b) => a.t - b.t);
+  const past = rows.filter((r) => r.t <= ref).sort((a, b) => b.t - a.t);
   const undated = items.filter((i) => tlTime(i.date) === null);
   const cats = CAT_ORDER.filter((c) => items.some((i) => i.category === c));
   let h = '<div class="tl-legend">' + cats.map((c) =>
     '<span class="c-' + esc(c) + '"><i class="cdot"></i>' + esc(CAT_LABEL[c] || c)
     + " (" + cvCat(items, c).length + ")</span>").join("") + "</div>";
   h += '<p class="muted" style="margin:8px 0 0">'
-    + plural(dated.length, "dated entry", "dated entries")
-    + (q.earliest && q.latest
-        ? ", " + esc(shortDate(q.earliest)) + " to " + esc(shortDate(q.latest)) : "")
+    + plural(past.length, "dated entry", "dated entries")
+    + (past.length ? ", " + esc(shortDate(past[past.length - 1].date)) + " to "
+        + esc(shortDate(past[0].date)) : "")
+    + (hasDoc ? " &middot; document date " + esc(docDate)
+        : rows.length ? " &middot; no document date, so upcoming is counted from today" : "")
+    + (upcoming.length ? " &middot; " + upcoming.length + " upcoming" : "")
     + (undated.length ? " &middot; " + undated.length + " undated" : "") + "</p>";
 
-  if (dated.length) {
+  if (rows.length) {
     let year = null;
     h += '<div class="tl">';
-    dated.forEach((i) => {
-      const y = String(i.date).slice(0, 4);
+    if (upcoming.length) {
+      h += '<div class="tl-year tl-upcoming">Upcoming</div>'
+        + upcoming.map(tlRowHtml).join("");
+    }
+    past.forEach((r) => {
+      const y = shortDate(r.date).slice(0, 4);
       if (y !== year) { year = y; h += '<div class="tl-year">' + esc(y) + "</div>"; }
-      h += '<div class="tl-row c-' + esc(i.category || "other") + '">'
-        + '<div class="tl-date">' + esc(shortDate(i.date)) + " &middot; "
-        + esc(CAT_LABEL[i.category] || "Entry")
-        + (i.status ? " &middot; " + esc(i.status) : "") + "</div>"
-        + '<div class="tl-label">' + esc(i.label || "Unnamed item") + cvChips(i) + "</div>"
-        + (i.detail ? '<div class="tl-detail">' + esc(i.detail) + "</div>" : "")
-        + (i.note ? '<div class="tl-detail tl-note">' + esc(i.note) + "</div>" : "")
-        + "</div>";
+      h += tlRowHtml(r);
     });
     h += "</div>";
   } else {
@@ -6693,18 +7452,20 @@ function viewTimeline(d) {
       + '<ul class="cv-items">' + undated.map(cvItemHtml).join("") + "</ul></div>";
   }
 
-  const asserted = (s.sections || [])
-    .filter((x) => !(x.items || []).length && x.empty_reason);
+  const asserted = (s.sections || []).filter((x) =>
+    x.state === "stated-none" || x.state === "none-known");
   if (asserted.length) {
     h += '<div class="tl-asserted"><strong>'
       + plural(asserted.length, "section", "sections")
-      + " asserting there is nothing to report</strong>"
+      + " with nothing known to report</strong>"
       + '<p class="muted" style="margin:2px 0 4px;font-size:0.8rem">Nothing to'
-      + " place on the timeline, but the author positively stated these are"
-      + " empty. That is a clinical finding, not missing data.</p>"
+      + " place on the timeline. Not the same as information missing, but not"
+      + " proof of absence either: no recorded procedures does not mean none"
+      + " were done.</p>"
       + '<ul class="cv-items">' + asserted.map((x) => "<li>"
-          + esc(x.title || "Untitled section") + '<span class="chip cvc ok">'
-          + esc(x.empty_reason) + "</span></li>").join("")
+          + esc(x.title || "Untitled section") + '<span class="chip cvc warn">'
+          + (x.state === "stated-none" ? "stated: none known"
+              : esc(x.empty_reason || "none known")) + "</span></li>").join("")
       + "</ul></div>";
   }
   return h;
@@ -6715,8 +7476,9 @@ function dbCard(title, body, cls) {
   return '<div class="db-card' + (cls ? " " + cls : "") + '"><h4>' + esc(title)
     + "</h4>" + body + "</div>";
 }
-function dbList(arr, n, fn) {
-  return '<ul class="db-list">' + arr.slice(0, n).map(fn).join("") + "</ul>"
+function dbList(arr, n, fn, cls) {
+  return '<ul class="db-list' + (cls ? " " + cls : "") + '">'
+    + arr.slice(0, n).map(fn).join("") + "</ul>"
     + (arr.length > n ? '<p class="db-more">and ' + (arr.length - n) + " more</p>" : "");
 }
 function dbMeter(label, n, total) {
@@ -6730,7 +7492,119 @@ function dbMeter(label, n, total) {
 function dbRow(i) {
   return "<li>" + esc(i.label || "Unnamed item") + cvChips(i)
     + (i.date ? ' <span class="db-more" style="display:inline">'
-        + esc(shortDate(i.date)) + "</span>" : "") + "</li>";
+        + esc(datedText(i)) + "</span>" : "") + "</li>";
+}
+/* Rows a decision rests on are listed in full up to this many: a diagnosis
+   or an anticoagulant folded into "and 4 more" is as good as not sent. */
+const DB_FULL = 12;
+const dbGap = (g) => '<span class="chip cvc gap">' + esc(g) + "</span>";
+function dbChips(i, dropFlags, dropGaps) {
+  return cvChips(Object.assign({}, i, {
+    flags: (i.flags || []).filter((f) => dropFlags.indexOf(f) === -1),
+    gaps: (i.gaps || []).filter((g) => (dropGaps || []).indexOf(g) === -1) }));
+}
+function dbDates(i) {
+  const detail = i.detail || "";
+  const all = (i.dates && i.dates.length) ? i.dates
+    : (i.date ? [{ kind: i.date_kind, value: i.date }] : []);
+  return all.filter((x) => detail.indexOf(shortDate(x.value)) === -1)
+    .map((x) => (x.kind ? x.kind + " " : "") + shortDate(x.value));
+}
+/* The dose or value, every date the detail does not name, and the note.
+   withStatus spells out the status of an entry that is not active. */
+function dbRowHtml(i, withStatus, extra) {
+  const meta = (extra ? [extra] : []).concat(dbDates(i));
+  return "<li>" + esc(i.label || "Unnamed item")
+    + (withStatus ? ' <span class="db-state">- '
+        + esc(i.status || "status not stated") + "</span>" : "")
+    + dbChips(i, ["active"])
+    + (i.detail ? '<div class="db-detail">' + esc(i.detail) + "</div>" : "")
+    + (meta.length ? '<div class="db-more">' + meta.map(esc).join(" &middot; ")
+        + "</div>" : "")
+    + (i.note ? '<div class="db-note">' + esc(i.note) + "</div>" : "")
+    + "</li>";
+}
+/* under an "active of N" heading the chip on every row says nothing */
+function dbActiveRow(i) {
+  return dbRow(Object.assign({}, i,
+    { flags: (i.flags || []).filter((f) => f !== "active") }));
+}
+function dbFullRow(i) { return dbRowHtml(i, false); }
+function dbStatusRow(i) { return dbRowHtml(i, true); }
+function dbQuiet(title, arr, fn) {
+  return arr.length ? '<p class="db-subhead">' + esc(title) + "</p>"
+    + dbList(arr, DB_FULL, fn, "db-quiet") : "";
+}
+/* A statement of use is not a prescription, a dispensing or an observed dose. */
+function dbMedBasis(meds, said) {
+  if (said) return "";
+  const n = {};
+  meds.forEach((m) => { if (m.basis) n[m.basis] = (n[m.basis] || 0) + 1; });
+  const kinds = Object.keys(n);
+  if (!kinds.length) return "";
+  let text = kinds.length === 1 && kinds[0] === "stated as taking"
+    ? "This list is what is stated as taken - not reconciled against prescriptions,"
+      + " dispensing or actual use."
+    : "Basis: " + kinds.map((k) => n[k] + " " + k).join(", ") + "."
+      + (n.prescribed || n.dispensed
+          ? " Prescribed or dispensed does not show what was actually taken." : "");
+  if (!n.given && !meds.some((m) => hasFlag(m, "last dose"))) {
+    text += " No last dose is recorded.";
+  }
+  return '<p class="db-more">' + esc(text) + "</p>";
+}
+function dbPlanRank(i) {
+  if (hasFlag(i, "cancelled") || i.status === "cancelled") return 0;
+  if (hasFlag(i, "planned") || i.status === "scheduled") return 1;
+  return 2;
+}
+/* Owner, time and status each get a line, so a missing one leaves a visible
+   hole instead of a shorter row. */
+function dbPlanRow(i) {
+  const cancelled = dbPlanRank(i) === 0;
+  const flagged = cancelled && !hasFlag(i, "cancelled")
+    ? Object.assign({}, i, { flags: (i.flags || []).concat("cancelled") }) : i;
+  // the detail repeats the dates as one string; keep only what "when" lacks
+  const rest = (i.detail || "").split("; ").filter((part) => part
+    && (!i.date || part.indexOf(shortDate(i.date)) === -1));
+  const fact = (k, v) => '<div class="db-fact"><span class="db-k">' + k
+    + "</span> " + v + "</div>";
+  return "<li" + (cancelled ? ' class="db-cancelled"' : "") + ">"
+    + '<div class="db-plan-label">' + esc(i.label || "Unnamed plan")
+    + dbChips(flagged, ["active", "planned"], ["no named owner", "no date"]) + "</div>"
+    + fact("Status", i.status ? '<span class="db-status">' + esc(i.status) + "</span>"
+        : dbGap("no status"))
+    + fact("When", (i.date ? esc(datedText(i)) : (rest.length ? "" : dbGap("no date")))
+        + (rest.length ? ' <span class="db-state">' + (i.date ? "&middot; " : "")
+            + esc(rest.join("; ")) + "</span>" : ""))
+    + fact("Who", i.owner ? esc(i.owner) : dbGap("no named owner"))
+    + (i.note ? '<div class="db-note">' + esc(i.note) + "</div>" : "")
+    + "</li>";
+}
+function dbSpan(days) {
+  if (days < 31) return plural(days, "day");
+  const months = Math.floor(days / 30.44);
+  return months < 24 ? plural(months, "month") : plural(Math.floor(months / 12), "year");
+}
+/* How old the newest result was when the document was written; null when
+   either date is missing, because then nothing can be said. */
+function dbCurrency(results, asOf) {
+  const newest = results.map((r) => shortDate(r.date))
+    .filter((v) => v && !isNaN(Date.parse(v))).sort().pop();
+  const ref = Date.parse(shortDate(asOf));
+  if (!newest || isNaN(ref)) return null;
+  const days = Math.round((ref - Date.parse(newest)) / 86400000);
+  const stale = days > 180;
+  let text = "Newest result " + newest;
+  if (days < 0) text += " - dated after this document.";
+  else if (days === 0) text += " - same day as this document.";
+  else {
+    text += " - " + dbSpan(days) + " before this document.";
+    if (days > 180) text += " Out of date - not a current basis for decisions.";
+    else if (days > 30) text += " Reference values, not a current basis.";
+  }
+  return { stale: stale, html: '<p class="db-currency'
+    + (stale || days < 0 ? " stale" : "") + '">' + esc(text) + "</p>" };
 }
 
 function viewDashboard(d) {
@@ -6738,7 +7612,7 @@ function viewDashboard(d) {
   const q = s.quality || {};
   const p = s.patient;
   const sections = s.sections || [];
-  const items = cvSectionItems(s);
+  const items = cvSectionItems(s).filter((i) => !i.assertion);
   const orphans = cvOrphans(s);
   const alerts = cvCat(items, "alert");
   const allergies = cvCat(items, "allergy");
@@ -6801,106 +7675,180 @@ function viewDashboard(d) {
       + dbList(high.concat(allergies.filter((a) => !hasFlag(a, "high risk"))),
                5, dbRow);
     aCls = high.length ? "alert" : "";
-  } else if (allergySec && allergySec.empty_reason) {
-    aBody = '<div class="db-big">' + esc(allergySec.empty_reason) + "</div>"
+  } else if (allergySec && (allergySec.state === "stated-none"
+                             || allergySec.state === "none-known")) {
+    aBody = '<div class="db-big">'
+      + (allergySec.state === "stated-none" ? "No known allergies" : "None known")
+      + "</div>"
       + (orphanAllergies.length
           ? '<div class="db-sub">Contradicted: '
             + plural(orphanAllergies.length, "allergy resource",
                      "allergy resources")
-            + " sits in the bundle unreferenced, so the assertion and the data"
+            + " sits in the bundle unreferenced, so the statement and the data"
             + " disagree. Do not rely on either.</div>"
             + dbList(orphanAllergies, 5, dbRow)
-          : '<div class="db-sub">Positively asserted by the author - safe to'
-            + " rely on.</div>");
-    aCls = orphanAllergies.length ? "alert" : "good";
+          : '<div class="db-sub">' + esc(STATE_TEXT[allergySec.state])
+            + " Confirm with the patient before giving a new drug.</div>");
+    aCls = orphanAllergies.length ? "alert" : "";
   } else {
-    aBody = '<div class="db-big">Unknown</div><div class="db-sub">Neither an allergy'
-      + " nor a statement that none is known.</div>";
+    aBody = '<div class="db-big">Unknown</div><div class="db-sub">Information'
+      + " missing: neither an allergy nor a statement that none is known"
+      + (allergySec && allergySec.empty_reason
+          ? " (" + esc(allergySec.empty_reason) + ")" : "") + ".</div>";
     aCls = "alert";
   }
   h += dbCard("Allergies and intolerances", aBody, aCls);
 
+  /* What is wrong, what is taken for it and who is responsible are read
+     against each other, so the three sit in one row of their own. */
+  h += '</div><div class="db-grid db-trio">';
+
+  /* Not active is not gone: a depression in remission or a resolved stroke
+     still explains the medicine list and the care plan. */
   const active = problems.filter((x) => hasFlag(x, "active"));
+  const notActive = problems.filter((x) => !hasFlag(x, "active"));
   h += dbCard("Problems",
     '<div class="db-big">' + (active.length || problems.length) + "</div>"
     + '<div class="db-sub">' + (active.length ? "active of " + problems.length
         + " recorded" : (problems.length ? "recorded, none marked active"
         : "nothing recorded")) + "</div>"
-    + dbList(active.length ? active : problems, 5, dbRow),
+    + (active.length
+        ? dbList(byRelevance(active), DB_FULL, dbActiveRow)
+          + dbQuiet("Not marked active", notActive, dbStatusRow)
+        : dbList(byRelevance(problems), DB_FULL, dbStatusRow)),
     problems.filter((x) => hasFlag(x, "severe")).length ? "alert" : "");
 
   const activeMeds = meds.filter((x) => hasFlag(x, "active"));
   const medsShown = activeMeds.length ? activeMeds : meds;
   const noDose = countGap(medsShown, "no dose");
+  /* the basis is only worth a line per row when the rows differ in it */
+  const mixedBasis = new Set(meds.map((m) => m.basis).filter(Boolean)).size > 1;
+  const medRow = (i) => dbRowHtml(i, !hasFlag(i, "active"), mixedBasis ? i.basis : "");
   h += dbCard("Current medication",
     '<div class="db-big">' + (activeMeds.length || meds.length) + "</div>"
     + '<div class="db-sub">' + (activeMeds.length
         ? "active of " + meds.length + " recorded"
           + (noDose ? ", " + noDose + " without a usable dose" : "")
         : (meds.length ? "recorded, none marked active" : "nothing recorded"))
-    + "</div>"
-    + dbList(medsShown, 5, dbRow), noDose ? "alert" : "");
+    + "</div>" + dbMedBasis(meds, (s.attention || []).some((a) => a.kind === "unreconciled"))
+    + dbList(byRelevance(medsShown), DB_FULL, medRow)
+    + (activeMeds.length
+        ? dbQuiet("Not active", meds.filter((x) => !hasFlag(x, "active")), medRow)
+        : ""),
+    noDose ? "alert" : "");
 
+  if (plans.length) {
+    const nCancelled = plans.filter((x) => dbPlanRank(x) === 0).length;
+    const unowned = plans.filter((x) => !x.owner).length;
+    h += dbCard("Care plan and responsibility",
+      '<div class="db-big">' + plans.length
+      + (nCancelled ? ' <span class="chip cvc risk">' + nCancelled
+          + " cancelled</span>" : "") + "</div>"
+      + '<div class="db-sub">' + (unowned ? unowned + " of " + plans.length
+          + " without a named owner" : "each with a named owner") + "</div>"
+      + dbList(plans.slice().sort((a, b) => dbPlanRank(a) - dbPlanRank(b)),
+               DB_FULL, dbPlanRow)
+      + '<p class="db-more">The document records what was planned - not that a'
+      + " receiving provider or municipality has confirmed the handover.</p>",
+      nCancelled ? "alert" : "");
+  }
+  h += "</div>";
+
+  let rest = "";
   if (results.length) {
     const recent = results.slice()
       .sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1);
     const abn = results.filter((r) => hasFlag(r, "abnormal"));
-    h += dbCard("Results",
+    const currency = dbCurrency(results, s.as_of || docDate);
+    rest += dbCard("Results",
       '<div class="db-big">' + results.length
       + (abn.length ? ' <span class="chip cvc risk">' + abn.length
           + " abnormal</span>" : "") + "</div>"
+      + (currency ? currency.html : "")
       + dbList(abn.length ? abn.concat(recent.filter((r) => abn.indexOf(r) === -1))
-               : recent, 5, dbRow),
-      abn.length ? "alert" : "");
+               : recent, DB_FULL, dbFullRow),
+      abn.length || (currency && currency.stale) ? "alert" : "");
   }
-  if (shots.length) {
-    h += dbCard("Vaccinations", '<div class="db-big">' + shots.length + "</div>"
-      + dbList(shots.slice().sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1),
-               4, dbRow));
+  if (devices.length) {
+    rest += dbCard("Devices and implants",
+      '<div class="db-big">' + devices.length + "</div>"
+      + dbList(devices, DB_FULL, dbFullRow));
   }
   if (procedures.length) {
-    h += dbCard("Procedures", '<div class="db-big">' + procedures.length + "</div>"
+    rest += dbCard("Procedures", '<div class="db-big">' + procedures.length + "</div>"
       + dbList(procedures.slice()
           .sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1), 5, dbRow));
   }
-  if (devices.length) {
-    h += dbCard("Devices and implants",
-      '<div class="db-big">' + devices.length + "</div>"
-      + dbList(devices, 5, dbRow));
-  }
-  if (plans.length) {
-    h += dbCard("Care plan", '<div class="db-big">' + plans.length + "</div>"
-      + dbList(plans, 5, dbRow));
+  if (shots.length) {
+    rest += dbCard("Vaccinations", '<div class="db-big">' + shots.length + "</div>"
+      + dbList(shots.slice().sort((a, b) => (a.date || "") < (b.date || "") ? 1 : -1),
+               4, dbRow));
   }
   if (other.length) {
-    h += dbCard("Other entries", '<div class="db-big">' + other.length + "</div>"
+    rest += dbCard("Other entries", '<div class="db-big">' + other.length + "</div>"
       + '<div class="db-sub">carried by the document but outside the standard'
       + " summary categories</div>" + dbList(other, 5, dbRow));
   }
+  h += (rest ? '<div class="db-grid">' + rest + "</div>" : "") + '<div class="db-grid">';
 
-  const empty = sections.filter((x) => !(x.items || []).length && !x.narrative);
-  h += dbCard("Document coverage",
-    '<div class="db-big">' + (sections.length - empty.length) + " / "
-    + sections.length + "</div>"
-    + '<div class="db-sub">sections carrying data</div>'
-    + (empty.length ? dbList(empty, 6, (x) => "<li>" + esc(x.title || "Untitled")
-        + (x.empty_reason ? '<span class="chip cvc ok">' + esc(x.empty_reason)
-            + "</span>" : '<span class="chip cvc gap">no reason given</span>')
-        + "</li>") : ""),
-    empty.some((x) => !x.empty_reason) ? "alert" : "");
+  const cov = s.coverage;
+  if (cov) {
+    const withData = cov.filter((c) => c.state === "data");
+    const req = cov.filter((c) => c.required);
+    const reqMissing = req.filter((c) => c.state === "missing" || c.state === "absent");
+    const nilKnown = cov.filter((c) => c.state === "stated-none" || c.state === "none-known");
+    const missing = cov.filter((c) => c.state === "missing");
+    const absent = cvAbsentRest(s);
+    const names = (arr) => arr.map((c) => esc(c.name)
+      + (c.required ? " (required)" : "")).join(", ");
+    h += dbCard("EPS section coverage",
+      '<div class="db-big">' + withData.length + " / " + cov.length + "</div>"
+      + '<div class="db-sub">sections of the EPS guide with data, '
+      + req.filter((c) => c.state === "data").length + " of the " + req.length
+      + " required ones</div>"
+      + (nilKnown.length ? '<p class="db-more"><strong>None known:</strong> '
+          + names(nilKnown) + " - not proof of absence.</p>" : "")
+      + (missing.length ? '<p class="db-more"><strong>Present but empty:</strong> '
+          + names(missing) + "</p>" : "")
+      + (absent.rest.length ? '<p class="db-more"><strong>'
+          + (absent.also ? "Also not sent:" : "Not in the document:") + "</strong> "
+          + names(absent.rest) + (absent.also ? "." : " - not sent, which is not"
+          + " the same as nothing to report.") + "</p>"
+          : ""),
+      reqMissing.length ? "alert" : "");
+  } else {
+    const empty = sections.filter((x) => !(x.items || []).length && !x.narrative);
+    h += dbCard("Document coverage",
+      '<div class="db-big">' + (sections.length - empty.length) + " / "
+      + sections.length + "</div>"
+      + '<div class="db-sub">sections carrying data</div>'
+      + (empty.length ? dbList(empty, 6, (x) => "<li>" + esc(x.title || "Untitled")
+          + (x.empty_reason ? '<span class="chip cvc warn">' + esc(x.empty_reason)
+              + "</span>" : '<span class="chip cvc gap">no reason given</span>')
+          + "</li>") : ""),
+      empty.some((x) => !x.empty_reason) ? "alert" : "");
+  }
 
   const total = q.items || 0;
-  let dq = dbMeter("Coded with a terminology", q.coded || 0, total)
-    + dbMeter("Placed in time", q.dated || 0, total);
+  let dq = dbMeter("Has a code", q.coded || 0, total)
+    + dbMeter("Has a date", q.dated || 0, total);
   const gaps = q.gaps || {};
   const gapKeys = Object.keys(gaps);
   if (gapKeys.length) {
     dq += dbList(gapKeys, 5, (g) => "<li>" + esc(g)
       + '<span class="chip cvc gap">' + gaps[g] + "</span></li>");
+    dq += '<p class="db-more">These check only that fields are filled in - not'
+      + " whether a code or binding is valid, nor how current an entry is.</p>";
+  } else if (total && q.coded === total && q.dated === total) {
+    dq += '<p class="db-more">All ' + plural(total, "included entry", "included entries")
+      + " " + (total === 1 ? "has" : "have") + " a code and a date. Currency and"
+      + " clinical completeness have not been assessed.</p>";
   } else if (total) {
-    dq += '<p class="db-more">No gaps detected in ' + total + " entries.</p>";
+    dq += '<p class="db-more">No expected field is empty in ' + plural(total, "entry",
+      "entries") + ". That checks presence only - currency and clinical completeness"
+      + " have not been assessed.</p>";
   }
-  h += dbCard("Data quality (" + total + " entries)", dq,
+  h += dbCard("Technical checks (" + total + " entries)", dq,
     total && pctOf((q.items || 0) - (q.with_gaps || 0), total) < 60 ? "alert" : "");
 
   if ((s.unreferenced || []).length) {
@@ -6936,8 +7884,14 @@ function viewDocument(d) {
   }
   for (const sec of s.sections || []) {
     html += '<h3 class="cv-sec">' + esc(sec.title || "Untitled section") + "</h3>";
-    if (sec.items && sec.items.length) {
-      html += '<ul class="cv-items">' + sec.items.map(cvItemHtml).join("") + "</ul>";
+    if (sec.state === "stated-none" || sec.state === "none-known") {
+      html += '<p class="muted" style="margin:2px 0 8px">'
+        + (sec.items && sec.items.length
+            ? esc(sec.items.map((i) => i.label).join(", ")) + " - " : "")
+        + esc(STATE_TEXT[sec.state]) + "</p>";
+    } else if (sec.items && sec.items.length) {
+      html += '<ul class="cv-items">' + byRelevance(sec.items).map(cvItemHtml).join("")
+        + "</ul>";
     } else if (sec.narrative) {
       // a section that is its narrative (a patient story): the prose is the
       // content, shown as written
@@ -6945,10 +7899,22 @@ function viewDocument(d) {
         .map((line) => "<p>" + esc(line) + "</p>").join("") + "</div>";
     } else if (sec.empty_reason) {
       html += '<p class="muted" style="margin:2px 0 8px">No entries - '
-        + esc(sec.empty_reason) + "</p>";
+        + esc(sec.empty_reason) + ". " + esc(STATE_TEXT.missing) + "</p>";
     } else {
-      html += '<p class="muted" style="margin:2px 0 8px">No entries.</p>';
+      html += '<p class="muted" style="margin:2px 0 8px">No entries. '
+        + esc(STATE_TEXT.missing) + "</p>";
     }
+  }
+  const notSent = cvAbsentRest(s);
+  const absent = notSent.rest;
+  if (absent.length) {
+    html += '<h3 class="cv-sec muted">Not in this document</h3>'
+      + '<p class="muted" style="margin:0;font-size:0.85rem">'
+      + (notSent.also ? "Also not sent: "
+          : plural(absent.length, "EPS section") + " not sent: ")
+      + absent.map((c) => esc(c.name) + (c.required ? " (required)" : "")).join(", ")
+      + ". Absent means the information did not come across - not that there"
+      + " is nothing to report.</p>";
   }
   if (s.unreferenced && s.unreferenced.length) {
     html += '<h3 class="cv-sec muted">Not referenced by any section</h3>'
@@ -7011,8 +7977,11 @@ function renderClinicalDoc(d) {
           + (d.errors ? ", " + plural(d.errors, "error") : "")
           + ' &middot; <a href="/fhir/Bundle/' + d.id
           + '" download>download the FHIR bundle</a>')
-    + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0]) : "")
+    + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0])
+        + ' <span class="cv-sub">(when it was assembled - not how current'
+        + " each entry is)</span>" : "")
     + "</p>";
+  html += cvCriticalHtml(s);
   html += (Object.hasOwn(CV_VIEWS, cvMode) ? CV_VIEWS[cvMode] : CV_VIEWS.document).fn(d);
   const doc = $("#cv-doc");
   doc.innerHTML = html;

@@ -831,7 +831,8 @@ def test_summarize_bundle_malformed_never_raises():
         result = sb(garbage)
         assert isinstance(result, dict)
         assert set(result) == {"patient", "composition", "sections",
-                               "unreferenced", "quality"}
+                               "unreferenced", "coverage", "quality",
+                               "as_of", "attention"}
 
 
 # ---------------------------------------------------------------- submissions API
@@ -1295,7 +1296,7 @@ def test_register_returns_company_note(client):
 # ------------------------------------------------- asserted-empty sections
 
 def test_empty_reason_codes_map_to_clinician_labels():
-    for code, label in [("nilknown", "None reported"), ("notasked", "Not asked"),
+    for code, label in [("nilknown", "None known"), ("notasked", "Not asked"),
                         ("withheld", "Information withheld"),
                         ("unavailable", "Unavailable"),
                         ("notstarted", "Not started"), ("closed", "Closed")]:
@@ -1317,7 +1318,7 @@ def test_empty_reason_display_text_is_relabelled_too():
                    {"text": "Nil known"}):
         s = app_module.summarize_bundle(json.loads(bundle_with_section(
             {"title": "S", "emptyReason": reason})))
-        assert s["sections"][0]["empty_reason"] == "None reported", reason
+        assert s["sections"][0]["empty_reason"] == "None known", reason
 
 
 def test_empty_reason_is_only_reported_when_the_section_is_actually_empty():
@@ -1338,7 +1339,7 @@ def test_asserted_empty_section_is_distinguishable_from_an_absent_one():
     asserted = app_module.summarize_bundle(json.loads(bundle_with_section(
         {"title": "Allergies", "emptyReason": {"coding": [{"code": "nilknown"}]}})))
     assert [x["title"] for x in asserted["sections"]] == ["Allergies"]
-    assert asserted["sections"][0]["empty_reason"] == "None reported"
+    assert asserted["sections"][0]["empty_reason"] == "None known"
     absent = app_module.summarize_bundle(json.loads(bundle()))
     assert absent["sections"] == []
 
@@ -2383,7 +2384,7 @@ def test_care_plan_shows_the_activity_not_the_plan(client):
     assert plans, [i.get("label") for i in items]
     plan = plans[0]
     assert plan["status"] == "cancelled"
-    assert "plan since" in plan["detail"]
+    assert "plan start" in plan["detail"]
     assert plan["note"]
 
 
@@ -2434,6 +2435,606 @@ def test_a_period_with_only_an_end_is_not_a_start():
         "resourceType": "DeviceUseStatement", "id": "d4", "status": "active",
         "device": {"display": "Hearing aid"}}))
     assert nothing[0]["detail"] is None
+
+
+def test_each_date_is_labelled_with_what_it_is():
+    allergy = _items(_doc("48765-2", "Allergies", {
+        "resourceType": "AllergyIntolerance", "id": "a", "criticality": "high",
+        "code": {"text": "Penicillin"}, "onsetDateTime": "1972-06-18",
+        "recordedDate": "2020-01-02", "lastOccurrence": "2019-05-05"}))[0]
+    assert (allergy["date"], allergy["date_kind"]) == ("1972-06-18", "onset")
+    assert allergy["dates"] == [
+        {"kind": "onset", "value": "1972-06-18"},
+        {"kind": "last reaction", "value": "2019-05-05"},
+        {"kind": "recorded", "value": "2020-01-02"}]
+    plan = _items(_doc("18776-5", "Plan of care", {
+        "resourceType": "CarePlan", "id": "cp", "status": "active", "intent": "plan",
+        "period": {"start": "2026-06-12"},
+        "activity": [{"detail": {"status": "scheduled"}}]}))[0]
+    assert plan["date_kind"] == "plan start"
+    assert "planned" in plan["flags"]
+    lab = _items(_doc("30954-2", "Results", {
+        "resourceType": "Observation", "id": "o", "status": "final",
+        "code": {"text": "HbA1c"}, "issued": "2025-12-10"}))[0]
+    assert (lab["date"], lab["date_kind"]) == ("2025-12-10", "issued")
+
+
+def test_unconfirmed_verification_is_carried():
+    item = _items(_doc("11450-4", "Problems", {
+        "resourceType": "Condition", "id": "c", "code": {"text": "Asthma"},
+        "verificationStatus": {"coding": [{"code": "unconfirmed"}]}}))[0]
+    assert item["verification"] == "unconfirmed"
+
+
+def test_anticoagulants_are_flagged_by_atc():
+    def med(atc):
+        return _items(_doc("10160-0", "Medication", {
+            "resourceType": "MedicationStatement", "id": "m", "status": "active",
+            "medicationCodeableConcept": {"coding": [
+                {"system": "http://www.whocc.no/atc", "code": atc}]}}))[0]
+    assert "anticoagulant" in med("B01AF02")["flags"]       # apixaban
+    assert "anticoagulant" not in med("B01AC06")["flags"]   # aspirin: antiplatelet
+
+
+def test_insulin_is_flagged_by_atc():
+    def med(atc):
+        return _items(_doc("10160-0", "Medication", {
+            "resourceType": "MedicationStatement", "id": "m", "status": "active",
+            "medicationCodeableConcept": {"coding": [
+                {"system": "http://www.whocc.no/atc", "code": atc}]}}))[0]
+    assert "insulin" in med("A10AE04")["flags"]       # glargine
+    assert "insulin" in med("A10AB05")["flags"]       # aspart
+    assert "insulin" not in med("A10BA02")["flags"]   # metformin
+
+
+def _plan(activity=None, **fields):
+    plan = {"resourceType": "CarePlan", "id": "cp", "status": "active",
+            "intent": "plan", "title": "Follow-up", **fields}
+    if activity is not None:
+        plan["activity"] = [{"detail": activity}]
+    return plan
+
+
+def test_a_plan_is_dated_by_its_scheduled_activity_not_its_start():
+    def plan(activity):
+        return _items(_doc("18776-5", "Plan of care", _plan(
+            activity, period={"start": "2026-06-12"})))[0]
+    due = plan({"status": "scheduled", "scheduledPeriod": {"start": "2026-09-15"}})
+    assert (due["date"], due["date_kind"]) == ("2026-09-15", "scheduled")
+    assert due["dates"] == [{"kind": "scheduled", "value": "2026-09-15"},
+                            {"kind": "plan start", "value": "2026-06-12"}]
+    assert due["detail"] == "scheduled 2026-09-15; plan start 2026-06-12"
+    text = plan({"status": "scheduled", "scheduledString": "2026-10-01"})
+    assert (text["date"], text["date_kind"]) == ("2026-10-01", "scheduled")
+    timing = plan({"status": "scheduled",
+                   "scheduledTiming": {"event": ["2026-11-02T09:00:00+01:00"]}})
+    assert (timing["date"], timing["date_kind"]) == (
+        "2026-11-02T09:00:00+01:00", "scheduled")
+    # prose is not a date to sort by, and neither is a period with no start
+    for vague in ({"status": "scheduled", "scheduledString": "next spring"},
+                  {"status": "scheduled", "scheduledString": "2026-13-45"},
+                  {"status": "scheduled", "scheduledPeriod": {"end": "2026-12-31"}},
+                  {"status": "in-progress"}):
+        item = plan(vague)
+        assert (item["date"], item["date_kind"]) == ("2026-06-12", "plan start")
+        assert item["dates"] == [{"kind": "plan start", "value": "2026-06-12"}]
+
+
+def test_a_cancelled_plan_activity_is_flagged_and_was_scheduled():
+    def plan(resource):
+        return _items(_doc("18776-5", "Plan of care", resource))[0]
+    cancelled = plan(_plan({"status": "cancelled",
+                            "scheduledPeriod": {"start": "2026-06-03"}},
+                           period={"start": "2019-01-14"}))
+    assert "cancelled" in cancelled["flags"] and "planned" not in cancelled["flags"]
+    assert (cancelled["date"], cancelled["date_kind"]) == ("2026-06-03", "was scheduled")
+    assert cancelled["dates"] == [{"kind": "was scheduled", "value": "2026-06-03"},
+                                  {"kind": "plan start", "value": "2019-01-14"}]
+    revoked = plan(_plan({"status": "scheduled"}, status="revoked"))
+    assert "cancelled" in revoked["flags"] and "planned" in revoked["flags"]
+    running = plan(_plan({"status": "in-progress"}))
+    assert "cancelled" not in running["flags"]
+
+
+def test_a_plan_names_its_owner_or_says_that_nobody_is_named():
+    def plan(resource, *others):
+        doc = _doc("18776-5", "Plan of care", resource)
+        doc["entry"] += [{"resource": other} for other in others]
+        return _items(doc)[0]
+    nobody = plan(_plan({"status": "scheduled"}))
+    assert nobody["owner"] is None and "no named owner" in nobody["gaps"]
+    performer = plan(_plan(
+        {"status": "scheduled", "performer": [{"display": "District nurse team"}]},
+        author={"display": "Dr Author"}))
+    assert performer["owner"] == "District nurse team"
+    assert "no named owner" not in performer["gaps"]
+    assert plan(_plan(author={"display": "Dr Author"},
+                      careTeam=[{"display": "Team"}]))["owner"] == "Dr Author"
+    assert plan(_plan(careTeam=[{"display": "Heart failure team"}]))["owner"] \
+        == "Heart failure team"
+    assert plan(_plan(contributor=[{"display": "Nurse Ek"}]))["owner"] == "Nurse Ek"
+    resolved = plan(
+        _plan(author={"reference": "Practitioner/dr"}),
+        {"resourceType": "Practitioner", "id": "dr",
+         "name": [{"given": ["Hanna"], "family": "Ekholm"}]})
+    assert resolved["owner"] == "Hanna Ekholm"
+    via_role = plan(
+        _plan(author={"reference": "PractitionerRole/role"}),
+        {"resourceType": "PractitionerRole", "id": "role",
+         "organization": {"reference": "Organization/org"}},
+        {"resourceType": "Organization", "id": "org", "name": "Kvarnängen"})
+    assert via_role["owner"] == "Kvarnängen"
+    dangling = plan(_plan(author={"reference": "Practitioner/elsewhere"}))
+    assert dangling["owner"] is None and "no named owner" in dangling["gaps"]
+    # only a plan has an owner to be missing
+    med = _items(_doc("10160-0", "Medication", {
+        "resourceType": "MedicationStatement", "id": "m", "status": "active"}))[0]
+    assert "owner" not in med and "no named owner" not in med["gaps"]
+
+
+def test_a_medication_says_what_kind_of_record_it_is():
+    def basis(rtype):
+        return _items(_doc("10160-0", "Medication", {
+            "resourceType": rtype, "id": "m", "status": "active",
+            "medicationCodeableConcept": {"text": "Metformin"}}))[0]["basis"]
+    assert basis("MedicationStatement") == "stated as taking"
+    assert basis("MedicationRequest") == "prescribed"
+    assert basis("MedicationDispense") == "dispensed"
+    assert basis("MedicationAdministration") == "given"
+    plan = _items(_doc("18776-5", "Plan of care", _plan()))[0]
+    assert "basis" not in plan
+
+
+def test_an_ended_medication_without_an_end_date_is_a_gap():
+    def gaps(rtype="MedicationStatement", **fields):
+        return _items(_doc("10160-0", "Medication", {
+            "resourceType": rtype, "id": "m",
+            "medicationCodeableConcept": {"text": "Sertraline"}, **fields}))[0]["gaps"]
+    assert "no stop date" in gaps(status="completed",
+                                  effectivePeriod={"start": "2021-11-20"})
+    assert "no stop date" in gaps(status="stopped", effectiveDateTime="2021-11-20")
+    assert "no stop date" not in gaps(
+        status="completed", effectivePeriod={"start": "2021-11-20", "end": "2023-05-30"})
+    assert "no stop date" not in gaps(status="active",
+                                      effectivePeriod={"start": "2021-11-20"})
+    assert "no stop date" in gaps("MedicationRequest", status="stopped")
+    # a dose given or a pack handed over is "completed" as an event, not a
+    # treatment that ended
+    assert "no stop date" not in gaps("MedicationAdministration", status="completed")
+    assert "no stop date" not in gaps("MedicationDispense", status="completed")
+
+
+def test_a_stated_stop_date_is_shown_as_one():
+    item = _items(_doc("10160-0", "Medication", {
+        "resourceType": "MedicationStatement", "id": "m", "status": "completed",
+        "medicationCodeableConcept": {"text": "Sertraline"},
+        "effectivePeriod": {"start": "2021-11-20", "end": "2023-05-30"}}))[0]
+    assert {"kind": "stopped", "value": "2023-05-30"} in item["dates"]
+
+
+def test_dates_written_into_a_note_are_pulled_out_with_their_sentence():
+    device = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d", "status": "active",
+        "device": {"display": "CGM"}, "timingPeriod": {"start": "2019-05-20"},
+        "note": [{"text": "Worn continuously. Data shared with the clinic; "
+                          "no readings uploaded since 2026-06-02."}]}))[0]
+    assert device["note_dates"] == [{
+        "value": "2026-06-02",
+        "text": "Data shared with the clinic; no readings uploaded since 2026-06-02."}]
+    plan = _items(_doc("18776-5", "Plan of care", _plan(
+        {"status": "cancelled", "scheduledPeriod": {"start": "2026-06-03T10:00:00Z"}},
+        period={"start": "2019-01-14"},
+        note=[{"text": "Appointment on 2026-06-03 was cancelled. Plan began "
+                       "2019-01-14. Last completed review 2025-12-09."}])))[0]
+    # the item's own dates are not repeated, compared by their date part
+    assert plan["note_dates"] == [
+        {"value": "2025-12-09", "text": "Last completed review 2025-12-09."}]
+    odd = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d", "status": "active",
+        "device": {"display": "Pump"},
+        "note": [{"text": "Serviced 2026-02-30 and 2026-02-27, ref 12026-01-011, "
+                          "again 2026-02-27"}]}))[0]
+    # not a real date, and digits inside a longer number are not a date
+    assert [n["value"] for n in odd["note_dates"]] == ["2026-02-27"]
+    assert odd["note_dates"][0]["text"].startswith("Serviced 2026-02-30")
+    plain = _items(_doc("46264-8", "Devices", {
+        "resourceType": "DeviceUseStatement", "id": "d", "status": "active",
+        "device": {"display": "Rollator"}, "note": [{"text": "Fitted in 2019."}]}))[0]
+    assert plain["note_dates"] == []
+    assert _items(_doc("11450-4", "Problems", {
+        "resourceType": "Condition", "id": "c"}))[0]["note_dates"] == []
+
+
+SECTION_OF_TYPE = {
+    "CarePlan": "18776-5", "DeviceUseStatement": "46264-8", "Observation": "30954-2",
+    "MedicationStatement": "10160-0", "MedicationRequest": "10160-0",
+    "MedicationDispense": "10160-0", "MedicationAdministration": "10160-0",
+}
+
+
+def _eps(*resources, date="2026-08-24", patient=None, sections=(), summary_type=True):
+    """A patient summary that files each resource under the section its type
+    belongs to; `sections` adds whole sections as they are."""
+    refs: dict = {}
+    for n, resource in enumerate(resources):
+        resource.setdefault("id", f"r{n}")
+        code = resource.pop("_section", None) or SECTION_OF_TYPE[resource["resourceType"]]
+        refs.setdefault(code, []).append(
+            {"reference": f"{resource['resourceType']}/{resource['id']}"})
+    composition = {"resourceType": "Composition", "section": [
+        {"code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+         "entry": entries} for code, entries in refs.items()] + list(sections)}
+    if summary_type:
+        composition["type"] = {"coding": [{"system": "http://loinc.org",
+                                           "code": "60591-5"}]}
+    if date:
+        composition["date"] = date
+    return {"resourceType": "Bundle", "type": "document", "entry": [
+        {"resource": composition},
+        {"resource": {"resourceType": "Patient", "id": "p", **(patient or {})}},
+        *({"resource": resource} for resource in resources)]}
+
+
+def _attention(*resources, **kwargs):
+    return app_module.summarize_bundle(_eps(*resources, **kwargs))["attention"]
+
+
+def _of_kind(attention, kind):
+    return [a for a in attention if a["kind"] == kind]
+
+
+def _lab(date, label="Creatinine [Moles/volume] in Serum or Plasma", value=71,
+         abnormal=False, **fields):
+    obs = {"resourceType": "Observation", "status": "final", "code": {"text": label},
+           "effectiveDateTime": date, **fields}
+    if value is not None:
+        obs["valueQuantity"] = {"value": value, "unit": "umol/L"}
+    if abnormal:
+        obs["interpretation"] = [{"coding": [{"code": "H"}]}]
+    return obs
+
+
+def test_as_of_is_the_date_part_of_the_composition_date():
+    as_of = lambda date: app_module.summarize_bundle(_eps(date=date))["as_of"]
+    assert as_of("2026-08-24T09:00:00+02:00") == "2026-08-24"
+    assert as_of("2026-08-24") == "2026-08-24"
+    assert as_of("2026-08") is None       # partial: not a day to count from
+    assert as_of("2026-02-31") is None
+    assert as_of(None) is None
+    assert app_module.summarize_bundle(None)["as_of"] is None
+
+
+def test_attention_is_empty_when_nothing_applies():
+    assert app_module.summarize_bundle(None)["attention"] == []
+    assert _attention(summary_type=False) == []
+    # a document that is not a patient summary is not measured against its sections
+    assert _attention(_plan({"status": "in-progress"}), summary_type=False) == []
+    entry = _attention(_plan({"status": "cancelled"}), summary_type=False)[0]
+    assert set(entry) == {"kind", "title", "detail", "date"}
+
+
+def test_attention_lists_each_cancelled_plan_first():
+    attention = _attention(
+        _lab("2025-12-09"),
+        _plan({"status": "cancelled", "scheduledPeriod": {"start": "2026-06-03"}},
+              title="Nurse follow-up", period={"start": "2019-01-14"},
+              note=[{"text": "Cancelled by the patient. Last review 2025-12-09."}]),
+        _plan(title="Old programme", status="revoked", period={"start": "2020-01-01"},
+              id="old"))
+    assert attention[0] == {
+        "kind": "cancelled", "title": "Cancelled: Nurse follow-up",
+        "detail": "Was scheduled 2026-06-03. Cancelled by the patient. "
+                  "Last review 2025-12-09.",
+        "date": "2026-06-03"}
+    # revoked with nothing scheduled: there is no "was scheduled" to claim
+    assert attention[1] == {"kind": "cancelled", "title": "Cancelled: Old programme",
+                            "detail": None, "date": "2020-01-01"}
+    # the cancelled item's note dates are not repeated as a second entry
+    assert _of_kind(attention, "noted") == []
+
+
+def test_attention_surfaces_recent_dates_noted_on_devices_and_plans():
+    def cgm(note):
+        return {"resourceType": "DeviceUseStatement", "status": "active",
+                "device": {"display": "CGM"}, "note": [{"text": note}]}
+    noted = _of_kind(_attention(
+        cgm("Worn continuously. No readings uploaded since 2026-06-02."),
+        _plan({"status": "in-progress"}, note=[{"text": "Reviewed 2026-01-15."}])),
+        "noted")
+    assert noted == [
+        {"kind": "noted", "title": "CGM", "date": "2026-06-02",
+         "detail": "No readings uploaded since 2026-06-02."},
+        {"kind": "noted", "title": "Follow-up", "date": "2026-01-15",
+         "detail": "Reviewed 2026-01-15."}]
+    edge = lambda day, **kw: _of_kind(_attention(cgm(f"Checked {day}."), **kw), "noted")
+    assert len(edge("2025-08-24")) == 1      # 365 days before the document
+    assert edge("2025-08-23") == []          # older than a year: history
+    assert len(edge("2026-08-24")) == 1
+    assert edge("2026-08-25") == []          # after the document
+    assert edge("2026-06-02", date=None) == []
+    # a date in a medication note is not a device or plan event
+    assert _of_kind(_attention({
+        "resourceType": "MedicationStatement", "status": "active",
+        "note": [{"text": "Last dose 2026-08-20."}]}), "noted") == []
+
+
+def test_attention_flags_results_older_than_the_document():
+    stale = lambda *labs, **kw: _of_kind(_attention(*labs, **kw), "stale-results")
+    assert stale(_lab("2026-07-25")) == []              # 30 days: current enough
+    assert stale(_lab("2026-08-30")) == []              # after the document
+    assert stale(_lab("2025-12-09"), date=None) == []
+    assert stale(_lab(None)) == []
+    assert stale() == []
+    recent = stale(_lab("2026-07-24"), _lab("2025-01-01"))
+    assert recent == [{
+        "kind": "stale-results", "title": "Newest results are from 2026-07-24",
+        "date": "2026-07-24",
+        "detail": "1 month before this document. They are reference values, "
+                  "not a current basis for decisions."}]
+    assert "2 months before this document. They are reference values" in stale(
+        _lab("2026-06-12"), date="2026-08-19T09:00:00+02:00")[0]["detail"]
+    assert "reference values" in stale(_lab("2026-02-25"))[0]["detail"]   # 180 days
+    old = stale(_lab("2026-02-24T08:00:00+01:00"))[0]                      # 181 days
+    assert old["title"] == "Newest results are from 2026-02-24"
+    assert old["detail"] == ("6 months before this document. "
+                             "They are out of date and need repeating.")
+    assert stale(_lab("2025-12-09"))[0]["detail"].startswith(
+        "8 months before this document. They are out of date")
+    assert stale(_lab("2023-08-01"))[0]["detail"].startswith("3 years before")
+
+
+def test_stale_results_name_the_abnormal_ones_compactly():
+    def detail(*labs):
+        return _of_kind(_attention(*labs), "stale-results")[0]["detail"]
+    assert detail(
+        _lab("2025-12-09", value=118, abnormal=True),
+        _lab("2025-12-09", "Potassium [Moles/volume] in Serum or Plasma", 4.4),
+        _lab("2025-12-09", "Hemoglobin A1c/Hemoglobin.total standardized per "
+                           "IFCC-RMP for CDT in Blood", 68, abnormal=True),
+        _lab("2025-12-09", "Albumin/Creatinine [Ratio] in Urine", 4.1, abnormal=True),
+        _lab("2025-12-09", "Mood", None, abnormal=True),
+    ).endswith("need repeating. Flagged abnormal: Creatinine 118 umol/L, "
+               "Hemoglobin A1c 68 umol/L, Albumin/Creatinine 4.1 umol/L.")
+    six = [_lab("2025-12-09", f"Analyte {n}, serum", n, abnormal=True) for n in range(6)]
+    assert detail(*six).endswith(
+        "Flagged abnormal: Analyte 0 0 umol/L, Analyte 1 1 umol/L, "
+        "Analyte 2 2 umol/L, Analyte 3 3 umol/L and 2 more.")
+    assert "abnormal" not in detail(_lab("2025-12-09"))
+
+
+def test_stale_results_are_judged_on_the_results_sections():
+    """A smoking status recorded last week does not make year-old labs current."""
+    smoking = _lab("2026-08-20", "Tobacco smoking status", None,
+                   valueString="Never smoked", _section="29762-2")
+    entry = _of_kind(_attention(_lab("2025-12-09"), smoking), "stale-results")
+    assert entry and entry[0]["date"] == "2025-12-09"
+    # with no results section at all, the observations there are stand in
+    alone = _lab("2025-12-09", _section="11329-0")
+    assert _of_kind(_attention(alone), "stale-results")[0]["date"] == "2025-12-09"
+
+
+def test_attention_says_when_the_medication_list_is_only_statements():
+    def med(rtype="MedicationStatement", **fields):
+        return {"resourceType": rtype, "status": "active",
+                "medicationCodeableConcept": {"text": "Metformin"}, **fields}
+    unreconciled = lambda *meds: _of_kind(_attention(*meds), "unreconciled")
+    entry = unreconciled(med(), med(), med())[0]
+    assert entry["title"] == "Medication list not reconciled"
+    assert entry["date"] is None
+    assert entry["detail"] == (
+        "3 entries are statements of what is taken. The document carries no "
+        "last-dose, dispensing or reconciliation date - confirm with the patient "
+        "what is actually taken and when the last dose was.")
+    assert unreconciled(med())[0]["detail"].startswith(
+        "The one entry is a statement of what is taken. The document")
+    assert unreconciled(med("MedicationRequest"))[0]["detail"].startswith(
+        "The one entry is a prescription. ")
+    assert unreconciled(med(), med("MedicationRequest"))[0]["detail"].startswith(
+        "2 entries are statements of what is taken and prescriptions. ")
+    assert unreconciled(med(), med("MedicationAdministration")) == []
+    assert unreconciled(med(), med("MedicationDispense")) == []
+    assert unreconciled() == []
+    # "no known medications" is not a list to reconcile
+    none_known = {
+        "resourceType": "MedicationStatement", "status": "active",
+        "medicationCodeableConcept": {"coding": [{
+            "system": "http://hl7.org/fhir/uv/ips/CodeSystem/absent-unknown-uv-ips",
+            "code": "no-known-medications"}]}}
+    summary = app_module.summarize_bundle(_eps(none_known))
+    assert _of_kind(summary["attention"], "unreconciled") == []
+    section = summary["sections"][0]
+    assert section["state"] == "stated-none"
+    assert section["items"][0]["assertion"] == "none-known"
+    assert section["items"][0]["gaps"] == []
+
+
+def test_attention_names_the_decisive_sections_the_document_lacks():
+    def section(code, **fields):
+        return {"code": {"coding": [{"system": "http://loinc.org", "code": code}]},
+                **fields}
+    told = {"text": {"div": "<div>Lives alone, independent.</div>"}}
+    woman = {"gender": "female", "birthDate": "2002-07-25"}
+    missing = lambda **kw: _of_kind(_attention(**kw), "missing")
+    entry = missing(patient=woman)[0]
+    assert entry["title"] == ("Not in this document: Functional status, Advance "
+                              "directives, Vital signs, Social history, "
+                              "History of pregnancy")
+    assert entry["detail"] == (
+        "Prior function, ADL and cognition unknown; limitations of treatment "
+        "unknown - not to be assumed from age or comorbidity; no weight, so "
+        "weight-based dosing cannot be checked; living situation and support "
+        "unknown; pregnancy status not stated.")
+    assert entry["sections"] == ["47420-5", "42348-3", "8716-3", "29762-2",
+                                 "10162-6"]
+    assert entry["date"] is None
+    pregnancy = lambda **kw: "History of pregnancy" in missing(**kw)[0]["title"]
+    assert not pregnancy(patient={"gender": "male", "birthDate": "2002-07-25"})
+    assert not pregnancy(patient={"gender": "female", "birthDate": "1943-02-09"})
+    assert not pregnancy(patient={"gender": "female", "birthDate": "2015-01-01"})
+    assert not pregnancy(patient={"gender": "female"})
+    assert not pregnancy(patient=woman, date=None)
+    assert pregnancy(patient={"gender": "female", "birthDate": "1970-08-25"})   # 55
+    assert not pregnancy(patient={"gender": "female", "birthDate": "1970-08-24"})
+    assert pregnancy(patient={"gender": "female", "birthDate": "2014-08-24"})   # 12
+    assert pregnancy(patient={"gender": "female", "birthDate": "1990"})
+    # a section that is there with content is not missing; one that is there
+    # and says nothing still is
+    partial = missing(patient=woman, sections=[
+        section("47420-5", **told), section("29762-2", **told),
+        section("10162-6", **told), section("42348-3", entry=[])])[0]
+    assert partial["title"] == "Not in this document: Advance directives, Vital signs"
+    assert partial["detail"] == (
+        "Limitations of treatment unknown - not to be assumed from age or "
+        "comorbidity; no weight, so weight-based dosing cannot be checked.")
+    everything = [section(code, **told)
+                  for code in ("47420-5", "42348-3", "8716-3", "29762-2", "10162-6")]
+    assert missing(patient=woman, sections=everything) == []
+    assert missing(patient=woman, summary_type=False) == []
+
+
+def test_attention_never_raises_on_malformed_clinical_resources():
+    for resource in (
+        {"resourceType": "CarePlan", "status": 7, "note": "x", "author": "me",
+         "careTeam": [None, 3, {"reference": 5}, {"display": " "}],
+         "activity": [None, {"detail": {"status": ["cancelled"], "performer": "x",
+                                        "scheduledPeriod": "soon",
+                                        "scheduledString": 5,
+                                        "scheduledTiming": {"event": [None]}}}]},
+        {"resourceType": "CarePlan", "status": "revoked", "period": {"start": 5},
+         "activity": [{"detail": {"status": "cancelled",
+                                  "scheduledTiming": {"event": "x"}}}],
+         "note": [{"text": "On 2026-99-99. And 0000-00-00."}]},
+        {"resourceType": "MedicationStatement", "status": "completed",
+         "effectivePeriod": "x", "medicationCodeableConcept": {"coding": [None, 3]}},
+        {"resourceType": "MedicationRequest", "status": "stopped",
+         "dosageInstruction": [None, {"timing": 4}, {"timing": {"repeat": []}}]},
+        {"resourceType": "MedicationRequest", "status": "stopped",
+         "dosageInstruction": 7},
+        {"resourceType": "Observation", "effectiveDateTime": "yesterday",
+         "interpretation": [{"coding": [{"code": "H"}]}]},
+        {"resourceType": "Observation", "effectiveDateTime": "2020-01-01",
+         "code": {"text": ", ["}, "valueString": "; ",
+         "interpretation": [{"coding": [{"code": "H"}]}]},
+        {"resourceType": "DeviceUseStatement", "note": [{"text": "2026-06-02"}]},
+    ):
+        for patient in ({"gender": 5, "birthDate": 7},
+                        {"gender": "female", "birthDate": "soon"}):
+            for date in ("2026-08-24", "never", None):
+                attention = _attention(dict(resource), date=date, patient=patient)
+                assert isinstance(attention, list)
+                assert all(set(a) - {"sections"}
+                           == {"kind", "title", "detail", "date"}
+                           for a in attention)
+
+
+def test_arne_sample_follow_up_is_dated_when_it_is_due(client):
+    summary = client.get("/ui/documents/arne-complex-care").json()["summary"]
+    assert summary["as_of"] == "2026-08-19"
+    plans = next(s for s in summary["sections"] if s["kind"] == "plan")["items"]
+    follow_up = next(i for i in plans if "planned" in i["flags"])
+    assert (follow_up["date"], follow_up["date_kind"]) == ("2026-09-15", "scheduled")
+    assert follow_up["dates"] == [{"kind": "scheduled", "value": "2026-09-15"},
+                                  {"kind": "plan start", "value": "2026-06-12"}]
+    # the sample plans name nobody, which is the point of the gap
+    assert all(i["owner"] is None and "no named owner" in i["gaps"] for i in plans)
+    meds = next(s for s in summary["sections"] if s["kind"] == "medication")["items"]
+    assert [i["code"] for i in meds if "insulin" in i["flags"]] == ["A10AE04"]
+    assert {i["basis"] for i in meds} == {"stated as taking"}
+    attention = summary["attention"]
+    assert [a["kind"] for a in attention] == ["stale-results", "unreconciled", "missing"]
+    assert attention[0]["title"] == "Newest results are from 2026-06-12"
+    assert attention[0]["detail"].startswith("2 months before this document.")
+    assert "Creatinine 118 umol/L" in attention[0]["detail"]
+    assert attention[0]["detail"].endswith("and 2 more.")
+    assert attention[1]["detail"].startswith("10 entries are statements")
+    assert attention[2]["title"] == ("Not in this document: Functional status, "
+                                     "Advance directives, Vital signs, Social history")
+    assert "pregnancy" not in attention[2]["title"].lower()
+
+
+def test_andrea_sample_attention_tier_carries_what_went_quiet(client):
+    summary = client.get("/ui/documents/andrea-cross-border").json()["summary"]
+    assert summary["as_of"] == "2026-08-24"
+    plans = next(s for s in summary["sections"] if s["kind"] == "plan")["items"]
+    follow_up = next(i for i in plans if "cancelled" in i["flags"])
+    assert (follow_up["date"], follow_up["date_kind"]) == ("2026-06-03", "was scheduled")
+    assert follow_up["note_dates"] == [
+        {"value": "2025-12-09", "text": "Last completed review 2025-12-09."}]
+    device = next(s for s in summary["sections"] if s["kind"] == "device")["items"][0]
+    assert device["note_dates"] == [{
+        "value": "2026-06-02",
+        "text": "Data shared with the diabetes clinic in Uppsala; "
+                "no readings uploaded since 2026-06-02."}]
+    meds = next(s for s in summary["sections"] if s["kind"] == "medication")["items"]
+    assert sorted(i["code"] for i in meds if "insulin" in i["flags"]) == [
+        "A10AB05", "A10AE06"]
+    attention = summary["attention"]
+    assert [a["kind"] for a in attention] == [
+        "cancelled", "noted", "stale-results", "unreconciled", "missing"]
+    cancelled, noted, stale, unreconciled, missing = attention
+    assert cancelled["title"].startswith("Cancelled: Digital follow-up")
+    assert cancelled["date"] == "2026-06-03"
+    assert cancelled["detail"].startswith("Was scheduled 2026-06-03. Appointment on")
+    assert noted["date"] == "2026-06-02"
+    assert noted["title"] == "Continuous glucose monitoring system"
+    assert stale["title"] == "Newest results are from 2025-12-09"
+    assert stale["detail"].startswith(
+        "8 months before this document. They are out of date and need repeating.")
+    assert unreconciled["detail"].startswith("4 entries are statements")
+    assert missing["title"].endswith("History of pregnancy")
+
+
+def test_no_known_and_no_info_statements_are_told_apart():
+    def allergy(system, code):
+        doc = _doc("48765-2", "Allergies", {
+            "resourceType": "AllergyIntolerance", "id": "a",
+            "code": {"coding": [{"system": system, "code": code}]}})
+        doc["entry"][0]["resource"]["type"] = {"coding": [{"code": "60591-5"}]}
+        return app_module.summarize_bundle(doc)
+    ips = "http://hl7.org/fhir/uv/ips/CodeSystem/absent-unknown-uv-ips"
+    stated = allergy("http://snomed.info/sct", "716186003")
+    item = stated["sections"][0]["items"][0]
+    assert item["assertion"] == "none-known"
+    assert item["gaps"] == []          # no reaction or criticality to be missing
+    assert stated["sections"][0]["state"] == "stated-none"
+    assert allergy(ips, "no-known-allergies")["sections"][0]["state"] == "stated-none"
+    no_info = allergy(ips, "no-allergy-info")
+    assert no_info["sections"][0]["items"][0]["assertion"] == "no-info"
+    assert no_info["sections"][0]["state"] == "missing"
+
+
+def test_coverage_counts_against_every_eps_section():
+    doc = json.loads(bundle_with_section(
+        {"title": "Allergies", "code": {"coding": [{"code": "48765-2"}]},
+         "emptyReason": {"coding": [{"code": "nilknown"}]}},
+        {"title": "Problems", "code": {"coding": [{"code": "11450-4"}]},
+         "entry": [{"reference": "urn:uuid:res-0"}]},
+        {"title": "Procedures", "code": {"coding": [{"code": "47519-4"}]},
+         "emptyReason": {"coding": [{"code": "unavailable"}]}},
+        resources=1))
+    assert app_module.summarize_bundle(doc)["coverage"] is None  # not a summary
+    doc["entry"][0]["resource"]["type"] = {"coding": [{"code": "60591-5"}]}
+    cov = {c["code"]: c for c in app_module.summarize_bundle(doc)["coverage"]}
+    assert len(cov) == 17
+    assert cov["48765-2"]["state"] == "none-known"
+    assert cov["11450-4"]["state"] == "data"
+    assert cov["47519-4"]["state"] == "missing"
+    assert cov["10160-0"] == {"code": "10160-0", "name": "Medication summary",
+                              "required": True, "state": "absent"}
+    assert cov["47420-5"]["state"] == "absent"   # functional status
+    assert cov["42348-3"]["name"] == "Advance directives"
+
+
+def test_advance_directives_are_not_a_care_plan():
+    assert app_module._section_kind(
+        {"code": {"coding": [{"code": "42348-3"}]}}, "") == "directive"
+
+
+def test_samples_label_future_ehds_scenarios(client):
+    entries = {e["id"]: e for e in param_entries(client.get("/fhir/$samples"))}
+    assert "2029" in entries["andrea-cross-border"]["horizon"]
+    assert "2031" in entries["arne-complex-care"]["horizon"]
+    assert "apixaban" in entries["arne-complex-care"]["scenario"]
 
 
 def test_notes_are_surfaced_and_normalised():
