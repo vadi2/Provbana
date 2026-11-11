@@ -832,7 +832,8 @@ def test_summarize_bundle_malformed_never_raises():
         assert isinstance(result, dict)
         assert set(result) == {"patient", "composition", "sections",
                                "unreferenced", "coverage", "quality",
-                               "as_of", "attention", "source"}
+                               "as_of", "attention", "source",
+                               "care_teams", "dosing"}
 
 
 # ---------------------------------------------------------------- submissions API
@@ -2848,10 +2849,10 @@ def test_attention_surfaces_recent_dates_noted_on_devices_and_plans():
         _plan({"status": "in-progress"}, note=[{"text": "Reviewed 2026-01-15."}])),
         "noted")
     assert noted == [
-        {"kind": "noted", "title": "CGM", "date": "2026-06-02",
-         "detail": "No readings uploaded since 2026-06-02."},
-        {"kind": "noted", "title": "Follow-up", "date": "2026-01-15",
-         "detail": "Reviewed 2026-01-15."}]
+        {"kind": "noted", "title": "No readings uploaded since 2026-06-02.",
+         "date": "2026-06-02", "detail": "Device: CGM"},
+        {"kind": "noted", "title": "Reviewed 2026-01-15.", "date": "2026-01-15",
+         "detail": "Care plan: Follow-up"}]
     edge = lambda day, **kw: _of_kind(_attention(cgm(f"Checked {day}."), **kw), "noted")
     assert len(edge("2025-08-24")) == 1      # 365 days before the document
     assert edge("2025-08-23") == []          # older than a year: history
@@ -2899,14 +2900,14 @@ def test_stale_results_name_the_abnormal_ones_compactly():
                            "IFCC-RMP for CDT in Blood", 68, abnormal=True),
         _lab("2025-12-09", "Albumin/Creatinine [Ratio] in Urine", 4.1, abnormal=True),
         _lab("2025-12-09", "Mood", None, abnormal=True),
-    ).endswith("need repeating. Flagged abnormal: Creatinine 118 umol/L, "
-               "Hemoglobin A1c 68 umol/L, Albumin/Creatinine 4.1 umol/L.")
+    ).endswith("need repeating. Flagged abnormal: Creatinine 118 µmol/L (high), "
+               "Hemoglobin A1c 68 µmol/L (high), Albumin/Creatinine 4.1 µmol/L (high).")
     six = [_lab("2025-12-09", f"Analyte {n}, serum", n, abnormal=True) for n in range(6)]
     # every one of them: the result folded into "and 2 more" is as good as unsent
     assert detail(*six).endswith(
-        "Flagged abnormal: Analyte 0 0 umol/L, Analyte 1 1 umol/L, "
-        "Analyte 2 2 umol/L, Analyte 3 3 umol/L, Analyte 4 4 umol/L, "
-        "Analyte 5 5 umol/L.")
+        "Flagged abnormal: Analyte 0 0 µmol/L (high), Analyte 1 1 µmol/L (high), "
+        "Analyte 2 2 µmol/L (high), Analyte 3 3 µmol/L (high), "
+        "Analyte 4 4 µmol/L (high), Analyte 5 5 µmol/L (high).")
     assert "abnormal" not in detail(_lab("2025-12-09"))
 
 
@@ -3052,9 +3053,25 @@ def test_arne_sample_follow_up_is_dated_when_it_is_due(client):
     assert [a["kind"] for a in attention] == ["stale-results", "unreconciled", "missing"]
     assert attention[0]["title"] == "Newest results are from 2026-06-12"
     assert attention[0]["detail"].startswith("2 months before this document.")
-    assert "Creatinine 118 umol/L" in attention[0]["detail"]
-    assert "1840 ng/L" in attention[0]["detail"]     # NT-proBNP, not "and 2 more"
-    assert "12.4 ug/L" in attention[0]["detail"]     # PSA
+    assert "Creatinine 118 µmol/L (high)" in attention[0]["detail"]
+    assert "46 mL/min/1.73 m2 (low)" in attention[0]["detail"]
+    assert "1840 ng/L (high)" in attention[0]["detail"]   # NT-proBNP, not "and 2 more"
+    # the PSA is older than the newest result, so it carries its own date
+    assert "12.4 µg/L (high, 2026-05-04)" in attention[0]["detail"]
+    assert summary["dosing"] == {
+        "renal": {"name": "eGFR", "value": "46 mL/min/1.73 m2", "direction": "low",
+                  "date": "2026-06-12"},
+        "weight": None}
+    assert summary["patient"]["languages"] == ["Swedish"]
+    assert summary["care_teams"] == []
+    hb = next(i for s in summary["sections"] for i in s["items"]
+              if i.get("code") == "718-7")
+    assert (hb["short"], hb["direction"], hb["range"], hb["performer"]) == (
+        "Hemoglobin (blood)", "low", "134-170 g/L",
+        "Klinisk kemi, Länssjukhuset Söderås")
+    potassium = next(i for s in summary["sections"] for i in s["items"]
+                     if i.get("code") == "2823-3")
+    assert "direction" not in potassium and potassium["range"] == "3.5-4.6 mmol/L"
     assert attention[1]["detail"].startswith("10 entries are statements")
     problems = next(s for s in summary["sections"] if s["kind"] == "problem")["items"]
     assert [i["code"] for i in problems if "high risk" in i["flags"]] == ["88805009"]
@@ -3102,11 +3119,14 @@ def test_andrea_sample_attention_tier_carries_what_went_quiet(client):
     assert cancelled["date"] == "2026-06-03"
     assert cancelled["detail"].startswith("Was scheduled 2026-06-03. Appointment on")
     assert noted["date"] == "2026-06-02"
-    assert noted["title"] == "Continuous glucose monitoring system"
+    assert noted["title"] == ("Data shared with the diabetes clinic in Uppsala; "
+                              "no readings uploaded since 2026-06-02.")
+    assert noted["detail"] == "Device: Continuous glucose monitoring system"
     assert stale["title"] == "Newest results are from 2025-12-09"
     assert stale["detail"].startswith(
         "8 months before this document. They are out of date and need repeating.")
-    assert unreconciled["detail"].startswith("4 entries are statements")
+    # the sertraline stopped in 2023 is not part of what is taken now
+    assert unreconciled["detail"].startswith("3 entries are statements")
     assert missing["title"].endswith("History of pregnancy")
 
 
@@ -5545,3 +5565,91 @@ def test_an_unreachable_smtp_server_is_a_failed_send_not_a_crash(monkeypatch):
     monkeypatch.setattr(monitor, "SMTP_PORT", port)
     monkeypatch.setattr(monitor, "MAIL_TO", "organiser@example.org")
     assert monitor.send_mail("test", "hello") is False
+
+
+# ---------------------------------------------------------------- QA round 2
+
+def _sample(name):
+    return app_module.summarize_bundle(
+        json.load(open(os.path.join(os.path.dirname(app_module.__file__),
+                                    "samples", f"{name}.json"))))
+
+
+def test_units_read_as_people_write_them():
+    unit = app_module._unit_text
+    assert unit("umol/L") == "µmol/L"
+    assert unit("ug/L") == "µg/L"
+    assert unit("ukat/L") == "µkat/L"
+    assert unit("mL/min/{1.73_m2}") == "mL/min/1.73 m2"
+    assert unit("mmol/mol") == "mmol/mol"       # no "u" to turn into a micro sign
+    assert unit("units") == "units"
+    assert unit("10*9/L") == "×10^9/L"
+
+
+def test_ville_plans_carry_their_steps_owner_and_alert_link():
+    summary = _sample("ville-difficult-airway")
+    plans = {i["label"].split(" ")[0]: i
+             for i in next(s for s in summary["sections"] if s["kind"] == "plan")["items"]}
+    airway, infection, visit = (plans["Luftvägsplan"], plans["Infektionsplan"],
+                                plans["Återbesök"])
+    # five standing instructions are not "the" status of the plan
+    assert airway["status"] == "active"
+    assert [s["status"] for s in airway["steps"]] == ["not-started"] * 5
+    assert "barnanestesiolog" in airway["steps"][0]["text"]
+    assert (airway["owner"], airway["owner_phone"]) == (
+        "Dr Johan Lindberg", "+46 8 000 00 11")
+    assert airway["flags"] == ["plan for alert"]
+    assert [s["status"] for s in infection["steps"]] == ["in-progress"] * 3
+    assert infection["flags"] == ["plan for alert"]
+    # a single activity is the plan itself, not a list of one
+    assert visit["steps"] == [] and visit["status"] == "scheduled"
+    assert visit["flags"] == ["planned"]
+    alerts = next(s for s in summary["sections"] if s["kind"] == "alert")["items"]
+    assert alerts[0]["covers"] == ["Svår intubation", "Svår maskventilation",
+                                   "Freeman-Sheldons syndrom", "Nedsatt gapförmåga"]
+    assert alerts[2]["covers"] == ["Återkommande nedre luftvägsinfektioner"]
+
+
+def test_ville_care_team_language_and_minor_specific_gaps():
+    summary = _sample("ville-difficult-airway")
+    team = summary["care_teams"][0]
+    assert team["name"] == "Villes vårdteam på Karolinska"
+    assert team["phone"] == "+46 8 000 00 10"
+    assert "barnanestesijouren +46 8 000 00 11" in team["note"]
+    assert team["members"][:2] == [
+        {"name": "Dr Hanna Ekholm", "role": "Barnreumatolog, patientansvarig läkare",
+         "phone": "+46 8 000 00 10"},
+        {"name": "Dr Johan Lindberg",
+         "role": "Barnanestesiolog, ansvarig för luftvägsplanen",
+         "phone": "+46 8 000 00 11"}]
+    assert summary["patient"]["languages"] == ["Swedish"]
+    missing = next(a for a in summary["attention"] if a["kind"] == "missing")
+    # nobody expects an advance directive from a 13-year-old
+    assert missing["title"] == ("Not in this document: Functional status, "
+                                "Vital signs, Social history")
+    assert "limitations of treatment" not in missing["detail"]
+    assert "only as far as the care plan or patient story says" in missing["detail"]
+    # no eGFR in the document, so the creatinine stands in
+    assert summary["dosing"]["renal"]["name"] == "Creatinine"
+    assert summary["dosing"]["weight"] is None
+
+
+def test_stopped_medicines_are_not_counted_as_unreconciled():
+    def med(status):
+        return {"resourceType": "MedicationStatement", "status": status,
+                "medicationCodeableConcept": {"text": "Metformin"}}
+    entry = _of_kind(_attention(med("active"), med("active"), med("completed"),
+                                med("stopped")), "unreconciled")[0]
+    assert entry["detail"].startswith("2 entries are statements")
+
+
+def test_a_result_says_which_way_it_is_off_and_against_what():
+    lab = _lab("2026-08-01", value=118, abnormal=True, referenceRange=[
+        {"low": {"value": 60, "unit": "umol/L"}, "high": {"value": 105, "unit": "umol/L"}}],
+        performer=[{"display": "Klinisk kemi"}])
+    item = _items(_eps(lab))[0]
+    assert (item["direction"], item["range"], item["performer"]) == (
+        "high", "60-105 µmol/L", "Klinisk kemi")
+    assert item["detail"].startswith("118 µmol/L")
+    plain = _items(_eps(_lab("2026-08-01")))[0]
+    assert not plain.get("direction") and not plain.get("range")
