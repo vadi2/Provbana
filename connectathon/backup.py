@@ -55,9 +55,10 @@ DEFAULT_BACKUPS = os.environ.get("BACKUP_DIR") or os.path.join(HERE, "backups")
 DB_NAME = "connectathon.db"
 TREES = ("submissions", "renderings")
 STAMP = "%Y%m%dT%H%M%SZ"
-# 15-minute snapshots for 24 hours. An event day is shorter than that, so the
-# pruner never reaches back past the start of the day it is protecting.
-DEFAULT_KEEP = 96
+# 15-minute snapshots for four days, so a mistake noticed days into a multi-day
+# event can still be undone. The trees are hard-linked, so each snapshot costs
+# one database copy.
+DEFAULT_KEEP = 384
 DEFAULT_EVERY = 900
 
 
@@ -286,7 +287,7 @@ def main():
     ap.add_argument("--data-dir", default=DEFAULT_DATA)
     ap.add_argument("--backup-dir", default=DEFAULT_BACKUPS)
     ap.add_argument("--keep", type=int, default=DEFAULT_KEEP,
-                    help="snapshots to retain (default %d = 24h at 15 min)"
+                    help="snapshots to retain (default %d = 96h at 15 min)"
                          % DEFAULT_KEEP)
     ap.add_argument("--loop", action="store_true",
                     help="keep running, snapshotting every --every seconds")

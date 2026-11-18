@@ -98,12 +98,12 @@ Start it beside the service and leave it running for the whole event:
 ```
 
 ```
-18:32:22  snapshotting ./data into /home/.../connectathon/backups every 900s, keeping 96
+18:32:22  snapshotting ./data into /home/.../connectathon/backups every 900s, keeping 384
 18:32:22  snapshot 20260902T183222Z - 21 files, 641.0 KB
 ```
 
-That is a snapshot every 15 minutes, keeping the last 96 - a day's worth, so the
-pruner never reaches back past the start of the day it is protecting. A bad run
+That is a snapshot every 15 minutes, keeping the last 384 - four days' worth, so
+a mistake noticed days into the event can still be undone. A bad run
 is logged as `SNAPSHOT FAILED` and the loop carries on; a backup loop that dies
 on one error stops silently and nobody notices until the restore is needed.
 
@@ -226,7 +226,7 @@ is the whole procedure.
 |---|---|---|
 | `--loop` | off | Keep running, snapshotting every `--every` seconds |
 | `--every N` | `900` | Seconds between snapshots in `--loop` |
-| `--keep N` | `96` | Snapshots to retain (96 = 24h at 15 min) |
+| `--keep N` | `384` | Snapshots to retain (384 = 96h at 15 min) |
 | `--list` | | Show what has been kept, with counts |
 | `--restore NAME` | | Put a snapshot back; `NAME` or `LATEST` |
 | `--yes` | off | Required by `--restore`; without it, nothing is touched |
