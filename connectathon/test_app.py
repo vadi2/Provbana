@@ -3896,6 +3896,12 @@ def page_script(client):
     return max(blocks, key=len)
 
 
+def page_function(js, name):
+    """One top-level function out of the page script, through its closing brace."""
+    start = js.index("function %s(" % name)
+    return js[start:js.index("\n}", start) + 2]
+
+
 def run_locator(client, doc, cases):
     """Resolve validator locations with the page's own code, in node.
 
@@ -3904,10 +3910,7 @@ def run_locator(client, doc, cases):
     Returns one [json path, line number, line text, readable label] per case.
     """
     js = page_script(client)
-    parts = []
-    for name in LOCATOR_FUNCS:
-        start = js.index("function %s(" % name)
-        parts.append(js[start:js.index("\n}", start) + 2])
+    parts = [page_function(js, name) for name in LOCATOR_FUNCS]
     proc = subprocess.run(["node", "-e", "\n".join(parts) + HARNESS],
                           input=json.dumps([doc, cases]),
                           capture_output=True, text=True, timeout=60)
@@ -4011,9 +4014,7 @@ def run_explain(client, groups, severity, reported):
         parts.append(js[start:end + 3])
     # explainPrompt reads it; the page sets it from X-Document-Type per submission.
     parts.append('let explainDoc = "eps";\n')
-    for name in ("explainPrompt", "explainUrl"):
-        start = js.index("function %s(" % name)
-        parts.append(js[start:js.index("\n}", start) + 2])
+    parts += [page_function(js, name) for name in ("explainPrompt", "explainUrl")]
     proc = subprocess.run(["node", "-e", "\n".join(parts) + EXPLAIN_HARNESS],
                           input=json.dumps([groups, severity, reported]),
                           capture_output=True, text=True, timeout=60)
@@ -4938,6 +4939,34 @@ def test_the_stored_category_is_the_one_the_bundle_was_scored_as(client, monkeyp
     # The download is named for what it is, not for what the event started as.
     dl = client.get("/fhir/Bundle/%d" % row["id"])
     assert "-imaging.json" in dl.headers["content-disposition"]
+
+
+@needs_node
+def test_the_clinical_list_reads_the_category_the_api_sends(client, monkeypatch):
+    """The company list's Document column, end to end: the real $submissions
+    entry through the page's own submissionRow and cvListRow. A renamed key
+    anywhere along that path would otherwise fill the column with "undefined",
+    and a dropped cell would shift every column left, with every test green."""
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("imaging"))
+    entry = param_entries(client.get("/fhir/$submissions"))[0]
+    js = page_script(client)
+    parts = []
+    for decl in ("const esc = ", "let DOC_LABELS = ", "const docLabel = "):
+        start = js.index(decl)
+        parts.append(js[start:js.index(";\n", start) + 2])
+    parts += [page_function(js, name) for name in ("submissionRow", "cvListRow")]
+    harness = ('const entry = JSON.parse(require("fs").readFileSync(0, "utf8"));\n'
+               'console.log(cvListRow(submissionRow(entry)));')
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + harness],
+                          input=json.dumps(entry),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    row = proc.stdout
+    assert "<td>Imaging Report</td>" in row
+    header = page_function(js, "renderCvList")
+    assert '<th scope="col">Document</th>' in header
+    assert row.count("<td>") == header.count('<th scope="col">')
 
 
 def test_an_old_database_gains_the_category_column_as_a_patient_summary(tmp_path,
