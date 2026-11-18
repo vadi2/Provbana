@@ -249,6 +249,19 @@ def docref(slug, image, note=None, mime="image/png"):
     return body
 
 
+def post_shot(client, token, slug="producer", context=None):
+    """Upload a screenshot, naming the document it shows when context is given."""
+    body = docref(slug, png_bytes())
+    if context is not None:
+        body["context"] = context
+    return client.post("/fhir/DocumentReference", json=body,
+                       headers={"X-Team-Token": token})
+
+
+def related_to(bundle_id):
+    return {"related": [{"reference": "Bundle/%d" % bundle_id}]}
+
+
 def consume_first_pass(client, monkeypatch):
     """Burn the global first pass bonus so scoring asserts stay clean."""
     tok = register(client, "First Pass Sink")
@@ -3427,6 +3440,167 @@ def test_a_rendering_stays_pinned_to_the_document_it_was_taken_from(client, monk
     assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 0   # of the new one
 
 
+def exchange_by_type(client, slug):
+    return {e["documentType"]: e for e in param_entries(client.get("/fhir/$exchange"))
+            if e["organizationSlug"] == slug}
+
+
+def test_every_document_type_a_company_passes_is_published(client, monkeypatch):
+    """One entry per company per type, the patient summary first - a lab report
+    passed alongside it is as much a test document for partners as it is."""
+    tok_p, _ = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("imaging"))
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_p, outcome(errors=1), monkeypatch,
+           body=secondary_bundle("hdr"))                  # failed: not published
+    listing = [e for e in param_entries(client.get("/fhir/$exchange"))
+               if e["organizationSlug"] == "producer"]
+    # registry order, not submission order
+    assert [e["documentType"] for e in listing] == ["eps", "laboratory", "imaging"]
+    assert len({e["id"] for e in listing}) == 3
+    for entry in listing:
+        assert entry["bundle"] == "/fhir/Bundle/%d" % entry["id"]
+
+
+def test_document_takes_a_type_and_defaults_to_the_patient_summary(client, monkeypatch):
+    tok_p, _ = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    published = exchange_by_type(client, "producer")
+
+    res = client.get("/fhir/Organization/producer/$document?type=laboratory")
+    assert res.status_code == 200
+    assert res.headers["content-location"] == "/fhir/Bundle/%d" % published["laboratory"]["id"]
+    assert res.headers["content-disposition"] == 'attachment; filename="producer-laboratory.json"'
+    assert json.loads(res.content) == json.loads(secondary_bundle("laboratory"))
+
+    # no type is what every script written before today asks for
+    for query in ("", "?type=eps"):
+        res = client.get("/fhir/Organization/producer/$document" + query)
+        assert res.headers["content-location"] == "/fhir/Bundle/%d" % published["eps"]["id"]
+
+    res = client.get("/fhir/Organization/producer/$document?type=hdr")
+    assert res.status_code == 404
+    assert diagnostics(res) == "Company has no valid Hospital Discharge Report yet"
+    res = client.get("/fhir/Organization/producer/$document?type=pdf")
+    assert res.status_code == 400
+    assert "$documents" in diagnostics(res)
+
+
+def test_a_screenshot_can_name_the_document_it_shows(client, monkeypatch):
+    """Without it every screenshot lands on the patient summary, whichever of a
+    company's documents was actually loaded."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    lab = exchange_by_type(client, "producer")["laboratory"]["id"]
+    res = post_shot(client, tok_c, context=related_to(lab))
+    assert res.status_code == 201, res.text
+    assert related_bundle(res.json()) == lab
+    counts = {t: e["renderings"] for t, e in exchange_by_type(client, "producer").items()}
+    assert counts == {"eps": 0, "laboratory": 1}
+
+
+def test_a_screenshot_of_an_earlier_document_still_lands_on_it(client, monkeypatch):
+    """The uploader may have loaded it before the company beat it. It is still
+    the bytes they opened, so that is where the picture belongs."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    first = exchange_by_type(client, "producer")["eps"]["id"]
+    submit(client, tok_p, outcome(), monkeypatch, body=bundle(sections=4, resources=10))
+    assert exchange_by_type(client, "producer")["eps"]["id"] != first
+    res = post_shot(client, tok_c, context=related_to(first))
+    assert res.status_code == 201, res.text
+    assert related_bundle(res.json()) == first
+
+
+@pytest.mark.parametrize("context, status", [
+    ({"related": [{"reference": "Bundle/abc"}]}, 400),
+    ({"related": [{"reference": "Patient/1"}]}, 400),
+    ({"related": [{"reference": "Bundle/" + "9" * 30}]}, 400),
+    ({"related": [{"reference": "Bundle/\u0661"}]}, 400),   # an Arabic-Indic one
+    ({"related": []}, 400),
+    ({"related": "Bundle/1"}, 400),
+    ("Bundle/1", 400),
+    ({"related": [{"reference": "Bundle/99999"}]}, 404),
+    ({"related": [{"reference": "https://elsewhere.example/fhir/Bundle/1"}]}, 400),
+])
+def test_a_screenshot_naming_no_usable_document_is_refused(client, monkeypatch, context, status):
+    """Falling back to the published document would pin the picture to one
+    nobody said they loaded - the mistake naming one is there to prevent."""
+    _, tok_c = interop_setup(client, monkeypatch)
+    res = post_shot(client, tok_c, context=context)
+    assert res.status_code == status, res.text
+    assert not os.path.exists(os.path.join(client.data_dir, "renderings"))
+
+
+def test_a_screenshot_must_name_a_valid_document_of_the_custodian(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_t = register(client, "Third")
+    submit(client, tok_t, outcome(), monkeypatch)
+    submit(client, tok_p, outcome(errors=1), monkeypatch,
+           body=secondary_bundle("laboratory"))
+    subs = param_entries(client.get("/fhir/$submissions"))
+    third_doc = next(e["id"] for e in subs if e["organizationSlug"] == "third")
+    failed_lab = next(e["id"] for e in subs if e["organizationSlug"] == "producer"
+                      and e["documentType"] == "laboratory")
+    for bundle_id in (third_doc, failed_lab):
+        res = post_shot(client, tok_c, context=related_to(bundle_id))
+        assert res.status_code == 404, bundle_id
+        assert diagnostics(res) == "Bundle/%d is not a valid document of Producer" % bundle_id
+
+
+def test_a_screenshot_with_no_related_still_goes_to_the_patient_summary(client, monkeypatch):
+    """What every script written against the old contract sends."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    eps = exchange_by_type(client, "producer")["eps"]["id"]
+    for context in (None, {}):
+        res = post_shot(client, tok_c, context=context)
+        assert res.status_code == 201, res.text
+        assert related_bundle(res.json()) == eps
+
+
+def test_a_screenshot_can_name_its_document_by_the_exchange_bundle_url(client, monkeypatch):
+    """The `bundle` part of an $exchange entry is the obvious thing to paste."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    lab = exchange_by_type(client, "producer")["laboratory"]
+    res = post_shot(client, tok_c, context={"related": [{"reference": lab["bundle"]}]})
+    assert res.status_code == 201, res.text
+    assert related_bundle(res.json()) == lab["id"]
+
+
+def test_a_newer_lab_report_replaces_the_published_one(client, monkeypatch):
+    """Every category but the patient summary scores a flat amount, so its
+    score cannot say which is better. The newest valid one is the team's
+    current version - otherwise a lab report they fixed would never show."""
+    tok_p, _ = interop_setup(client, monkeypatch)
+    for _ in range(2):
+        submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_p, outcome(errors=1), monkeypatch,
+           body=secondary_bundle("laboratory"))               # newest, but failed
+    labs = [e["id"] for e in param_entries(client.get("/fhir/$submissions?organization=producer"))
+            if e["documentType"] == "laboratory" and e["pass"]]
+    listing = [e for e in param_entries(client.get("/fhir/$exchange"))
+               if e["documentType"] == "laboratory"]
+    assert [e["id"] for e in listing] == [max(labs)]
+    res = client.get("/fhir/Organization/producer/$document?type=laboratory")
+    assert res.headers["content-location"] == "/fhir/Bundle/%d" % max(labs)
+
+
+def test_a_retired_document_type_is_never_handed_out(client, monkeypatch):
+    """A row whose category the service no longer lists is off $exchange, so a
+    request naming no type must not serve it either - nor pin a screenshot to
+    it - when the team has nothing else."""
+    _, tok_c = interop_setup(client, monkeypatch)
+    tok_r = register(client, "Retired")
+    submit(client, tok_r, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    with app_module.connect() as conn:
+        conn.execute("UPDATE submissions SET doc_type = 'withdrawn-guide' "
+                     "WHERE team_id = (SELECT id FROM teams WHERE slug = 'retired')")
+    assert exchange_by_type(client, "retired") == {}
+    assert client.get("/fhir/Organization/retired/$document").status_code == 404
+    assert post_shot(client, tok_c, slug="retired").status_code == 404
+
+
 def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     tok_d = register(client, "Third")
@@ -4968,6 +5142,105 @@ def test_the_clinical_list_reads_the_category_the_api_sends(client, monkeypatch)
     header = page_function(js, "renderCvList")
     assert '<th scope="col">Document</th>' in header
     assert row.count("<td>") == header.count('<th scope="col">')
+
+
+@needs_node
+def test_each_published_document_gets_its_own_card_and_screenshots(client, monkeypatch):
+    """Two cards from one company share a slug, so anything keyed by it would
+    open the wrong form or upload against the wrong document. The real
+    $exchange entries go through the page's own partnerRow, partnerCard and
+    uploadShot, and the upload has to name the card's document."""
+    tok_p, _ = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    entries = param_entries(client.get("/fhir/$exchange"))
+    by_type = {e["documentType"]: e["id"] for e in entries}
+    js = page_script(client)
+    parts = ["let me = null; const maxNote = 500;"]
+    for decl in ("const esc = ", "let DOC_LABELS = ", "const docLabel = "):
+        start = js.index(decl)
+        parts.append(js[start:js.index(";\n", start) + 2])
+    parts += [page_function(js, name) for name in (
+        "partnerRow", "shotCountLabel", "documentPath", "partnerCard", "uploadShot")]
+    harness = r"""
+const entries = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const cards = entries.map(partnerRow).map(partnerCard);
+const sent = [];
+const lab = String(entries.find((e) => e.documentType === "laboratory").id);
+const el = (extra) => Object.assign({value: "", disabled: false, hidden: true,
+  classList: {toggle() {}}}, extra);
+const form = el({
+  closest: () => ({dataset: {slug: "producer"}}),
+  querySelector: (s) => s === "input[type=file]" ? el({files: [{size: 1}]})
+    : s === "textarea" ? el({value: "lab came through"}) : el({}),
+});
+const document = {querySelector: (s) => s === '[data-form="' + lab + '"]' ? form : null};
+const $ = () => ({value: "tok"});
+const shrinkImage = async (f) => ({type: "image/png"});
+const blobToBase64 = async () => "AAAA";
+const shotFromDocRef = () => ({document: lab});
+const shotStatus = () => {};
+const refreshShotCount = async (id) => sent.push(["count", id]);
+const fetch = async (url, opts) => { sent.push(JSON.parse(opts.body));
+  return {ok: true, json: async () => ({})}; };
+uploadShot(lab).then(() => console.log(JSON.stringify({cards, sent})));
+"""
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + harness],
+                          input=json.dumps(entries),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout)
+    eps_card, lab_card = out["cards"]
+    assert "Producer</strong> \u00b7 European Patient Summary" in eps_card
+    assert "Producer</strong> \u00b7 Laboratory Report" in lab_card
+    assert "<code>GET /fhir/Organization/producer/$document</code>" in eps_card
+    assert "<code>GET /fhir/Organization/producer/$document?type=laboratory</code>" in lab_card
+    for card, doc_id in ((eps_card, by_type["eps"]), (lab_card, by_type["laboratory"])):
+        for key in ("data-doc", "data-add", "data-form", "data-upload", "data-gallery",
+                    "data-shots"):
+            assert '%s="%d"' % (key, doc_id) in card, (key, card)
+    upload, count = out["sent"]
+    assert upload["custodian"] == {"reference": "Organization/producer"}
+    assert upload["context"] == {"related": [{"reference": "Bundle/%d" % by_type["laboratory"]}]}
+    assert upload["description"] == "lab came through"
+    assert count == ["count", str(by_type["laboratory"])]
+
+
+@needs_node
+def test_a_new_screenshot_updates_the_count_on_its_own_card(client, monkeypatch):
+    """The company's other cards share its slug. Matched by slug, the patient
+    summary's count would land on the lab card the screenshot was added to."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_p, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    lab = exchange_by_type(client, "producer")["laboratory"]["id"]
+    assert post_shot(client, tok_c, context=related_to(lab)).status_code == 201
+    exchange = client.get("/fhir/$exchange").json()
+    js = page_script(client)
+    parts = [js[js.index("function paramValue("):js.index("function submissionRow(")]]
+    parts += [page_function(js, name) for name in (
+        "partnerRow", "shotCountLabel", "refreshShotCount")]
+    harness = r"""
+const [exchange, ids] = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const buttons = {};
+const document = {querySelector: (s) => {
+  const m = s.match(/data-doc="(\d+)"/);
+  return m ? (buttons[m[1]] = buttons[m[1]] || {textContent: "stale"}) : null; }};
+const fetch = async () => ({ok: true, json: async () => exchange});
+(async () => {
+  for (const id of ids) await refreshShotCount(String(id));
+  console.log(JSON.stringify(buttons));
+})();
+"""
+    published = exchange_by_type(client, "producer")
+    ids = [e["id"] for e in published.values()]
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + harness],
+                          input=json.dumps([exchange, ids]),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    eps = published["eps"]["id"]
+    assert json.loads(proc.stdout) == {
+        str(eps): {"textContent": "No other system has shown this yet"},
+        str(lab): {"textContent": "Seen in 1 other system"},
+    }
 
 
 # Just enough page for the clinical view's picker and document loader to run in

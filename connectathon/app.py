@@ -2373,14 +2373,43 @@ def summarize_bundle(bundle) -> dict:
 # ---------------------------------------------------------------- interop
 
 
-def best_valid_submission(conn: sqlite3.Connection, team_id: int) -> sqlite3.Row | None:
-    """The team's published exchange document: its best valid submission
-    (highest score, earliest ts tiebreak - mirrors the leaderboard pick)."""
+def published_submission(
+    conn: sqlite3.Connection, team_id: int, doc_type: str
+) -> sqlite3.Row | None:
+    """The team's published exchange document of that type.
+
+    The patient summary is their best valid one (highest score, earliest ts
+    tiebreak - mirrors the leaderboard pick). Every other category scores a
+    flat SECONDARY_CATEGORY_POINTS, so "best" would only ever mean "first",
+    and a lab report a team improved would never be published; for those it
+    is their newest valid one instead.
+    """
+    order = ("score DESC, ts ASC, id ASC" if doc_type == PRIMARY_DOCUMENT["id"]
+             else "ts DESC, id DESC")
     return conn.execute(
         "SELECT * FROM submissions WHERE team_id = ? AND pass = 1 "
-        "ORDER BY score DESC, ts ASC, id ASC LIMIT 1",
-        (team_id,),
+        "AND doc_type = ? ORDER BY " + order + " LIMIT 1",
+        (team_id, doc_type),
     ).fetchone()
+
+
+def published_documents(conn: sqlite3.Connection, team_id: int) -> list[sqlite3.Row]:
+    """One published document per category the team has a valid one of, in
+    EHDS_DOCUMENTS order so the patient summary leads. A doc_type the service
+    no longer recognises is left out, as it is from the score."""
+    documents = []
+    for doc in EHDS_DOCUMENTS:
+        published = published_submission(conn, team_id, doc["id"])
+        if published is not None:
+            documents.append(published)
+    return documents
+
+
+def lead_document(conn: sqlite3.Connection, team_id: int) -> sqlite3.Row | None:
+    """What a request that names no type gets: the first document $exchange
+    lists for the team - their patient summary whenever they have one."""
+    documents = published_documents(conn, team_id)
+    return documents[0] if documents else None
 
 
 def read_submission_bytes(team_slug: str, filename: str) -> bytes | None:
@@ -3903,12 +3932,15 @@ def read_bundle(bundle_id: str) -> Response:
     tags=["Interop"],
     summary="Documents published for exchange",
     description=(
-        "Each company's best valid submission is published automatically. The "
-        "list is open - the documents are the event's shared test corpus. "
-        "`name` keeps the companies with that anywhere in their name or their "
-        "slug, ignoring case and accents - `name:contains` is the same thing, "
-        "for anyone arriving from the Organization search. Each entry's "
-        "`organizationSlug` is what Organization/{slug}/$document takes."
+        "Each company's best valid submission of each document type is "
+        "published automatically - one entry per company per type, the patient "
+        "summary first; that one is their best scoring, every other type their "
+        "newest valid one. The list is open - the documents are the event's "
+        "shared test corpus. `name` keeps the companies with that anywhere in "
+        "their name or their slug, ignoring case and accents - `name:contains` "
+        "is the same thing, for anyone arriving from the Organization search. "
+        "Each entry's `organizationSlug` and `documentType` are what "
+        "Organization/{slug}/$document?type= takes."
     ),
 )
 def exchange_list(
@@ -3929,27 +3961,27 @@ def exchange_list(
                 or name_matches(team["slug"], contains=wanted)
             ):
                 continue
-            best = best_valid_submission(conn, team["id"])
-            if best is None:
-                continue
-            entries.append(
-                (
-                    "entry",
-                    {
-                        "organization": team["name"],
-                        "organizationSlug": team["slug"],
-                        "bundle": "%s/Bundle/%d" % (FHIR_BASE, best["id"]),
-                        "id": best["id"],
-                        "recorded": best["ts"],
-                        "sections": best["sections"],
-                        "resources": best["resources"],
-                        "renderings": conn.execute(
-                            "SELECT COUNT(*) FROM renderings WHERE submission_id = ?",
-                            (best["id"],),
-                        ).fetchone()[0],
-                    },
+            for best in published_documents(conn, team["id"]):
+                entries.append(
+                    (
+                        "entry",
+                        {
+                            "organization": team["name"],
+                            "organizationSlug": team["slug"],
+                            "documentType": best["doc_type"],
+                            "bundle": "%s/Bundle/%d" % (FHIR_BASE, best["id"]),
+                            "id": best["id"],
+                            "recorded": best["ts"],
+                            "sections": best["sections"],
+                            "resources": best["resources"],
+                            "renderings": conn.execute(
+                                "SELECT COUNT(*) FROM renderings "
+                                "WHERE submission_id = ?",
+                                (best["id"],),
+                            ).fetchone()[0],
+                        },
+                    )
                 )
-            )
     return fhir_response(parameters(entries))
 
 
@@ -3957,27 +3989,42 @@ def exchange_list(
     tags=["Interop"],
     summary="Fetch a company's published document",
     description=(
-        "The company's best valid submission, ready to load into your own "
-        "system. An instance operation rather than a search because the answer "
-        "is one document and it changes the moment they beat their own score."
+        "The company's published document of the given `type` - an id from "
+        "$documents - ready to load into your own system: their best scoring "
+        "patient summary, or their newest valid document of any other type. "
+        "Without `type` it is the first one $exchange lists for them, which is "
+        "their patient summary whenever they have one. An instance operation "
+        "rather than a search because the answer is one document and it "
+        "changes the moment they publish a better one. 400 for a type "
+        "$documents does not list."
     ),
 )
-def exchange_fetch(slug: str) -> Response:
+def exchange_fetch(
+    slug: str, doc_type: str | None = Query(None, alias="type")
+) -> Response:
+    if doc_type is not None and doc_type not in DOCUMENTS_BY_ID:
+        raise HTTPException(
+            400,
+            detail="Unknown document type %r - $documents lists them" % doc_type,
+        )
     with connect() as conn:
         producer = conn.execute(
             "SELECT id, name, slug FROM teams WHERE slug = ?", (slug,)
         ).fetchone()
         if producer is None:
             raise HTTPException(404, detail="Unknown company")
-        best = best_valid_submission(conn, producer["id"])
+        best = (lead_document(conn, producer["id"]) if doc_type is None
+                else published_submission(conn, producer["id"], doc_type))
     if best is None:
-        raise HTTPException(404, detail="Company has no valid submission yet")
+        what = ("submission" if doc_type is None
+                else DOCUMENTS_BY_ID[doc_type]["long_label"])
+        raise HTTPException(404, detail="Company has no valid %s yet" % what)
     raw = read_submission_bytes(producer["slug"], best["filename"])
     if raw is None:
         raise HTTPException(404, detail="Exchange document file missing")
     return bundle_response(
         raw,
-        "%s-eps.json" % producer["slug"],
+        "%s-%s.json" % (producer["slug"], best["doc_type"]),
         **{
             "Content-Location": "%s/Bundle/%d" % (FHIR_BASE, best["id"]),
             "X-Producer": producer["slug"],
@@ -4117,6 +4164,35 @@ def _reference_id(ref, expected_type: str) -> str | None:
     return value[len(prefix):] if value.startswith(prefix) else None
 
 
+def _related_bundle_id(payload: dict) -> int | None:
+    """The submission id out of context.related, or None when it is absent.
+
+    Present but not a Bundle/<id> reference is an error rather than a fallback:
+    falling back would pin the screenshot to whatever document is published
+    now, which is exactly the mistake naming one is there to prevent.
+    """
+    context = payload.get("context")
+    if context is None:
+        return None
+    # A non-object context holds no related, so it falls through to the 400 below.
+    related = context.get("related") if isinstance(context, dict) else []
+    if related is None:
+        return None
+    first = related[0] if isinstance(related, list) and related else None
+    value = first.get("reference") if isinstance(first, dict) else None
+    # Relative, or the `bundle` URL $exchange hands out. 18 digits stays inside
+    # SQLite's integer range; past it is no id of ours.
+    match = (re.fullmatch(r"(?:%s/)?Bundle/([0-9]{1,18})" % re.escape(FHIR_BASE), value)
+             if isinstance(value, str) else None)
+    if match is None:
+        raise HTTPException(
+            400,
+            detail="context.related[0] must reference the document you loaded, "
+            "as Bundle/<id> - the id of its $exchange entry",
+        )
+    return int(match.group(1))
+
+
 def _attachment_bytes(payload: dict) -> bytes:
     content = payload.get("content")
     first = content[0] if isinstance(content, list) and content else None
@@ -4152,10 +4228,16 @@ def _attachment_bytes(payload: dict) -> bytes:
         "looks like, and POST a DocumentReference whose "
         "`content[0].attachment.data` is the image bytes base64-encoded - PNG, "
         "JPEG or WebP. `custodian` names the company whose document it is, and "
-        "`description` is where you say what the picture shows. `author` is "
+        "`description` is where you say what the picture shows. "
+        "`context.related` names the document you loaded, as `Bundle/<id>` - "
+        "the `id` of its $exchange entry, or its `bundle` URL. Without it the "
+        "screenshot is taken to be of the first document $exchange lists for "
+        "them, their patient summary whenever they have one. `author` is "
         "taken from your token, not from the body. Nothing about this is "
-        "scored. 400 if the attachment is not one of those three formats or "
-        "the document is your own, 413 over MAX_IMAGE_BYTES."
+        "scored. 400 if the attachment is not one of those three formats, the "
+        "document is your own or `context.related` holds no usable "
+        "`Bundle/<id>` reference, 404 if that Bundle is not a valid document "
+        "of theirs, 413 over MAX_IMAGE_BYTES."
     ),
 )
 def add_rendering(
@@ -4178,6 +4260,7 @@ def add_rendering(
         )
     note = payload.get("description")
     note = note if isinstance(note, str) else ""
+    bundle_id = _related_bundle_id(payload)
 
     with connect() as conn:
         producer = conn.execute(
@@ -4193,10 +4276,22 @@ def add_rendering(
             )
         # Pinned to the submission, not the slug: a team's exchange document
         # changes the moment it beats its own score, and a screenshot has to
-        # stay attached to the bytes somebody actually opened.
-        best = best_valid_submission(conn, producer["id"])
+        # stay attached to the bytes somebody actually opened. Any valid one of
+        # theirs will do, not only what is published now - the uploader may
+        # have loaded it before it was overtaken.
+        if bundle_id is None:
+            best = lead_document(conn, producer["id"])
+            missing = "Company has no valid submission yet"
+        else:
+            best = conn.execute(
+                "SELECT id FROM submissions WHERE id = ? AND team_id = ? "
+                "AND pass = 1",
+                (bundle_id, producer["id"]),
+            ).fetchone()
+            missing = "Bundle/%d is not a valid document of %s" % (
+                bundle_id, producer["name"])
         if best is None:
-            raise HTTPException(404, detail="Company has no valid submission yet")
+            raise HTTPException(404, detail=missing)
 
     now = datetime.now(timezone.utc)
     dest_dir = os.path.join(DATA_DIR, "renderings", consumer["slug"])
@@ -4817,7 +4912,9 @@ def metadata() -> Response:
                                         CANONICAL_BASE
                                         + "/OperationDefinition/document",
                                     "documentation":
-                                        "The company's best valid submission.",
+                                        "The company's published document of "
+                                        "the type in `type` - else the first "
+                                        "one $exchange lists for them.",
                                 },
                                 {
                                     "name": "me",
@@ -6044,8 +6141,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
       <span class="lane-n">Pathway 1 &middot; Validate</span>
       <h3>Send it to Provbana</h3>
       <p class="muted">Matchbox checks it against HL7 EU EPS, the leaderboard
-      scores it and the clinical view renders it. Your best valid summary is
-      published below for others to fetch.</p>
+      scores it and the clinical view renders it. Your best valid document
+      of each type is published below for others to fetch.</p>
       <p class="muted" style="margin:0"><a href="#submit">Submit a bundle</a></p>
     </div>
     <div class="lane">
@@ -6177,8 +6274,9 @@ function submissionRow(e) {
 }
 function partnerRow(e) {
   return { team: e.organization, team_slug: e.organizationSlug,
-           exchange_id: e.id, ts: e.recorded, sections: e.sections,
-           resources: e.resources, renderings: e.renderings };
+           doc_type: e.documentType, exchange_id: e.id, ts: e.recorded,
+           sections: e.sections, resources: e.resources,
+           renderings: e.renderings };
 }
 /* FHIR has no null, so a company that has never submitted has no bestErrors
    part at all rather than one set to null. Absent becomes null here, once, so
@@ -8696,7 +8794,10 @@ function interopCurls() {
     "# a $ inside single quotes needs no backslash:\n" +
     "curl -s '" + origin + "/fhir/$exchange?name=acme'\n" +
     "curl -s " + origin + "/fhir/Organization/PARTNER_SLUG/\\$document"
-      + " -o partner-eps.json\n\n" +
+      + " -o partner-eps.json\n" +
+    "# another type they publish - the ?type= in that card's GET line:\n" +
+    "curl -s '" + origin + "/fhir/Organization/PARTNER_SLUG/$document?type=laboratory'"
+      + " -o partner-laboratory.json\n\n" +
     "# publish a screenshot of how it came out in your system - the image goes\n" +
     "# in the attachment, base64-encoded:\n" +
     "curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
@@ -8705,9 +8806,12 @@ function interopCurls() {
     '       "resourceType": "DocumentReference", "status": "current",\n' +
     '       "description": "Allergies came through empty",\n' +
     '       "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
+    '       "context": {"related": [{"reference": "Bundle/ID"}]},\n' +
     '       "content": [{"attachment": {"contentType": "image/png",\n' +
     '                                   "data": "\'\"$(base64 -w0 shot.png)\"\'"}}]}\'\n' +
-    "# every screenshot of one document:\n" +
+    "# ID is the Document # on the card you loaded; leave context out and it is\n" +
+    "# taken to be their first card, the patient summary if they have one.\n" +
+    "# Every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
     "# or have documents sent to you: advertise where your system takes them\n" +
     "# in - hl7-fhir-rest for a FHIR base, or web-page for a how-to page:\n" +
@@ -8733,52 +8837,64 @@ function shotCountLabel(n) {
 /* Only one number on one card changes when a screenshot lands or is withdrawn.
    Rebuilding the whole list to show it would take the upload form, its
    confirmation and the open gallery down with it. */
-async function refreshShotCount(slug) {
+async function refreshShotCount(docId) {
   try {
     const res = await fetch("/fhir/$exchange");
     if (!res.ok) return;
     const p = paramEntries(await res.json(), "entry").map(partnerRow)
-      .find((x) => x.team_slug === slug);
-    const btn = document.querySelector('.io-partner[data-slug="' + slug
+      .find((x) => String(x.exchange_id) === String(docId));
+    const btn = document.querySelector('.io-partner[data-doc="' + docId
       + '"] [data-shots]');
     if (p && btn) btn.textContent = shotCountLabel(p.renderings);
   } catch (e) { /* the count is decoration; the gallery below it is the truth */ }
 }
 
+/* The patient summary is what $document hands out with no type, so its line
+   stays the short one every team already has in their scripts. */
+function documentPath(p) {
+  return "/fhir/Organization/" + p.team_slug + "/$document"
+    + (p.doc_type === "eps" ? "" : "?type=" + p.doc_type);
+}
+
+/* One card per document, not per company: a company publishes its best valid
+   document of every type, and a screenshot is of one of them. Everything on
+   the card is keyed by the document id, since the slug repeats. */
 function partnerCard(p) {
-  return '<div class="io-partner" data-slug="' + esc(p.team_slug) + '">'
-    + "<strong>" + esc(p.team) + "</strong>"
-    + '<p class="muted" style="margin:6px 0 0"><code>GET /fhir/Organization/'
-    + esc(p.team_slug) + "/$document</code> \u00b7 Document #" + p.exchange_id
+  const id = p.exchange_id;
+  return '<div class="io-partner" data-slug="' + esc(p.team_slug)
+    + '" data-doc="' + id + '">'
+    + "<strong>" + esc(p.team) + "</strong> \u00b7 " + esc(docLabel(p.doc_type))
+    + '<p class="muted" style="margin:6px 0 0"><code>GET '
+    + esc(documentPath(p)) + "</code> \u00b7 Document #" + id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
-    + '<a href="#clinical/submission/' + p.exchange_id + '">view document</a>'
-    + ' \u00b7 <a href="/fhir/Bundle/' + p.exchange_id
+    + '<a href="#clinical/submission/' + id + '">view document</a>'
+    + ' \u00b7 <a href="/fhir/Bundle/' + id
     + '" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
-    + '<button class="ghost" data-shots="' + p.exchange_id + '">'
+    + '<button class="ghost" data-shots="' + id + '">'
     + shotCountLabel(p.renderings) + "</button>"
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */
     + (me && me.id === p.team_slug
         ? '<span class="muted">Your document - other companies add the screenshots.</span>'
-        : '<button class="ghost" data-add="' + esc(p.team_slug) + '">'
+        : '<button class="ghost" data-add="' + id + '">'
           + "I loaded this - add a screenshot</button>")
     + "</div>"
     + (me && me.id === p.team_slug ? "" :
-      '<div class="shot-form" hidden data-form="' + esc(p.team_slug) + '">'
-    + '<label for="shot-file-' + esc(p.team_slug) + '">Screenshot (PNG, JPEG or WebP)</label>'
+      '<div class="shot-form" hidden data-form="' + id + '">'
+    + '<label for="shot-file-' + id + '">Screenshot (PNG, JPEG or WebP)</label>'
     + '<input type="file" accept="image/png,image/jpeg,image/webp" id="shot-file-'
-    + esc(p.team_slug) + '">'
-    + '<label for="shot-note-' + esc(p.team_slug) + '">What should someone look at?</label>'
-    + '<textarea id="shot-note-' + esc(p.team_slug) + '" maxlength="' + maxNote
+    + id + '">'
+    + '<label for="shot-note-' + id + '">What should someone look at?</label>'
+    + '<textarea id="shot-note-' + id + '" maxlength="' + maxNote
     + '" placeholder="'
     + "e.g. Allergies came through, but the penicillin severity is missing and "
     + 'the medication list dropped every dose."></textarea>'
-    + '<div class="io-actions"><button data-upload="' + esc(p.team_slug)
+    + '<div class="io-actions"><button data-upload="' + id
     + '">Upload</button>'
     + '</div><p class="shot-status" hidden></p></div>')
-    + '<div class="shots" hidden data-gallery="' + p.exchange_id + '"></div></div>';
+    + '<div class="shots" hidden data-gallery="' + id + '"></div></div>';
 }
 
 /* Screenshots are full-screen grabs: 2-3 MB of PNG each, and a gallery of
@@ -8903,8 +9019,9 @@ function shotStatus(form, text, isError) {
   p.hidden = !text;
 }
 
-async function uploadShot(slug) {
-  const form = document.querySelector('[data-form="' + slug + '"]');
+async function uploadShot(docId) {
+  const form = document.querySelector('[data-form="' + docId + '"]');
+  const slug = form.closest(".io-partner").dataset.slug;
   const file = form.querySelector("input[type=file]").files[0];
   const note = form.querySelector("textarea").value.trim();
   const token = $("#token").value.trim();
@@ -8924,6 +9041,7 @@ async function uploadShot(slug) {
         status: "current",
         description: note,
         custodian: { reference: "Organization/" + slug },
+        context: { related: [{ reference: "Bundle/" + docId }] },
         content: [{ attachment: {
           contentType: blob.type || "application/octet-stream",
           data: await blobToBase64(blob),
@@ -8939,7 +9057,7 @@ async function uploadShot(slug) {
     shotStatus(form, "Published - thank you.");
     form.querySelector("input[type=file]").value = "";
     form.querySelector("textarea").value = "";
-    await refreshShotCount(slug);
+    await refreshShotCount(docId);
     const gallery = document.querySelector('[data-gallery="' + data.document + '"]');
     if (gallery) { gallery.hidden = false; loadGallery(data.document); }
   } catch (e) {
@@ -9016,7 +9134,6 @@ async function withdrawShot(id, confirmed) {
     return;
   }
   const docId = tile.closest(".shots").dataset.gallery;
-  const slug = tile.closest(".io-partner").dataset.slug;
   shotErr(tile, "");
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
@@ -9030,7 +9147,7 @@ async function withdrawShot(id, confirmed) {
   } catch (e) {
     return shotErr(tile, "Network error: " + e.message);
   }
-  await refreshShotCount(slug);
+  await refreshShotCount(docId);
   const gallery = document.querySelector('[data-gallery="' + docId + '"]');
   if (gallery) { gallery.hidden = false; loadGallery(docId); }
 }
