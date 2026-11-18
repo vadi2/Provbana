@@ -7253,13 +7253,12 @@ async function initSamples() {
 }
 
 /* The picker follows the document, but only at the moment a different one
-   opens: browsing another company's list while reading a summary should not be
-   undone by a view switch, and Back onto someone else's document should not
-   leave the picker pointing at the company you came from. */
+   opens: Back onto someone else's document should not leave the picker
+   pointing at the company you came from. */
 function routeTeam() {
   const parts = routeParts();
-  // a local preview belongs to no company, so leave the picker where it is
-  if (parts[1] === "preview") return $("#cv-team").value || SAMPLE_TEAM;
+  // a local preview belongs to no company - it came from the preview box
+  if (parts[1] === "preview") return PREVIEW_TEAM;
   if (parts[1] === "company" && parts[2]) return parts[2];
   if (parts[1] === "submission") {
     if (cvCurrent && String(cvCurrent.id) === parts[2] && cvCurrent.team_slug) {
@@ -7314,9 +7313,11 @@ async function initClinical() {
     cvSubsByTeam = new Map();  // a fresh visit deserves fresh lists
     /* A #clinical/company route is an explicit request for that company, so it
        wins over whatever the picker happened to be showing; otherwise a company
-       you had picked by hand survives a trip to another tab. */
+       you had picked by hand survives a trip to another tab. The examples and
+       the preview box are picker entries too, so they have routes of their own. */
     const asked = routeParts()[1] === "company" ? routeParts()[2] : null;
-    if (asked && !slugs.has(asked)) { showUnknownCompany(asked); return; }
+    const listed = [...sel.options].some((o) => o.value === asked);
+    if (asked && !listed) { showUnknownCompany(asked); return; }
     sel.value = asked ? asked : slugs.has(current) ? current : routeTeam();
     renderCvList();
   } finally {
@@ -7424,14 +7425,17 @@ async function renderCvList() {
 }
 
 $("#cv-team").addEventListener("change", () => {
-  /* On a company route the URL names the list on show; keep it truthful so a
-     reload or a shared link lands on the company just picked, not the old one. */
-  if (routeParts()[1] === "company") {
-    const slug = $("#cv-team").value;
-    if (slug === PREVIEW_TEAM) { renderCvList(); return; }
-    history.replaceState(null, "", slug === SAMPLE_TEAM ? "#clinical"
-                                                        : "#clinical/company/" + slug);
-  }
+  /* A document belongs to the company it came from: left open under another
+     company's name it reads as theirs. So picking from the list closes it, and
+     the URL follows - a reload or a shared link lands on the list just picked,
+     and Back returns to the document that was open or still loading. Moving
+     between lists replaces the entry rather than piling up Back steps. */
+  const hash = "#clinical/company/" + $("#cv-team").value;
+  if (routeParts()[1] === "company") history.replaceState(null, "", hash);
+  else history.pushState(null, "", hash);
+  hideDoc();
+  // the tab link remembers where you were; that is now this list
+  document.querySelector('.tab-btn[data-tab="clinical"]').setAttribute("href", hash);
   renderCvList();
 });
 $("#cv-list").addEventListener("click", (ev) => {
@@ -7456,20 +7460,21 @@ async function showDoc(kind, id, scroll) {
   const path = "/ui/documents/";
   const key = kind + "/" + id;
   if (key === cvDocKey && cvCurrent) { renderClinicalDoc(cvCurrent); return; }
-  let data;
+  let data, problem = null;
   try {
     const res = await fetch(path + encodeURIComponent(id));
-    if (!res.ok) {
-      showDocMessage(res.status === 404
-        ? "Document not found - the link may be stale, or the submission was removed."
-        : "Could not load the document (HTTP " + res.status + ").");
-      return;
-    }
-    data = await res.json();
+    if (res.ok) data = await res.json();
+    else problem = res.status === 404
+      ? "Document not found - the link may be stale, or the submission was removed."
+      : "Could not load the document (HTTP " + res.status + ").";
   } catch (e) {
-    showDocMessage("Could not load the document: " + e.message);
-    return;
+    problem = "Could not load the document: " + e.message;
   }
+  /* The reader may have moved on while this loaded - picked another company,
+     opened another row. Shown now, it would sit under the wrong company. */
+  const now = routeParts();
+  if (now[1] !== kind || now[2] !== id) return;
+  if (problem) { showDocMessage(problem); return; }
   cvDocKey = key;
   cvCurrent = data;  // routeTeam reads the document's company from here
   syncTeamPicker();
@@ -8651,6 +8656,7 @@ function showPreviewDoc(scroll) {
   }
   const first = cvDocKey !== "preview/local";
   cvDocKey = "preview/local";
+  syncTeamPicker();  // Back onto the preview from a company's list
   renderClinicalDoc(cvPreview);
   if (scroll || first) $("#cv-doc").scrollIntoView({ behavior: "smooth" });
 }

@@ -3226,7 +3226,6 @@ def test_index_reads_health_and_links_rows(client):
     assert "if (cvInitPending) return;" in text
     assert "cvCurrent = data;  // routeTeam reads" in text
     assert 'if (ev.target.closest("a")) return;' in text
-    assert 'if (routeParts()[1] === "company") {' in text  # the picker keeps the URL honest
     assert "Company token" in text
     assert "team token" not in text.lower()
 
@@ -3899,6 +3898,8 @@ def page_script(client):
 def page_function(js, name):
     """One top-level function out of the page script, through its closing brace."""
     start = js.index("function %s(" % name)
+    if js[:start].endswith("async "):
+        start -= len("async ")
     return js[start:js.index("\n}", start) + 2]
 
 
@@ -4967,6 +4968,114 @@ def test_the_clinical_list_reads_the_category_the_api_sends(client, monkeypatch)
     header = page_function(js, "renderCvList")
     assert '<th scope="col">Document</th>' in header
     assert row.count("<td>") == header.count('<th scope="col">')
+
+
+# Just enough page for the clinical view's picker and document loader to run in
+# node: the elements they touch, a history and a route that can be read back.
+CV_STUBS = r"""
+const calls = [];
+let route = "";
+const routeParts = () => route.split("/");
+const els = {"#cv-team": {value: "", addEventListener(t, f) { this.fire = f; }},
+             "#cv-doc": {style: {display: "block"}}};
+const $ = (s) => els[s];
+const tabLink = {setAttribute(k, v) { this[k] = v; }};
+const document = {querySelector: () => tabLink};
+const historyStep = (step) => (a, b, h) => { calls.push([step, h]); route = h.slice(1); };
+const history = {pushState: historyStep("push"), replaceState: historyStep("replace")};
+let cvDocKey = "submission/5", cvCurrent = {id: 5};
+const renderCvList = () => calls.push(["list"]);
+"""
+
+
+def cv_picker_change(client, route, pick):
+    """Pick from the clinical view's company list with the page's own handler."""
+    js = page_script(client)
+    start = js.index('$("#cv-team").addEventListener("change", () => {')
+    harness = ('[route, els["#cv-team"].value] = JSON.parse(require("fs").readFileSync(0, "utf8"));\n'
+               'els["#cv-team"].fire();\n'
+               'console.log(JSON.stringify({calls, doc: els["#cv-doc"].style.display,'
+               ' tab: tabLink.href, cvCurrent}));')
+    src = "\n".join([CV_STUBS, page_function(js, "hideDoc"),
+                     js[start:js.index("\n});", start) + 4], harness])
+    proc = subprocess.run(["node", "-e", src], input=json.dumps([route, pick]),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout)
+
+
+@needs_node
+@pytest.mark.parametrize("route,pick,step", [
+    # leaving a document (open, or a local preview) is a step Back should undo
+    ("clinical/submission/5/document", "alpha", "push"),
+    ("clinical/sample/andrea-cross-border/document", "__samples", "push"),
+    ("clinical/preview", "__preview", "push"),
+    # moving between lists is not
+    ("clinical/company/beta", "alpha", "replace"),
+    ("clinical/company/alpha", "__preview", "replace"),
+])
+def test_picking_from_the_company_list_closes_the_document(client, route, pick, step):
+    """A document left open under another company's name reads as theirs, and
+    a URL that still named it would bring it back on a reload."""
+    got = cv_picker_change(client, route, pick)
+    hash = "#clinical/company/" + pick
+    assert got == {"calls": [[step, hash], ["list"]], "doc": "none",
+                   "tab": hash, "cvCurrent": None}
+
+
+@needs_node
+def test_back_onto_a_local_preview_takes_the_picker_back_to_the_preview(client):
+    """Your own file, reached again with Back from a company's list, must not
+    sit under that company's name."""
+    js = page_script(client)
+    harness = r"""
+route = "clinical/preview/local/document";
+els["#cv-team"].value = "beta";
+els["#cv-team"].options = ["__samples", "beta", "__preview"].map((value) => ({value}));
+syncTeamPicker();
+console.log(JSON.stringify({picker: els["#cv-team"].value, calls}));
+"""
+    teams = []
+    for name in ("SAMPLE_TEAM", "PREVIEW_TEAM"):
+        start = js.index("const %s = " % name)
+        teams.append(js[start:js.index(";\n", start) + 2])
+    src = "\n".join([CV_STUBS, *teams, page_function(js, "routeTeam"),
+                     page_function(js, "syncTeamPicker"), harness])
+    proc = subprocess.run(["node", "-e", src], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"picker": "__preview", "calls": [["list"]]}
+    assert "syncTeamPicker();  // Back onto the preview" in page_function(js, "showPreviewDoc")
+
+
+@needs_node
+@pytest.mark.parametrize("moved_on,calls,current", [
+    (False, [["shown", 7]], {"id": 7}),
+    (True, [], None),
+])
+def test_a_document_that_arrives_after_the_reader_moved_on_is_dropped(client, moved_on,
+                                                                      calls, current):
+    """Picking another company while a document loads must not let it land
+    under that company's name when the fetch finally returns."""
+    js = page_script(client)
+    harness = r"""
+const [movedOn] = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const showDocMessage = (m) => calls.push(["message", m]);
+const syncTeamPicker = () => {};
+const renderClinicalDoc = (d) => calls.push(["shown", d.id]);
+let resolve;
+global.fetch = () => new Promise((r) => { resolve = r; });
+route = "clinical/submission/7/document";
+cvDocKey = null; cvCurrent = null;
+const loading = showDoc("submission", "7", false);
+if (movedOn) route = "clinical/company/beta";
+resolve({ok: true, json: async () => ({id: 7})});
+loading.then(() => console.log(JSON.stringify({calls, cvCurrent})));
+"""
+    src = "\n".join([CV_STUBS, page_function(js, "showDoc"), harness])
+    proc = subprocess.run(["node", "-e", src], input=json.dumps([moved_on]),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"calls": calls, "cvCurrent": current}
 
 
 def test_an_old_database_gains_the_category_column_as_a_patient_summary(tmp_path,
