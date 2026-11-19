@@ -2286,6 +2286,10 @@ def summarize_bundle(bundle) -> dict:
         summary["composition"] = {
             "title": _first_str(composition, "title"),
             "date": _first_str(composition, "date"),
+            # A BCP-47 code. The Composition's own wins; a document that only
+            # says it on the Bundle is still written in it.
+            "language": _first_str(composition, "language")
+            or _first_str(bundle, "language"),
         }
         as_of = _iso_day(summary["composition"]["date"])
         summary["as_of"] = as_of.isoformat() if as_of else None
@@ -7934,6 +7938,16 @@ function cvPatientMeta(p, on) {
     .filter(Boolean).join(" &middot; ");
 }
 
+/* "en" -> "English". The browser knows every BCP-47 name, so no table here
+   can fall behind; a code it cannot read is shown as written. */
+function languageName(code) {
+  try {
+    return new Intl.DisplayNames(["en"], { type: "language" }).of(code) || code;
+  } catch (e) {
+    return code;
+  }
+}
+
 /* Who wrote it and whom to ring: asked for before anything in the document
    is acted on, so above the three views rather than inside one of them. */
 function cvContextHtml(s) {
@@ -7946,9 +7960,17 @@ function cvContextHtml(s) {
       lines.push("<strong>Source:</strong> " + who.map(esc).join(" &middot; "));
     }
   }
+  /* Two different languages, and a bare "Language:" reads as the document's:
+     a Swedish patient's discharge report written in English said "Language:
+     Swedish" above English text. One is what to speak to the patient in, the
+     other what the document is written in, so each says which it is. */
   const p = s.patient || {};
   if ((p.languages || []).length) {
-    lines.push("<strong>Language:</strong> " + p.languages.map(esc).join(", "));
+    lines.push("<strong>Patient speaks:</strong> " + p.languages.map(esc).join(", "));
+  }
+  const written = (s.composition || {}).language;
+  if (written) {
+    lines.push("<strong>Document language:</strong> " + esc(languageName(written)));
   }
   (p.contacts || []).forEach((c) => {
     lines.push("<strong>" + esc(c.relationship || "Contact") + ":</strong> "

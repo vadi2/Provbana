@@ -10,6 +10,7 @@ first pass for the first team ever to go valid).
 """
 
 import base64
+import copy
 import datetime
 import io
 import html.parser
@@ -683,7 +684,27 @@ def test_summarize_bundle_patient_and_composition():
     assert s["patient"]["gender"] == "female"
     assert s["patient"]["identifiers"] == [
         {"system": "http://example.org/ids", "value": "1234"}]
-    assert s["composition"] == {"title": "Patient Summary", "date": "2026-01-01"}
+    assert s["composition"] == {"title": "Patient Summary", "date": "2026-01-01",
+                                "language": None}
+
+
+@pytest.mark.parametrize("bundle_lang, composition_lang, expected", [
+    ("en", None, "en"),          # said only on the Bundle - still what it is in
+    ("en", "sv", "sv"),          # the Composition's own wins
+    (None, " de ", "de"),
+    (None, None, None),
+    (7, "", None),               # junk is no language
+])
+def test_the_summary_says_what_language_the_document_is_in(
+        bundle_lang, composition_lang, expected):
+    bundle = copy.deepcopy(CLINICAL_BUNDLE)
+    if bundle_lang is not None:
+        bundle["language"] = bundle_lang
+    composition = next(e["resource"] for e in bundle["entry"]
+                       if e["resource"]["resourceType"] == "Composition")
+    if composition_lang is not None:
+        composition["language"] = composition_lang
+    assert app_module.summarize_bundle(bundle)["composition"]["language"] == expected
 
 
 def test_summarize_bundle_section_resolution_and_medication_names():
@@ -5241,6 +5262,44 @@ const fetch = async () => ({ok: true, json: async () => exchange});
         str(eps): {"textContent": "No other system has shown this yet"},
         str(lab): {"textContent": "Seen in 1 other system"},
     }
+
+
+@needs_node
+def test_the_clinical_view_tells_the_patients_language_from_the_documents(client):
+    """A Swedish patient's discharge report written in English used to say
+    "Language: Swedish" above English text. Each language now says whose it is.
+    Run on a real sample through the page's own code."""
+    summary = _sample("andrea-cross-border")
+    summary["patient"]["languages"] = ["Swedish"]
+    js = page_script(client)
+    start = js.index("const esc = ")
+    parts = [js[start:js.index(";\n", start) + 2]]
+    parts += [page_function(js, name) for name in ("languageName", "cvContextHtml")]
+    harness = r"""
+const s = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const out = [cvContextHtml(s)];
+s.composition.language = "not a language!";
+out.push(cvContextHtml(s));
+s.composition.language = null;
+out.push(cvContextHtml(s));
+s.composition.language = "<img src=x onerror=alert(1)>";
+out.push(cvContextHtml(s));
+console.log(JSON.stringify(out));
+"""
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + harness],
+                          input=json.dumps(summary),
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    english, unreadable, undeclared, hostile = json.loads(proc.stdout)
+    assert "<strong>Patient speaks:</strong> Swedish" in english
+    assert "<strong>Document language:</strong> English" in english
+    assert "<strong>Language:</strong>" not in english
+    # a code the browser cannot name is shown as written, not dropped or thrown on
+    assert "<strong>Document language:</strong> not a language!" in unreadable
+    assert "Document language" not in undeclared
+    # it is whatever the submitter wrote, so it is escaped like everything else
+    assert "&lt;img src=x onerror=alert(1)&gt;" in hostile
+    assert "<img" not in hostile
 
 
 # Just enough page for the clinical view's picker and document loader to run in
