@@ -3912,6 +3912,107 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     return raw, "%s-example-eps.json" % bundle_id
 
 
+def document_patient_identifiers(bundle) -> set:
+    """(system, value) for each identifier of the document's patient - the one
+    its Composition's subject points at, which is what the FHIR search
+    parameter composition.patient means. A system-less identifier has system
+    None. Malformed input is simply a document with no patient."""
+    if not isinstance(bundle, dict) or not isinstance(bundle.get("entry"), list):
+        return set()
+    entries = [
+        e for e in bundle["entry"]
+        if isinstance(e, dict) and isinstance(e.get("resource"), dict)
+    ]
+    composition = next(
+        (e["resource"] for e in entries
+         if e["resource"].get("resourceType") == "Composition"),
+        {},
+    )
+    subject = composition.get("subject")
+    reference = subject.get("reference") if isinstance(subject, dict) else None
+    patient = _resolve_reference(reference, _build_reference_index(entries))
+    if not isinstance(patient, dict) or patient.get("resourceType") != "Patient":
+        return set()
+    return {
+        (ident["system"], ident["value"])
+        for ident in _patient_summary(patient)["identifiers"]
+    }
+
+
+def parse_token(token: str) -> tuple[str | None, str]:
+    """A FHIR token search value as (system, value). `system|value` needs
+    both; `|value` needs an identifier with no system, which is what system
+    "" stands for here; a bare `value` matches any system, which is system
+    None."""
+    if "|" not in token:
+        return None, token
+    system, value = token.split("|", 1)
+    return system, value
+
+
+def token_matches(wanted: tuple[str | None, str], identifiers: set) -> bool:
+    system, value = wanted
+    return any(
+        ident_value == value
+        and (system is None or (ident_system or "") == system)
+        for ident_system, ident_value in identifiers
+    )
+
+
+@app.get("/fhir/Bundle",
+    tags=["Submissions"],
+    summary="Find documents by patient",
+    description=(
+        "Every valid document whose patient carries the identifier, newest "
+        "first, as a searchset - across all companies and every document "
+        "type. Prescriptions (eP/eD) are not documents but collections, with "
+        "no Composition and so no composition.patient, and are not searched. "
+        "`composition.patient.identifier` is a FHIR token: `system|value`, "
+        "`|value` for an identifier with no system, or a bare `value` for any "
+        "system. Several, separated by commas, match any of them. Each "
+        "entry's id is the one Bundle/{id} reads it back by."
+    ),
+)
+def search_bundles(
+    identifier: str | None = Query(None, alias="composition.patient.identifier"),
+) -> Response:
+    wanted = [parse_token(t) for t in (identifier or "").split(",") if t]
+    if not any(value for _, value in wanted):
+        raise HTTPException(
+            400, detail="Search by composition.patient.identifier=system|value")
+    # Only the types that are documents: one with no Bundle profile travels as
+    # a collection and has no Composition to search through. A category the
+    # service no longer lists is off $exchange, and so off here too.
+    searchable = tuple(d for d, doc in DOCUMENTS_BY_ID.items() if doc["bundles"])
+    documents = []
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT s.id, s.filename, t.slug FROM submissions s "
+            "JOIN teams t ON t.id = s.team_id WHERE s.pass = 1 "
+            "AND s.doc_type IN (%s) ORDER BY s.ts DESC, s.id DESC"
+            % ",".join("?" * len(searchable)),
+            searchable,
+        ).fetchall()
+    for row in rows:
+        raw = read_submission_bytes(row["slug"], row["filename"])
+        if raw is None:
+            # Skipped rather than failing the search, but never unnoticed: the
+            # likeliest cause is a restore that brought back the database and
+            # not the files, and nothing else would say so.
+            record_usage(monitor.record_error, "server",
+                         "Bundle search: submission %d has no file" % row["id"])
+            continue
+        bundle = _loads_or_none(raw)
+        identifiers = document_patient_identifiers(bundle)
+        if any(token_matches(w, identifiers) for w in wanted):
+            # The document's own Bundle.id is the author's and is not unique
+            # here - companies have sent the very same document. This server's
+            # id is the submission, the one Bundle/{id} reads; the document's
+            # lasting identity is Bundle.identifier, which is left as sent.
+            documents.append(dict(bundle, id=str(row["id"])))
+    return fhir_response(searchset(documents))
+
+
 @app.get("/fhir/Bundle/{bundle_id}",
     tags=["Submissions"],
     summary="Read a document",
@@ -4882,7 +4983,19 @@ def metadata() -> Response:
                             "supportedProfile": [
                                 d["profile"] for d in SECONDARY_DOCUMENTS
                             ],
-                            "interaction": [{"code": "read"}],
+                            "interaction": [
+                                {"code": "read"}, {"code": "search-type"}
+                            ],
+                            "searchParam": [
+                                {"name": "composition.patient.identifier",
+                                 "type": "token",
+                                 "documentation":
+                                     "The patient's identifier, as "
+                                     "system|value, |value or value. Valid "
+                                     "documents only, newest first; "
+                                     "prescriptions are collections, with no "
+                                     "Composition, and are not searched."},
+                            ],
                             "operation": [
                                 {
                                     "name": "validate",
@@ -8835,6 +8948,11 @@ function interopCurls() {
     "# taken to be their first card, the patient summary if they have one.\n" +
     "# Every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
+    "# every valid document anyone has sent for one patient - system|value, or\n" +
+    "# the value alone to match it in any system. Prescriptions are collections,\n" +
+    "# not documents, and are not searched:\n" +
+    "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier="
+      + "http://electronichealth.se/identifier/personnummer|191212121212'\n\n" +
     "# or have documents sent to you: advertise where your system takes them\n" +
     "# in - hl7-fhir-rest for a FHIR base, or web-page for a how-to page:\n" +
     "curl -X POST " + origin + "/fhir/Endpoint \\\n" +

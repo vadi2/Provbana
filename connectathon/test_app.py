@@ -1871,6 +1871,9 @@ def test_metadata_describes_the_whole_api(client):
     # and the secondary categories ride along as supportedProfile - the
     # conformance resource's own way of saying "this one is what we are about"
     bundles = next(r for r in rest["resource"] if r["type"] == "Bundle")
+    assert {i["code"] for i in bundles["interaction"]} == {"read", "search-type"}
+    assert [p["name"] for p in bundles["searchParam"]] == [
+        "composition.patient.identifier"]
     assert bundles["profile"] == app_module.PROFILE
     assert bundles["profile"] == app_module.PRIMARY_DOCUMENT["profile"]
     assert bundles["supportedProfile"] == [
@@ -3620,6 +3623,176 @@ def test_a_retired_document_type_is_never_handed_out(client, monkeypatch):
     assert exchange_by_type(client, "retired") == {}
     assert client.get("/fhir/Organization/retired/$document").status_code == 404
     assert post_shot(client, tok_c, slug="retired").status_code == 404
+
+
+# ------------------------------------------------- documents by patient
+
+PNR = "http://electronichealth.se/identifier/personnummer"
+
+
+def patient_document(*identifiers, title="Patient Summary"):
+    """A document whose Composition.subject is a Patient with these
+    identifiers, each given as (system, value) - system None for none."""
+    doc = json.loads(bundle())
+    doc["id"] = "shared-by-everyone"
+    doc["entry"][0]["fullUrl"] = "urn:uuid:comp"
+    doc["entry"][0]["resource"].update(
+        title=title, subject={"reference": "urn:uuid:subject"})
+    doc["entry"][1]["fullUrl"] = "urn:uuid:subject"
+    doc["entry"][1]["resource"]["identifier"] = [
+        {"value": value} if system is None else {"system": system, "value": value}
+        for system, value in identifiers
+    ]
+    return doc
+
+
+def found(client, query):
+    res = client.get("/fhir/Bundle", params={"composition.patient.identifier": query})
+    assert res.status_code == 200, res.text
+    assert res.headers["content-type"].startswith("application/fhir+json")
+    body = res.json()
+    assert body["type"] == "searchset"
+    assert body["total"] == len(body.get("entry", []))
+    return body.get("entry", [])
+
+
+def test_documents_are_found_by_their_patients_identifier(client, monkeypatch):
+    """Across companies, newest first, valid ones only - each under the id
+    Bundle/{id} reads it back by, since companies send the very same document
+    and its own Bundle.id cannot tell them apart."""
+    tok_a = register(client, "Alpha")
+    tok_b = register(client, "Beta")
+    arne = patient_document((PNR, "194301011234"), title="Alpha's")
+    submit(client, tok_a, outcome(), monkeypatch, body=json.dumps(arne))
+    submit(client, tok_b, outcome(errors=1), monkeypatch,       # failed: not offered
+           body=json.dumps(patient_document((PNR, "194301011234"))))
+    submit(client, tok_b, outcome(), monkeypatch,
+           body=json.dumps(patient_document((PNR, "194301011234"), title="Beta's")))
+    submit(client, tok_b, outcome(), monkeypatch,               # somebody else
+           body=json.dumps(patient_document((PNR, "195901011234"))))
+
+    entries = found(client, PNR + "|194301011234")
+    assert [e["resource"]["entry"][0]["resource"]["title"] for e in entries] == [
+        "Beta's", "Alpha's"]
+    alphas = entries[-1]
+    assert alphas["fullUrl"] == "/fhir/Bundle/%s" % alphas["resource"]["id"]
+    assert alphas["resource"] == dict(arne, id=alphas["resource"]["id"])
+    assert client.get(alphas["fullUrl"]).json() == arne
+    assert len({e["resource"]["id"] for e in entries}) == 2
+
+
+def test_an_identifier_is_matched_the_way_fhir_matches_a_token(client, monkeypatch):
+    tok = register(client, "Alpha")
+    for doc in (patient_document((PNR, "1943"), title="pnr"),
+                patient_document(("urn:oid:1.2.752.129.2.1.3.1", "1943"), title="oid"),
+                patient_document((None, "1943"), title="none"),
+                patient_document((PNR, "1959"), title="other")):
+        submit(client, tok, outcome(), monkeypatch, body=json.dumps(doc))
+
+    def titles(query):
+        return sorted(e["resource"]["entry"][0]["resource"]["title"]
+                      for e in found(client, query))
+
+    assert titles(PNR + "|1943") == ["pnr"]
+    assert titles("1943") == ["none", "oid", "pnr"]           # any system
+    assert titles("|1943") == ["none"]                         # no system at all
+    assert titles(PNR + "|1943," + PNR + "|1959") == ["other", "pnr"]  # either
+    assert titles(PNR + "|19") == []                           # whole values only
+    assert titles("http://example.org|1943") == []
+
+
+def test_the_patient_is_the_one_the_composition_is_about(client, monkeypatch):
+    """composition.patient means Composition.subject - another Patient riding
+    in the document, a relative say, is not who it is about."""
+    tok = register(client, "Alpha")
+    doc = patient_document((PNR, "1943"))
+    doc["entry"].append({"fullUrl": "urn:uuid:mother",
+                         "resource": {"resourceType": "Patient",
+                                      "identifier": [{"system": PNR, "value": "1920"}]}})
+    submit(client, tok, outcome(), monkeypatch, body=json.dumps(doc))
+    assert len(found(client, PNR + "|1943")) == 1
+    assert found(client, PNR + "|1920") == []
+
+
+def test_every_document_type_is_searched(client, monkeypatch):
+    """A lab report about the patient is as much their document as a summary."""
+    tok = register(client, "Alpha")
+    report = patient_document((PNR, "1943"), title="Lab report")
+    report["meta"] = {"profile": [app_module.DOCUMENTS_BY_ID["laboratory"]["bundles"][0]]}
+    submit(client, tok, outcome(), monkeypatch, body=json.dumps(report))
+    assert exchange_by_type(client, "alpha").keys() == {"laboratory"}
+    assert [e["resource"]["entry"][0]["resource"]["title"]
+            for e in found(client, "1943")] == ["Lab report"]
+
+
+def test_a_prescription_is_not_a_document_and_is_not_searched(client, monkeypatch):
+    """eP/eD travels as a collection with no Composition, so there is no
+    composition.patient to match - and the API says so rather than leaving a
+    valid prescription to go missing without a word."""
+    tok = register(client, "Alpha")
+    prescription = json.loads(secondary_bundle("mpd"))
+    prescription["entry"].append({"resource": {
+        "resourceType": "Patient", "identifier": [{"system": PNR, "value": "1943"}]}})
+    submit(client, tok, outcome(), monkeypatch, body=json.dumps(prescription))
+    assert exchange_by_type(client, "alpha").keys() == {"mpd"}   # it is valid
+    assert found(client, "1943") == []
+    bundles = next(r for r in client.get("/fhir/metadata").json()["rest"][0]["resource"]
+                   if r["type"] == "Bundle")
+    assert "prescriptions" in bundles["searchParam"][0]["documentation"]
+
+
+def test_a_document_whose_file_is_gone_is_skipped_and_reported(client, monkeypatch):
+    tok = register(client, "Alpha")
+    for value in ("1943", "1943"):
+        submit(client, tok, outcome(), monkeypatch,
+               body=json.dumps(patient_document((PNR, value))))
+    assert len(found(client, "1943")) == 2      # every valid one, not one per type
+    errors = []
+    monkeypatch.setattr(app_module.monitor, "record_error",
+                        lambda _db, *args, **kw: errors.append(args))
+    with app_module.connect() as conn:
+        lost = conn.execute("SELECT id, filename FROM submissions "
+                            "ORDER BY id LIMIT 1").fetchone()
+    os.remove(os.path.join(app_module.DATA_DIR, "submissions", "alpha", lost["filename"]))
+    assert [e["resource"]["id"] for e in found(client, "1943")] == [str(lost["id"] + 1)]
+    assert errors == [("server", "Bundle search: submission %d has no file" % lost["id"])]
+
+
+@pytest.mark.parametrize("bundle_", [
+    None, [], {"entry": "no"},
+    {"entry": [None, {"resource": {"resourceType": "Composition"}}]},  # no subject
+    {"entry": [{"resource": {"resourceType": "Composition", "subject": "Patient/1"}}]},
+    {"entry": [{"resource": {"resourceType": "Composition",
+                             "subject": {"reference": "urn:uuid:nowhere"}}}]},
+    {"entry": [{"resource": {"resourceType": "Composition",
+                             "subject": {"reference": "urn:uuid:rp"}}},
+               {"fullUrl": "urn:uuid:rp",                       # not a Patient
+                "resource": {"resourceType": "RelatedPerson",
+                             "identifier": [{"value": "1943"}]}}]},
+])
+def test_a_document_without_a_resolvable_patient_has_no_identifiers(bundle_):
+    assert app_module.document_patient_identifiers(bundle_) == set()
+
+
+def test_a_retired_document_type_is_not_found_either(client, monkeypatch):
+    tok = register(client, "Retired")
+    submit(client, tok, outcome(), monkeypatch,
+           body=json.dumps(patient_document((PNR, "1943"))))
+    assert len(found(client, "1943")) == 1
+    with app_module.connect() as conn:
+        conn.execute("UPDATE submissions SET doc_type = 'withdrawn-guide'")
+    assert found(client, "1943") == []
+
+
+@pytest.mark.parametrize("params", [
+    {}, {"composition.patient.identifier": ""},
+    {"composition.patient.identifier": PNR + "|"},
+    {"composition.patient.identifier": ",|"},
+])
+def test_a_search_needs_an_identifier_to_look_for(client, params):
+    res = client.get("/fhir/Bundle", params=params)
+    assert res.status_code == 400
+    assert res.json()["resourceType"] == "OperationOutcome"
 
 
 def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
