@@ -6302,6 +6302,11 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <a href="/docs" target="_blank" rel="noopener">the interactive docs</a>.</p>
   <p class="muted">Fetch a company's exchange document:</p>
   <pre class="curl" id="curl-exchange"></pre>
+  <p class="muted">Find every valid document anyone has sent for one patient,
+  by the patient's identifier - <code>system|value</code>, or the value alone
+  to match it in any system. Prescriptions are collections rather than
+  documents, so they are not searched.</p>
+  <pre class="curl" id="curl-patient"></pre>
 </details>
 
 </div>
@@ -8948,11 +8953,6 @@ function interopCurls() {
     "# taken to be their first card, the patient summary if they have one.\n" +
     "# Every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
-    "# every valid document anyone has sent for one patient - system|value, or\n" +
-    "# the value alone to match it in any system. Prescriptions are collections,\n" +
-    "# not documents, and are not searched:\n" +
-    "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier="
-      + "http://electronichealth.se/identifier/personnummer|191212121212'\n\n" +
     "# or have documents sent to you: advertise where your system takes them\n" +
     "# in - hl7-fhir-rest for a FHIR base, or web-page for a how-to page:\n" +
     "curl -X POST " + origin + "/fhir/Endpoint \\\n" +
@@ -8966,6 +8966,13 @@ function interopCurls() {
     "# everyone's advertised endpoints, or one company's:\n" +
     "curl -s " + origin + "/fhir/Endpoint\n" +
     "curl -s '" + origin + "/fhir/Endpoint?organization=PARTNER_SLUG'";
+  /* Arne is the worked example's patient, so the search finds something on
+     any instance where teams have started from it. */
+  $("#curl-patient").textContent =
+    "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier="
+      + "http://electronichealth.se/identifier/personnummer|194302096997'\n" +
+    "# the same number in any identifier system:\n" +
+    "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier=194302096997'";
 }
 $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
