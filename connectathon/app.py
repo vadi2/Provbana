@@ -5583,6 +5583,7 @@ tr.rank-3 td:first-child { box-shadow: inset 3px 0 0 var(--bronze); color: var(-
 .banner.fail { display: block; color: var(--fail); background: var(--fail-bg);
   border: 1px solid var(--fail); }
 .banner .score { float: right; }
+.banner .score .company { font-size: var(--fs-medium); font-weight: 400; }
 /* The banner carries its scoring breakdown as a title, so say so. */
 .banner[title] { cursor: help; }
 /* Inline text with an explanation in its title. */
@@ -7415,10 +7416,13 @@ $("#submit-btn").addEventListener("click", async () => {
     banner.innerHTML = esc(text)
       + (isPrimary ? "" : '<span class="cat-chip" title="Validated against '
           + esc(docLabel(docType)) + '">' + esc(docShort(docType)) + "</span>")
-      /* A failed bundle shows its own 0: the standing an earlier pass earned,
-         printed beside "INVALID", reads as this bundle's score. It is still
-         in the hover text. */
-      + '<span class="score">' + (pass ? score : 0) + " pts</span>";
+      /* The points are this bundle's own (0 when it fails), not the standing:
+         the standing rests on the company's best summary, so a poorer bundle
+         sent later would otherwise show the better one's number. The
+         standing follows, labelled, when it differs. */
+      + '<span class="score">' + mine + " pts"
+      + (score !== mine ? '<span class="company"> · company ' + score + "</span>" : "")
+      + "</span>";
     renderIssues(outcome.issue || [], body);
     refreshLeaderboard();
   } catch (e) {

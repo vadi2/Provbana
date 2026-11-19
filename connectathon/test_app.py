@@ -4494,11 +4494,14 @@ def test_the_submit_tab_shows_findings_inside_the_document(client):
     assert "DOC_MAX_LINES" in text                               # a huge bundle stays usable
 
 
-def test_a_failed_bundle_does_not_show_an_earlier_score(client):
-    # X-Score is the standing, which an earlier pass keeps up; beside
-    # "INVALID" it read as this bundle's score. A fail shows its own 0.
+def test_the_banner_shows_this_bundles_points_not_the_best_ones(client):
+    # X-Score is the standing, which the company's best summary keeps up: as
+    # the badge it showed a poorer bundle sent afterwards - or a failed one -
+    # at the better one's points. The badge is X-Submission-Score (0 on a
+    # fail), with the standing labelled beside it when the two differ.
     text = client.get("/").text
-    assert '(pass ? score : 0) + " pts</span>"' in text
+    assert '+ \'<span class="score">\' + mine + " pts"' in text
+    assert "(score !== mine ? '<span class=\"company\"> · company ' + score" in text
     assert '+ (score ? " " + standing : "")' in text             # standing on hover
 
 
