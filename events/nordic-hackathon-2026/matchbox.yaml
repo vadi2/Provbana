@@ -5,7 +5,7 @@ hapi:
   fhir:
     implementationguides:
       # One package per EHDS Article 14 priority category this service scores,
-      # plus the Swedish base. app.py's EHDS_DOCUMENTS decides which of these a given
+      # plus the Swedish base. event.toml's document types decide which of these a given
       # submission is checked against; this list is only what the validator
       # holds. The two have to agree: a package named there and missing here
       # loads no profiles, so bundles of that category validate against nothing

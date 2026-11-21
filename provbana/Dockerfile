@@ -10,6 +10,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+# Reads the event folder, which is not baked in: compose mounts the one .env's
+# EVENT_DIR names at /event, so switching events is a restart, not a rebuild.
+COPY event.py .
+ENV EVENT_DIR=/event
 # The backup daemon runs from this same image as its own compose service - it
 # opens the SQLite database directly, so it has to be beside it. Stdlib only,
 # so it adds nothing to requirements.txt.
@@ -23,9 +27,6 @@ COPY warm.py .
 # And the usage log and its mailer: the service imports it to record requests
 # and errors, and the monitor container runs it to send the alerts and digest.
 COPY monitor.py .
-# Only the bundles: generate.py is the authoring tool, not part of the service.
-COPY samples/*.json ./samples/
-
 ENV DATA_DIR=/data
 # PORT is honoured by app.py's __main__ entry point, which also binds 0.0.0.0.
 ENV PORT=8095

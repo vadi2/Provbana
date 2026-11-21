@@ -1,4 +1,4 @@
-# Runtime dependencies for the connectathon service (app.py).
+# Runtime dependencies for the Provbana service (app.py).
 #
 # app.py imports only the stdlib plus fastapi + uvicorn; everything else here is
 # a required transitive dependency of those two. Pinned so every machine at the

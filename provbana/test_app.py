@@ -1,4 +1,4 @@
-"""Tests for the Nordic Hackathon 2026 service.
+"""Tests for Provbana, run against the default event (events/nordic-hackathon-2026).
 
 Matchbox is monkeypatched with canned OperationOutcomes; DATA_DIR points at a
 pytest tmp dir so every test gets a fresh SQLite database and audit log.
@@ -118,7 +118,7 @@ def _pin_env(monkeypatch):
     monkeypatch.setattr(app_module, "MAX_JSON_BODY_BYTES", 64 * 1024)
     monkeypatch.setattr(app_module, "USAGE_DB", "")
     monkeypatch.setattr(app_module, "SAMPLES_DIR",
-                        os.path.join(os.path.dirname(app_module.__file__), "samples"))
+                        os.path.join(app_module.EVENT["dir"], "samples"))
 
 
 @pytest.fixture()
@@ -1061,7 +1061,7 @@ def test_the_clinical_view_knows_what_kind_of_document_it_shows(client, monkeypa
     assert [(s["title"], len(s["items"])) for s in summary["sections"]] == [("Entries", 3)]
     assert summary["unreferenced"] == []
     text = client.get("/").text
-    assert 'esc(comp.title || docLabel(d.doc_type || "eps"))' in text
+    assert 'esc(comp.title || docLabel(d.doc_type || PRIMARY_DOC))' in text
     assert '} else if (d.doc_type && d.doc_type !== "eps") {' in text
     assert "if (aBody) h += dbCard(" in text
 
@@ -1458,10 +1458,37 @@ def test_samples_carry_the_personnummer_from_the_bundle(client):
     """The page shows each example's personnummer, read off the document so
     the two cannot drift, in the hyphenated form people write it in."""
     samples = {s["id"]: s for s in param_entries(client.get("/fhir/$samples"))}
-    assert samples["andrea-cross-border"]["personnummer"] == "20020725-2388"
-    assert samples["arne-complex-care"]["personnummer"] == "19430209-6997"
-    assert app_module.sample_personnummer(None) is None
-    assert app_module.sample_personnummer(b'{"entry": [{}]}') is None
+    assert samples["andrea-cross-border"]["identifier"] == "20020725-2388"
+    assert samples["arne-complex-care"]["identifier"] == "19430209-6997"
+    assert app_module.sample_identifier(None) is None
+    assert app_module.sample_identifier(b'{"entry": [{}]}') is None
+
+
+def _patient_with(*identifiers):
+    return json.dumps({"entry": [{"resource": {
+        "resourceType": "Patient", "identifier": list(identifiers)}}]}).encode()
+
+
+def test_national_identifiers_are_labelled_by_their_system():
+    """Each Nordic national number gets its own name, written as on paper
+    where that differs from storage; an unknown system is not presented as a
+    national number at all, and the first known one wins."""
+    cpr = {"system": "urn:oid:1.2.208.176.1.2", "value": "0101701234"}
+    fnr = {"system": "urn:oid:2.16.578.1.12.4.1.4.1", "value": "01017012345"}
+    hetu = {"system": "urn:oid:1.2.246.21", "value": "010170-123A"}
+    mrn = {"system": "https://hospital.example/mrn", "value": "A-1"}
+    assert app_module.sample_identifier(_patient_with(cpr)) == ("CPR-nummer", "010170-1234")
+    assert app_module.sample_identifier(_patient_with(fnr)) == ("Fødselsnummer", "01017012345")
+    assert app_module.sample_identifier(_patient_with(hetu)) == ("Henkilötunnus", "010170-123A")
+    assert app_module.sample_identifier(_patient_with(mrn)) is None
+    assert app_module.sample_identifier(_patient_with(mrn, cpr))[0] == "CPR-nummer"
+
+
+def test_an_event_can_name_its_own_national_identifier(monkeypatch):
+    monkeypatch.setitem(app_module.NATIONAL_IDENTIFIERS,
+                        "https://example.org/national-id", "Citizen number")
+    assert app_module.sample_identifier(_patient_with(
+        {"system": "https://example.org/national-id", "value": "42"})) == ("Citizen number", "42")
 
 
 def test_index_lists_examples_as_a_company(client):
@@ -1687,7 +1714,7 @@ def test_ville_sample_patient_story_is_shown_as_narrative(client):
 def test_samples_label_a_samordningsnummer_as_one(client):
     """Ville has no personnummer; the number shown must not be called one."""
     samples = {s["id"]: s for s in param_entries(client.get("/fhir/$samples"))}
-    assert samples["ville-difficult-airway"]["personnummer"] == "20130482-2172"
+    assert samples["ville-difficult-airway"]["identifier"] == "20130482-2172"
     assert samples["ville-difficult-airway"]["identifierLabel"] == "Samordningsnummer"
     assert samples["arne-complex-care"]["identifierLabel"] == "Personnummer"
     text = client.get("/").text
@@ -2152,7 +2179,7 @@ def test_the_health_check_covers_every_category(monkeypatch):
 def test_every_category_the_registry_names_is_a_package_the_validator_loads():
     """The one invariant adding or removing a category has to satisfy by hand.
 
-    EHDS_DOCUMENTS and matchbox/config/application.yaml are edited separately,
+    event.toml and the event's matchbox.yaml are edited separately,
     and a category named in the registry with no package in the yaml validates
     against nothing and scores as if it had passed - the silent failure the
     yaml's own comment warns about. Until now only /fhir/$status caught it,
@@ -2163,8 +2190,7 @@ def test_every_category_the_registry_names_is_a_package_the_validator_loads():
     supporting package that reaches the validator through another guide's
     dependencies rather than a yaml entry of its own.
     """
-    yaml_path = os.path.join(os.path.dirname(os.path.abspath(app_module.__file__)),
-                             os.pardir, "matchbox", "config", "application.yaml")
+    yaml_path = os.path.join(app_module.EVENT["dir"], "matchbox.yaml")
     with open(yaml_path, encoding="utf-8") as fh:
         # Deliberately not a YAML parse: the file is a fixed two-line-per-entry
         # shape and the suite has no yaml dependency.
@@ -5498,14 +5524,13 @@ def run_explain(client, groups, severity, reported):
     """Build the explain-with-an-assistant prompt with the page's own code."""
     js = page_script(client)
     parts = []
-    for name in ("EXPLAIN_GUIDES", "EXPLAIN_PROVIDERS"):
+    for name, end_at in (("EVENT_DOCS", ";\n"), ("EXPLAIN_GUIDES", "]));\n")):
         start = js.index("const %s = " % name)
-        # One is an object literal and the other an array, and both carry ";\n"
-        # inside their string values - so close on whichever bracket terminator
-        # comes first, not on the first semicolon.
-        end = min(e for e in (js.find("};\n", start), js.find("];\n", start))
-                  if e != -1)
-        parts.append(js[start:end + 3])
+        parts.append(js[start:js.index(end_at, start) + len(end_at)])
+    start = js.index("const EXPLAIN_PROVIDERS = ")
+    # An array carrying ";\n" inside its string values - so close on the
+    # bracket terminator, not on the first semicolon.
+    parts.append(js[start:js.index("];\n", start) + 3])
     # explainPrompt reads it; the page sets it from X-Document-Type per submission.
     parts.append('let explainDoc = "eps";\n')
     parts += [page_function(js, name) for name in ("explainPrompt", "explainUrl")]
@@ -5536,9 +5561,9 @@ def test_the_explain_prompt_carries_every_error_with_its_location_and_profiles(c
     than leaving the assistant to wonder where the other two went."""
     got = run_explain(client, EXPLAIN_GROUPS, "error", 4)
     prompt = got["prompt"]
-    assert prompt.startswith("I am validating a FHIR bundle against the HL7 Europe "
-                             "European Patient Summary implementation guide "
-                             "(https://hl7.eu/fhir/eps/)")
+    assert prompt.startswith("I am validating a FHIR bundle against the HL7 EU EPS "
+                             "(European Patient Summary) implementation guide "
+                             "(https://hl7.eu/fhir/eps/1.0.0-ballot/)")
     assert "Explain what these errors mean" in prompt
     assert "starting with whichever change clears the most of them" in prompt
     assert "The 4 errors, merged into 2 distinct findings:\n\n1. Slice" in prompt
@@ -6809,7 +6834,8 @@ def test_the_clinical_list_reads_the_category_the_api_sends(client, monkeypatch)
     entry = param_entries(client.get("/fhir/$submissions"))[0]
     js = page_script(client)
     parts = []
-    for decl in ("const esc = ", "let DOC_LABELS = ", "const docLabel = "):
+    for decl in ("const esc = ", "const EVENT_DOCS = ", "const PRIMARY_DOC = ",
+                 "let DOC_LABELS = ", "const docLabel = "):
         start = js.index(decl)
         parts.append(js[start:js.index(";\n", start) + 2])
     parts += [page_function(js, name) for name in ("submissionRow", "cvListRow")]
@@ -6838,7 +6864,8 @@ def test_each_published_document_gets_its_own_card_and_screenshots(client, monke
     by_type = {e["documentType"]: e["id"] for e in entries}
     js = page_script(client)
     parts = ["let me = null; const maxNote = 500;"]
-    for decl in ("const esc = ", "let DOC_LABELS = ", "const docLabel = "):
+    for decl in ("const esc = ", "const EVENT_DOCS = ", "const PRIMARY_DOC = ",
+                 "let DOC_LABELS = ", "const docLabel = "):
         start = js.index(decl)
         parts.append(js[start:js.index(";\n", start) + 2])
     parts += [page_function(js, name) for name in (
@@ -7133,23 +7160,17 @@ def test_a_retired_category_still_in_the_database_scores_nothing(client, monkeyp
 
 
 def test_the_page_names_every_category_it_can_be_asked_about(client):
-    """Three lists in the page script mirror the registry by hand.
-
-    DOC_LABELS is refreshed from $documents so it self-heals, but DOC_SHORT and
-    EXPLAIN_GUIDES are const and never refreshed - and both fail soft, to the
-    raw id and to the summary's guide respectively. A category added to the
-    registry and forgotten here sends a team to the wrong specification with
-    nothing to show for it, which is precisely the drift the guide link exists
-    to prevent.
-    """
+    """DOC_SHORT, DOC_LABELS and EXPLAIN_GUIDES are all built from EVENT_DOCS,
+    which the server writes into the page from the event's own registry - so a
+    category cannot be missing from them and send a team to the wrong
+    specification."""
     js = page_script(client)
-    ids = {d["id"] for d in app_module.EHDS_DOCUMENTS}
-    for name in ("DOC_SHORT", "EXPLAIN_GUIDES"):
-        start = js.index("const %s = " % name)
-        # Anchored on the separator, so a key is only a key where one can
-        # start - "https:" inside a guide URL is not one.
-        listed = set(re.findall(r"[{,]\s*(\w+):", js[start:js.index("};", start)]))
-        assert listed == ids, (name, listed ^ ids)
+    start = js.index("const EVENT_DOCS = ") + len("const EVENT_DOCS = ")
+    docs = json.loads(js[start:js.index(";\n", start)])
+    assert [d["id"] for d in docs] == [d["id"] for d in app_module.EHDS_DOCUMENTS]
+    assert [d["id"] for d in docs if d["primary"]] == [app_module.PRIMARY_DOCUMENT["id"]]
+    for name in ("DOC_SHORT", "DOC_LABELS", "EXPLAIN_GUIDES"):
+        assert re.search(r"(const|let) %s = Object\.fromEntries\(\s*EVENT_DOCS\.map" % name, js), name
 
 
 # ------------------------------------------------- EPS is the primary citizen
@@ -7723,7 +7744,7 @@ def test_an_unreachable_smtp_server_is_a_failed_send_not_a_crash(monkeypatch):
 
 def _sample(name):
     return app_module.summarize_bundle(
-        json.load(open(os.path.join(os.path.dirname(app_module.__file__),
+        json.load(open(os.path.join(app_module.EVENT["dir"],
                                     "samples", f"{name}.json"))))
 
 
@@ -7805,3 +7826,151 @@ def test_a_result_says_which_way_it_is_off_and_against_what():
     assert item["detail"].startswith("118 µmol/L")
     plain = _items(_eps(_lab("2026-08-01")))[0]
     assert not plain.get("direction") and not plain.get("range")
+
+
+# ------------------------------------------------------------ event folders
+
+import event as event_config  # noqa: E402
+
+
+def write_event(path, toml):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "event.toml").write_text(toml, encoding="utf-8")
+    return str(path)
+
+
+SECOND_EVENT = """
+[event]
+name = "Test Fest <2027>"
+when_where = "somewhere"
+
+[documents]
+primary = "laboratory"
+enabled = ["laboratory"]
+
+[scoring]
+valid_base = 7
+"""
+
+SECOND_EVENT_PROBE = r"""
+import json
+from fastapi.testclient import TestClient
+import app
+page = TestClient(app.app).get("/").text
+doc = app.detect_document({"resourceType": "Bundle", "type": "document", "entry": [
+    {"resource": {"resourceType": "ImagingStudy"}}]})
+theme = TestClient(app.app).get("/theme.css")
+print(json.dumps({
+    "primary": app.PRIMARY_DOCUMENT["id"],
+    "igs": app.VALIDATION_IGS,
+    "valid_base": app.VALID_BASE,
+    "identifier_system": app.TEAM_IDENTIFIER_SYSTEM,
+    "samples": app.SAMPLES,
+    "nordic": "Nordic" in page or "Kista" in page,
+    "title": "<title>Test Fest &lt;2027&gt;</title>" in page,
+    "part_of": "<p>Part of the Test Fest &lt;2027&gt;, somewhere.</p>" in page,
+    "imaging_reads_as": doc["id"],
+    "theme_linked": '<link rel="stylesheet" href="/theme.css">' in page,
+    "theme_status": theme.status_code,
+    "theme_body": theme.text,
+}))
+"""
+
+
+def probe_event(tmp_path, event_dir):
+    env = dict(os.environ, EVENT_DIR=event_dir, DATA_DIR=str(tmp_path / "data"),
+               SITE_ADDRESS="fest.example")
+    (tmp_path / "data").mkdir(exist_ok=True)
+    proc = subprocess.run([sys.executable, "-c", SECOND_EVENT_PROBE], env=env,
+                          cwd=os.path.dirname(os.path.abspath(app_module.__file__)),
+                          capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+def test_a_second_event_runs_from_its_own_folder(tmp_path):
+    """Another event is a folder, not an edit: its name is on the page and
+    nothing of the Nordic one is, its only category is the primary and the only
+    guide the validator must hold, and a bundle of a category it did not enable
+    falls back to its primary instead of erroring."""
+    got = probe_event(tmp_path, write_event(tmp_path / "fest", SECOND_EVENT))
+    assert got["primary"] == "laboratory"
+    assert got["igs"] == ["hl7.fhir.eu.laboratory#2.1.0"]
+    assert got["valid_base"] == 7
+    assert got["identifier_system"] == "https://fest.example/fhir/company"
+    assert got["samples"] == []
+    assert not got["nordic"]
+    assert got["title"] and got["part_of"]
+    assert got["imaging_reads_as"] == "laboratory"
+    assert not got["theme_linked"] and got["theme_status"] == 404
+
+
+def test_an_event_theme_is_linked_and_served(tmp_path):
+    folder = tmp_path / "fest"
+    write_event(folder, SECOND_EVENT)
+    (folder / "theme.css").write_text(":root { --accent: #0a7; }", encoding="utf-8")
+    got = probe_event(tmp_path, str(folder))
+    assert got["theme_linked"] and got["theme_status"] == 200
+    assert got["theme_body"] == ":root { --accent: #0a7; }"
+
+
+@pytest.mark.parametrize("toml, named", [
+    ('[event]\nname = "X"\n[scoring]\nvalid_bse = 1\n', "valid_bse"),
+    ('[event]\nname = "X"\nlocation = "Y"\n', "location"),
+    ('[evnt]\nname = "X"\n', "evnt"),
+    ('[event]\nwhen_where = "Y"\n', "[event] name"),
+    ('[event]\nname = "X"\n[scoring]\nvalid_base = -1\n', "valid_base"),
+    ('[event]\nname = "X"\n[[samples]]\nname = "Andrea"\n', "id"),
+    ('[event]\nname = "X"\n[[samples]]\nid = "a"\nname = "A"\ncolour = "red"\n', "colour"),
+    ('[event]\nname = "X"\n[documents.eps]\nigz = []\n', "igz"),
+])
+def test_a_mistake_in_event_toml_is_refused_with_the_key_named(tmp_path, toml, named):
+    with pytest.raises(event_config.EventConfigError, match=re.escape(named)):
+        event_config.load(write_event(tmp_path / "bad", toml))
+
+
+@pytest.mark.parametrize("documents, named", [
+    ('primary = "hdr"\nenabled = ["eps"]', "primary 'hdr' is not in enabled"),
+    ('enabled = ["eps", "eps"]', "lists a type twice"),
+    ('enabled = ["eps"]\n[documents.laboratory]\nspec = "x"', "[documents.laboratory]"),
+    ('enabled = ["dental"]\n[documents.dental]\nlabel = "Dental"', "needs"),
+])
+def test_a_document_type_mistake_is_refused(tmp_path, documents, named):
+    config = event_config.load(write_event(
+        tmp_path / "bad", '[event]\nname = "X"\n[documents]\n' + documents + "\n"))
+    with pytest.raises(event_config.EventConfigError, match=re.escape(named)):
+        event_config.build_documents(app_module.DOCUMENT_CATALOGUE, config)
+
+
+def test_an_event_can_add_a_guide_and_define_its_own_type(tmp_path):
+    """extra_igs adds to the catalogue's pin rather than restating it, and a
+    type the catalogue lacks is whole once it names what validating it needs."""
+    config = event_config.load(write_event(tmp_path / "ev", """
+[event]
+name = "X"
+[documents]
+primary = "dental"
+enabled = ["dental", "eps"]
+[documents.eps]
+extra_igs = ["example.national.base#1.0.0"]
+[documents.dental]
+label = "Dental record"
+long_label = "Dental Record"
+short = "DENT"
+category = "Dental"
+profile = "https://example.org/StructureDefinition/dental-bundle"
+igs = ["example.dental#0.1.0"]
+bundles = ["https://example.org/StructureDefinition/dental-bundle"]
+"""))
+    docs = event_config.build_documents(app_module.DOCUMENT_CATALOGUE, config)
+    assert [(d["id"], d["primary"]) for d in docs] == [("dental", True), ("eps", False)]
+    assert docs[1]["igs"] == ["hl7.fhir.eu.eps#1.0.0-ballot", "example.national.base#1.0.0"]
+    assert docs[0]["loinc"] == [] and docs[0]["bundles"] == [
+        "https://example.org/StructureDefinition/dental-bundle"]
+
+
+def test_the_shipped_event_folder_is_the_default():
+    assert app_module.EVENT["dir"] == event_config.DEFAULT_EVENT_DIR
+    assert app_module.EVENT["event"]["name"] == "Nordic Hackathon 2026"
+    assert [s["id"] for s in app_module.SAMPLES] == [
+        "andrea-cross-border", "arne-complex-care", "ville-difficult-airway"]

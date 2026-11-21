@@ -1,11 +1,15 @@
-# Nordic Hackathon 2026
+# Provbana
 
-Service for the [Nordic Hackathon 2026](https://nordichackathon2026.blogs.dsv.su.se), 18-20 November in Kista.
+Gamified FHIR document service for hackathons and connectathons: teams register, submit
+FHIR document bundles, a local [Matchbox](https://github.com/ahdis/matchbox) validates
+them against the event's implementation guides, and a live leaderboard keeps score.
 
-Gamified FHIR hackathon service: teams register, submit European Patient Summary bundles,
-a local [Matchbox](https://github.com/ahdis/matchbox) validates them against HL7 EU EPS, and a live leaderboard keeps score.
-Four other EHDS [document types](#document-types) are accepted too, validated against
-their own HL7 Europe guide - second-class on purpose: the patient summary is the track.
+The event it runs for is read from `$EVENT_DIR/event.toml` (default
+`../events/nordic-hackathon-2026`) - see the [top-level README](../README.md#running-it-for-your-event).
+This README describes the default: the Nordic Hackathon 2026's European Patient Summary
+track, where four other EHDS [document types](#document-types) are accepted too,
+validated against their own HL7 Europe guide - second-class on purpose: the patient
+summary is the track.
 
 ## Run
 
@@ -16,7 +20,7 @@ creates the `itb_default` docker network the container run below joins:
 cd ../itb && docker compose -p itb up -d matchbox   # -> http://localhost:8090/matchboxv3/fhir
 ```
 
-Matchbox reads `matchbox/config/application.yaml` once, at boot. After editing it
+Matchbox reads the event's `matchbox.yaml` once, at boot. After editing it
 (adding an IG, say) recreate the container - `docker compose -p itb up -d
 --force-recreate matchbox` - or the running validator keeps its old package list and
 `/fhir/$status` reports it as `degraded`.
@@ -25,8 +29,9 @@ Matchbox reads `matchbox/config/application.yaml` once, at boot. After editing i
 `docker run` fails with `network itb_default not found`):
 
 ```
-docker build -t connectathon .
-docker run --network itb_default -p 8095:8095 -v conn-data:/data connectathon
+docker build -t provbana .
+docker run --network itb_default -p 8095:8095 -v provbana-data:/data \
+  -v "$PWD/../events/nordic-hackathon-2026:/event:ro" provbana
 ```
 
 **Bare metal** (Python 3.11+ - the pins assume it; the image uses 3.12):
@@ -39,12 +44,13 @@ DATA_DIR=./data MATCHBOX_URL=http://localhost:8090/matchboxv3/fhir .venv/bin/pyt
 `python app.py` binds `0.0.0.0`, so participants reach it at `http://<organiser-ip>:8095/`.
 Do not use `uvicorn app:app` - it defaults to localhost only and ignores `PORT`.
 
-Environment: `PORT` (8095), `DATA_DIR` (`/data`), `MATCHBOX_URL`
+Environment: `EVENT_DIR` (the event folder - `../events/nordic-hackathon-2026`, or
+`/event` in the image, which bakes none in), `PORT` (8095), `DATA_DIR` (`/data`), `MATCHBOX_URL`
 (`http://matchbox:8080/matchboxv3/fhir`), `PROFILE`
 (`http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps` - the patient summary
 profile the event scores against; the other document types carry their own),
 `SAMPLES_DIR`
-(`samples/` next to `app.py`), `MAX_BODY_BYTES` (5 MB), `MAX_IMAGE_BYTES` (2 MB - the
+(`samples/` in the event folder), `MAX_BODY_BYTES` (5 MB), `MAX_IMAGE_BYTES` (2 MB - the
 backstop for an interop screenshot; the UI downscales before it uploads, so this is
 not the expected size), `MATCHBOX_TIMEOUT` (60 s - how long a submitting client waits
 on a wedged validator), `REGISTER_CODE` (unset = registration is open; set it to
@@ -55,20 +61,20 @@ screenshots, one directory per uploading company).
 
 `VALIDATION_IGS` (comma-separated) is the list of packages `/fhir/$status`
 insists Matchbox has actually loaded, and `deploy.sh` refuses to finish while
-any of them is missing. It defaults to every package named in `EHDS_DOCUMENTS`,
+any of them is missing. It defaults to every package the event's document types name,
 de-duplicated, so a category whose guide is missing is caught before an event
 rather than silently scored unchecked. It does *not* decide what a given bundle
 is checked against: each document type carries its own package list, and that is
 what the validation engine is scoped to - see [Document
 types](#document-types). Narrow it only to run against a Matchbox holding fewer
 IGs than the registry describes. Whatever is named here must also be listed in
-`matchbox/config/application.yaml`, or Matchbox has nothing to load.
+the event's `matchbox.yaml`, or Matchbox has nothing to load.
 
 Tests: `.venv/bin/pip install -r requirements-dev.txt && .venv/bin/python -m pytest -q test_app.py`
 
 Demo data for a local preview: `.venv/bin/python seed_demo.py` (with the service and
 Matchbox running) registers a handful of fake companies, submits the bundles in
-`examples/` and `samples/`, and publishes a few interop screenshots against them, so
+`examples/` and the event's `samples/`, and publishes a few interop screenshots against them, so
 every UI state has something to show. The screenshots are drawn by the script - no real
 product is pictured. `--reset` deletes
 the data directory first - stop the service before, restart it after. Never point it at
@@ -77,7 +83,7 @@ the event instance.
 Terminology lookup is off: Matchbox runs with its packaged `txServer: n/a`, so
 structure, profiles and cardinality are checked in full but a SNOMED CT, LOINC
 or ATC code is reported as "cannot be validated" instead of being confirmed.
-Turning it on is one line in `matchbox/config/application.yaml`, and that file
+Turning it on is one line in the event's `matchbox.yaml`, and the Nordic one
 explains both reasons it is off - an unreachable terminology server stops
 Matchbox booting at all, and one that dies mid-event fails the next bundle
 carrying an uncached code with a hard error, scoring a good bundle 0.
@@ -98,7 +104,7 @@ Start it beside the service and leave it running for the whole event:
 ```
 
 ```
-18:32:22  snapshotting ./data into /home/.../connectathon/backups every 900s, keeping 384
+18:32:22  snapshotting ./data into /home/.../provbana/backups every 900s, keeping 384
 18:32:22  snapshot 20260902T183222Z - 21 files, 641.0 KB
 ```
 
@@ -142,7 +148,7 @@ snapshot                files       size  contents
 20260902T183222Z           21   641.0 KB  11 companies, 14 submissions
 20260902T184722Z           21   641.0 KB  11 companies, 14 submissions
 
-3 snapshot(s) in /home/.../connectathon/backups
+3 snapshot(s) in /home/.../provbana/backups
 ```
 
 Names are UTC timestamps, and the company and submission counts come from
@@ -164,10 +170,10 @@ the snapshot holds and what would move where, then exits 1:
 ```
 
 ```
-Restore /home/.../connectathon/backups/20260902T184722Z
+Restore /home/.../provbana/backups/20260902T184722Z
   contains   11 companies, 14 submissions, 21 files (641.0 KB)
-  into       /home/.../connectathon/data
-  current    /home/.../connectathon/data -> moved aside to /home/.../connectathon/data.replaced-20260902T185727Z (nothing is deleted)
+  into       /home/.../provbana/data
+  current    /home/.../provbana/data -> moved aside to /home/.../provbana/data.replaced-20260902T185727Z (nothing is deleted)
 
 Stop the service, then re-run with --yes to go ahead.
 ```
@@ -186,8 +192,8 @@ of the restored one.
 ```
 
 ```
-18:57:27  restored 20260902T184722Z -> /home/.../connectathon/data
-18:57:27  previous data is at /home/.../connectathon/data.replaced-20260902T185727Z - delete it once you are happy
+18:57:27  restored 20260902T184722Z -> /home/.../provbana/data
+18:57:27  previous data is at /home/.../provbana/data.replaced-20260902T185727Z - delete it once you are happy
 18:57:27  start the service again now
 ```
 
@@ -446,17 +452,17 @@ error saying which profile to add rather than paid for conformance nobody checke
 Each category is validated in its own engine: Matchbox scopes an engine to the
 requested profile's dependency closure, so a lab report checked with the summary's
 packages comes back with its conformance *unchecked* rather than checked and failed -
-a silent pass. The package list per category lives in `EHDS_DOCUMENTS` in `app.py`,
-and each category's own guide must also be in `matchbox/config/application.yaml`.
-Adding a sixth category is an entry in each; `test_every_category_the_registry_names_
+a silent pass. The package list per category lives in `DOCUMENT_CATALOGUE` in `app.py`,
+an event can override it in `event.toml`, and each category's own guide must also be in
+the event's `matchbox.yaml`. Adding a sixth category is an entry in each; `test_every_category_the_registry_names_
 is_a_package_the_validator_loads` holds the two together. One of the guides fails its own
 published examples for reasons outside this repository;
-`matchbox/config/application.yaml` records which and why.
+the Nordic `matchbox.yaml` records which and why.
 
 ## Swedish base profiles
 
-The bundles in `samples/` (built by `samples/generate.py`, which is the place to edit
-them) claim the HL7 Sweden base profiles
+The Nordic event's bundles in `samples/` (built by `samples/generate.py`, which is the
+place to edit them) claim the HL7 Sweden base profiles
 ([hl7se.fhir.base](https://hl7.se/fhir/ig/base/)) alongside the European ones:
 `SEBasePatient`, `SEBasePractitioner`, `SEBaseOrganization` and
 `SEBasePractitionerRole`. In practice that means Swedish identifiers go in the
@@ -466,8 +472,8 @@ rather than the `urn:oid:1.2.752.129.2.1.3.1` OID, HSA-id under
 personnummer still validates; it just matches no slice, so nothing Swedish is
 checked.
 
-Teams are not required to claim these profiles, but the validator is configured
-to resolve them (see `VALIDATION_IGS`), so a team that does gets real feedback
+Teams are not required to claim these profiles, but the event adds the package to the
+patient summary's guides (`extra_igs` in its `event.toml`), so a team that does gets real feedback
 instead of a "not checked" warning.
 
 ## API
@@ -760,7 +766,8 @@ replaced. It is out of the CapabilityStatement and out of `/openapi.json`; build
 
 ### Samples
 
-Synthetic worked examples of the hackathon scenarios - no real patient data.
+Synthetic worked examples of the event's scenarios, from its `[[samples]]` - no real
+patient data.
 
 ```
 curl 'localhost:8095/fhir/$samples'

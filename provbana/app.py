@@ -1,5 +1,8 @@
-"""Nordic Hackathon 2026 - gamified FHIR European Patient Summary validation service.
+"""Provbana - gamified FHIR document validation, scoring and interop for hackathons.
 
+Which event it runs for - name, document types, scoring, worked examples - is
+read from $EVENT_DIR/event.toml; see event.py. Written for, and by default
+configured as, the Nordic Hackathon 2026's European Patient Summary track.
 Teams register, submit EPS bundles, Matchbox validates, leaderboard keeps score.
 Other EHDS document categories - laboratory report, prescription and dispense,
 imaging report, discharge report - are accepted and validated against their own
@@ -39,6 +42,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 # recording half is all this process uses, the mailing runs in its own
 # container.
 import monitor
+# The event this instance runs for. Loaded before anything below that depends
+# on it, and fatal when malformed: a typo must not quietly score with defaults.
+import event as event_config
+
+EVENT = event_config.load()
 
 MATCHBOX_URL = os.environ.get(
     "MATCHBOX_URL", "http://matchbox:8080/matchboxv3/fhir"
@@ -70,8 +78,11 @@ MATCHBOX_URL = os.environ.get(
 #             everything else in detect_document().
 #   loinc     Composition.type codes that identify it when nothing is claimed.
 #
-# Adding a category is adding an entry here plus its package in
-# matchbox/config/application.yaml. Nothing else in the service knows the list.
+# This list is the built-in catalogue. The event's event.toml picks which of
+# these it accepts and which is the primary, can override their version pins and
+# add guides, and can define a type the catalogue does not have - see
+# event.build_documents(). Every package a chosen type needs also has to be in
+# the event's matchbox.yaml.
 EPS_PROFILE = os.environ.get(
     "PROFILE", "http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"
 )
@@ -79,19 +90,17 @@ EPS_PROFILE = os.environ.get(
 # a box may already have set, so it keeps its old name as well as its new one.
 PROFILE = EPS_PROFILE
 
-EHDS_DOCUMENTS = [
+DOCUMENT_CATALOGUE = [
     {
         "id": "eps",
+        "guide": "HL7 EU EPS",
         "label": "Patient summary",
         "long_label": "European Patient Summary",
         "short": "PS",
         "category": "Patient summary",
         "primary": True,
         "profile": EPS_PROFILE,
-        # hl7se.fhir.base rides along on this one only: it is a Swedish event
-        # and teams claim the Swedish base profiles on Patient, but they have
-        # nothing to say about a lab report or an imaging study.
-        "igs": ["hl7.fhir.eu.eps#1.0.0-ballot", "hl7se.fhir.base#1.1.0"],
+        "igs": ["hl7.fhir.eu.eps#1.0.0-ballot"],
         "bundles": ["http://hl7.eu/fhir/eps/StructureDefinition/bundle-eu-eps"],
         "loinc": ["60591-5"],
         "ehds_from": 2029,
@@ -100,6 +109,7 @@ EHDS_DOCUMENTS = [
     },
     {
         "id": "laboratory",
+        "guide": "HL7 EU Laboratory",
         "label": "Laboratory report",
         "long_label": "Laboratory Report",
         "short": "LAB",
@@ -116,6 +126,7 @@ EHDS_DOCUMENTS = [
     },
     {
         "id": "mpd",
+        "guide": "HL7 EU MPD",
         "label": "Prescription and dispense",
         "long_label": "Medication Prescription and Dispense",
         "short": "eP/eD",
@@ -150,6 +161,7 @@ EHDS_DOCUMENTS = [
     },
     {
         "id": "imaging",
+        "guide": "HL7 EU Imaging",
         "label": "Imaging report",
         "long_label": "Imaging Report",
         "short": "IMG",
@@ -174,6 +186,7 @@ EHDS_DOCUMENTS = [
     },
     {
         "id": "hdr",
+        "guide": "HL7 EU HDR",
         "label": "Discharge report",
         "long_label": "Hospital Discharge Report",
         "short": "HDR",
@@ -192,11 +205,13 @@ EHDS_DOCUMENTS = [
     },
 ]
 
+# The event's document types, primary first in its own order.
+EHDS_DOCUMENTS = event_config.build_documents(DOCUMENT_CATALOGUE, EVENT)
 DOCUMENTS_BY_ID = {doc["id"]: doc for doc in EHDS_DOCUMENTS}
 # The track. Also the fallback for a bundle that announces nothing, so an
 # unrecognised submission is scored exactly as it was before any of the other
 # categories existed.
-PRIMARY_DOCUMENT = DOCUMENTS_BY_ID["eps"]
+PRIMARY_DOCUMENT = next(doc for doc in EHDS_DOCUMENTS if doc["primary"])
 SECONDARY_DOCUMENTS = [doc for doc in EHDS_DOCUMENTS if not doc["primary"]]
 
 # Packages $status insists Matchbox actually loaded. Every document's list,
@@ -218,9 +233,7 @@ VALIDATION_IGS = [
 ]
 
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
-SAMPLES_DIR = os.environ.get(
-    "SAMPLES_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "samples")
-)
+SAMPLES_DIR = os.environ.get("SAMPLES_DIR", os.path.join(EVENT["dir"], "samples"))
 PORT = int(os.environ.get("PORT", "8095"))
 # Who used the service, and what broke - read by monitor.py's loop. Beside
 # DATA_DIR unless told otherwise; the event box points it outside, so a backup
@@ -246,19 +259,21 @@ MAX_JSON_BODY_BYTES = 64 * 1024
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(2 * 1024 * 1024)))
 MAX_NOTE_CHARS = 2000
 
-VALID_BASE = 50        # points for a submission with zero error/fatal issues
-SECTION_POINTS = 10    # per populated top-level Composition section
-RESOURCE_POINTS = 2    # per clinical resource (not Composition/Patient)
-RESOURCE_CAP = 60      # max points from clinical resources
-SECTION_CAP = 160      # max points from sections (the IPS set is ~16 sections)
-FIRST_PASS_BONUS = 20  # one-time, to the first company to pass a patient summary
+# The event's [scoring], defaulting to event.SCORING_DEFAULTS.
+_SCORING = EVENT["scoring"]
+VALID_BASE = _SCORING["valid_base"]          # a submission with zero error/fatal issues
+SECTION_POINTS = _SCORING["section_points"]  # per populated top-level Composition section
+RESOURCE_POINTS = _SCORING["resource_points"]  # per clinical resource (not Composition/Patient)
+RESOURCE_CAP = _SCORING["resource_cap"]      # max points from clinical resources
+SECTION_CAP = _SCORING["section_cap"]        # max points from sections (the IPS set is ~16)
+FIRST_PASS_BONUS = _SCORING["first_pass_bonus"]  # one-time, first company to pass the primary
 # Per non-EPS EHDS category a company has passed, once each. Deliberately small
 # and flat: EHDS obliges EHR systems to exchange six categories rather than one,
 # so breadth is worth acknowledging, but this is the patient summary track and a
 # stack of lab reports must not out-rank a well-built summary. A company that
 # submits only patient summaries scores precisely what it scored before any of
 # the other categories existed.
-SECONDARY_CATEGORY_POINTS = 15
+SECONDARY_CATEGORY_POINTS = _SCORING["secondary_category_points"]
 
 # Set REGISTER_CODE to require a shared secret on $register. Left empty the
 # endpoint stays open, which is what you want on a closed event network.
@@ -2777,14 +2792,13 @@ def detect_document(bundle) -> dict:
         if codes.intersection(doc["loinc"]):
             return doc
 
-    if "ImagingStudy" in resource_types:
+    if "ImagingStudy" in resource_types and "imaging" in DOCUMENTS_BY_ID:
         return DOCUMENTS_BY_ID["imaging"]
     # Only when there is no Composition: a patient summary carries a medication
     # section, and reading one as a prescription would score it against the
     # wrong profile entirely.
-    if "Composition" not in resource_types and resource_types.intersection(
-        {"MedicationRequest", "MedicationDispense"}
-    ):
+    if "mpd" in DOCUMENTS_BY_ID and "Composition" not in resource_types \
+            and resource_types.intersection({"MedicationRequest", "MedicationDispense"}):
         return DOCUMENTS_BY_ID["mpd"]
     return PRIMARY_DOCUMENT
 
@@ -2978,7 +2992,7 @@ def validate_with_matchbox(body: bytes, doc: dict | None = None) -> dict:
 
 # ------------------------------------------------- unresolvable terminology
 
-# Matchbox runs with `txServer: n/a` (see matchbox/config/application.yaml), so
+# Matchbox runs with `txServer: n/a` (see the event's matchbox.yaml), so
 # the licensed code systems EPS points at - SNOMED CT, LOINC, WHO ATC - are not
 # resolvable here. The validator is scrupulous about saying so, and says it once
 # per coding: a rich summary picks up hundreds of "the code cannot be validated"
@@ -3193,7 +3207,7 @@ async def lifespan(_app: FastAPI):
 
 APP_VERSION = "1.0.0"
 app = FastAPI(
-    title="Nordic Hackathon 2026 EPS service",
+    title="%s - Provbana" % EVENT["event"]["name"],
     version=APP_VERSION,
     lifespan=lifespan,
 )
@@ -3248,7 +3262,7 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
 
 
 # Set on the scope of a HEAD answered as a GET, so the usage log still says HEAD.
-HEAD_AS_GET = "connectathon.head_as_get"
+HEAD_AS_GET = "provbana.head_as_get"
 
 
 class HeadAsGet:
@@ -3625,7 +3639,7 @@ async def image_body(
 # The company slug doubles as the Organization's logical id, so a partner's
 # document is reachable at a URL a human can type. The identifier system names
 # who mints them - a bare slug with no system is unmergeable with anything.
-TEAM_IDENTIFIER_SYSTEM = "https://nordichackathon2026.blogs.dsv.su.se/fhir/company"
+TEAM_IDENTIFIER_SYSTEM = EVENT["event"]["canonical_base"] + "/company"
 
 
 def organization_resource(row: sqlite3.Row, endpoints=()) -> dict:
@@ -4277,77 +4291,13 @@ def list_submissions(organization: str | None = None, count: int = 100) -> Respo
 
 # ----------------------------------------------------------------- sample API
 
-# Synthetic worked examples of the Nordic Hackathon 2026 scenarios. They are
-# generated by samples/generate.py to exercise the clinician views (nil-known assertions, stale
-# data, a non-English document) and do not come from any real system, record
-# or person.
-# scenario_url points at the organisers' brief on the event's resources page
-# (https://nordichackathon2026.blogs.dsv.su.se/resources/). The briefs are the
-# source these bundles were authored from, so they are linked rather than
-# paraphrased here - a paraphrase would be a second, drifting copy.
-SAMPLES = [
-    {
-        "id": "andrea-cross-border",
-        "name": "Andrea Lindqvist, 24",
-        "tagline": "Type 1 diabetes, seen in a Paris emergency department",
-        "scenario": (
-            "A Swedish exchange student is brought into a Paris emergency "
-            "department with runaway blood sugar. Her summary is "
-            "complete and well coded, but the data behind it has gone stale: "
-            "the last labs are eight months old and the follow-up that would "
-            "have refreshed them was cancelled and never rebooked."
-        ),
-        "horizon": (
-            "Future scenario: under the EHDS Regulation, cross-border exchange "
-            "of patient summaries is required from around 2029."
-        ),
-        "language": "English",
-        "scenario_name": "The Andrea Scenario",
-        "scenario_url":
-            "https://drive.google.com/file/d/1hzOACA3chu7E6aknBFni-hZWDJwvVGHx/view",
-    },
-    {
-        "id": "arne-complex-care",
-        "name": "Arne Bergström, 83",
-        "tagline": "Multimorbid, admitted after a fall in Copenhagen",
-        "scenario": (
-            "A Swedish pensioner falls while visiting his son in Denmark and "
-            "needs surgery. Ten conditions, ten medicines including the "
-            "anticoagulant apixaban, and a high-criticality penicillin allergy "
-            "with anaphylaxis have to survive the border."
-        ),
-        "horizon": (
-            "Future scenario: under the EHDS Regulation, cross-border exchange "
-            "of patient summaries is required from around 2029, and of lab "
-            "results and discharge reports only from around 2031."
-        ),
-        "language": "Swedish",
-        "scenario_name": "The Arne Scenario",
-        "scenario_url":
-            "https://drive.google.com/file/d/11dMseBg1439zSf2v8sRnWHSjrE18ZgLJ/view",
-    },
-    {
-        "id": "ville-difficult-airway",
-        "name": "Vilhelm \"Ville\" Söderberg, 13",
-        "tagline": "Difficult airway and immunosuppressed, in a Gothenburg emergency department",
-        "scenario": (
-            "A Stockholm boy with a rare craniofacial syndrome, a known "
-            "difficult airway and juvenile spondyloarthritis on adalimumab and "
-            "methotrexate arrives at Sahlgrenska with a chest infection and "
-            "worsening breathing. The team that has never met him needs the "
-            "airway plan, the last anaesthetic, the last doses and who to "
-            "ring at Karolinska - before anyone reaches for a laryngoscope."
-        ),
-        "horizon": None,
-        "language": "Swedish",
-        "scenario_name": "The Ville Scenario",
-        "scenario_url":
-            "https://drive.google.com/file/d/1_PzonjLJ-BjW1sQYdL6YY1dS04T8Kkpp/view",
-    },
-]
+# Synthetic worked examples of the event's scenarios, from its [[samples]]:
+# each id is a bundle in SAMPLES_DIR. They exist to exercise the clinician views
+# and do not come from any real system, record or person.
+SAMPLES = EVENT["samples"]
 
 SAMPLE_DISCLAIMER = (
-    "Synthetic example, generated for the hackathon scenarios - it does not "
+    "Synthetic example, generated for the event's scenarios - it does not "
     "come from any real system, record or person, and only illustrates how "
     "such a summary could look."
 )
@@ -4370,26 +4320,32 @@ def read_sample_bytes(sample_id: str) -> bytes | None:
         return None
 
 
-SE_PERSONNUMMER = "http://electronichealth.se/identifier/personnummer"
-SE_SAMORDNINGSNUMMER = "http://electronichealth.se/identifier/samordningsnummer"
-# The label the page prints in front of the number: a samordningsnummer looks
-# like a personnummer (day + 60) and must not be presented as one.
-SE_IDENTIFIER_LABELS = {
-    SE_PERSONNUMMER: "Personnummer",
-    SE_SAMORDNINGSNUMMER: "Samordningsnummer",
+# National identity numbers the clinical view shows under a patient's name,
+# by identifier system, with the label to print in front of the number. A
+# samordningsnummer looks like a personnummer (day + 60) and must not be
+# presented as one, which is why the label comes from the system and not the
+# shape. An event adds its own with [identifiers] in event.toml.
+NATIONAL_IDENTIFIERS = {
+    "http://electronichealth.se/identifier/personnummer": "Personnummer",
+    "http://electronichealth.se/identifier/samordningsnummer": "Samordningsnummer",
+    "urn:oid:2.16.578.1.12.4.1.4.1": "Fødselsnummer",
+    "urn:oid:2.16.578.1.12.4.1.4.2": "D-nummer",
+    "urn:oid:1.2.208.176.1.2": "CPR-nummer",
+    "urn:oid:1.2.246.21": "Henkilötunnus",
+    **EVENT["identifiers"],
+}
+# How each is written on paper, where that differs from how it is stored.
+_ID_LAYOUT = {
+    "http://electronichealth.se/identifier/personnummer": (12, 8),
+    "http://electronichealth.se/identifier/samordningsnummer": (12, 8),
+    "urn:oid:1.2.208.176.1.2": (10, 6),
 }
 
 
-def sample_personnummer(raw: bytes | None) -> str | None:
-    """The patient's personnummer as it is written on paper, YYYYMMDD-NNNN.
-    Read off the bundle rather than kept in SAMPLES, so the page cannot
-    disagree with the document it is describing."""
-    return (sample_identifier(raw) or (None, None))[1]
-
-
 def sample_identifier(raw: bytes | None) -> tuple[str, str] | None:
-    """(label, number) of the Swedish identity number in the bundle - a
-    personnummer or, for a patient without one, a samordningsnummer."""
+    """(label, number) of the patient's national identity number, written as
+    it is on paper. Read off the bundle rather than kept in SAMPLES, so the
+    page cannot disagree with the document it is describing."""
     try:
         entries = json.loads(raw or b"").get("entry", [])
     except (ValueError, AttributeError):
@@ -4399,10 +4355,14 @@ def sample_identifier(raw: bytes | None) -> tuple[str, str] | None:
         if resource.get("resourceType") != "Patient":
             continue
         for ident in resource.get("identifier", []):
-            value = ident.get("value") or ""
-            label = SE_IDENTIFIER_LABELS.get(ident.get("system"))
-            if label and len(value) == 12:
-                return (label, value[:8] + "-" + value[8:])
+            system, value = ident.get("system"), ident.get("value") or ""
+            label = NATIONAL_IDENTIFIERS.get(system)
+            if not label or not value:
+                continue
+            length, split = _ID_LAYOUT.get(system, (None, None))
+            if length and len(value) == length and value.isdigit():
+                value = value[:split] + "-" + value[split:]
+            return (label, value)
     return None
 
 
@@ -4426,10 +4386,10 @@ def list_samples() -> Response:
                         "id": sample["id"],
                         "bundle": "%s/Bundle/%s" % (FHIR_BASE, sample["id"]),
                         "name": sample["name"],
-                        "personnummer": sample_personnummer(
-                            read_sample_bytes(sample["id"])),
+                        "identifier": (sample_identifier(
+                            read_sample_bytes(sample["id"])) or (None, None))[1],
                         "identifierLabel": (sample_identifier(
-                            read_sample_bytes(sample["id"])) or ("", ""))[0] or None,
+                            read_sample_bytes(sample["id"])) or (None, None))[0],
                         "tagline": sample["tagline"],
                         "scenario": sample["scenario"],
                         "scenarioName": sample["scenario_name"],
@@ -5221,7 +5181,7 @@ def delete_rendering(
 # resolve to an OperationDefinition anywhere - CapabilityStatement requires a
 # canonical for every operation, and a URL in our own namespace is at least
 # unambiguous about who coined it.
-CANONICAL_BASE = "https://nordichackathon2026.blogs.dsv.su.se/fhir"
+CANONICAL_BASE = EVENT["event"]["canonical_base"]
 
 # name -> the one-line description that goes in $status and the docs. Kept
 # beside the CapabilityStatement so a new operation cannot be added to one and
@@ -5626,11 +5586,11 @@ def metadata(request: Request) -> Response:
             "resourceType": "CapabilityStatement",
             "status": "active",
             "date": datetime.now(timezone.utc).date().isoformat(),
-            "publisher": "Nordic Hackathon 2026",
+            "publisher": EVENT["event"]["name"],
             "kind": "instance",
-            "software": {"name": app.title, "version": APP_VERSION},
+            "software": {"name": "Provbana", "version": APP_VERSION},
             "implementation": {
-                "description": "Nordic Hackathon 2026 EPS validation service",
+                "description": "%s validation service" % EVENT["event"]["name"],
                 "url": fhir_base(request),
             },
             "fhirVersion": "4.0.1",
@@ -5985,7 +5945,22 @@ def favicon() -> Response:
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def index() -> str:
-    return INDEX_HTML
+    return INDEX_PAGE
+
+
+THEME_CSS = os.path.join(EVENT["dir"], "theme.css")
+
+
+@app.get("/theme.css", include_in_schema=False)
+def theme_css() -> Response:
+    """The event's optional palette override, linked after the built-in one."""
+    try:
+        with open(THEME_CSS, "rb") as fh:
+            body = fh.read()
+    except OSError:
+        raise HTTPException(status_code=404, detail="This event has no theme.css")
+    return Response(content=body, media_type="text/css",
+                    headers={"Cache-Control": "public, max-age=300"})
 
 
 # An ECG trace in the event's purple and yellow, on a 32-unit grid. Kept to a
@@ -6045,10 +6020,11 @@ INDEX_HTML = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700&display=swap">
 <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-<title>Nordic Hackathon 2026</title>
+<title>{{event_name}}</title>
 <style>
-/* Nordic Hackathon 2026 - palette, type scale and controls taken from the
-   event site (nordichackathon2026.blogs.dsv.su.se), which runs WordPress's
+/* Provbana's palette, type scale and controls, taken from the site of the
+   event it was first built for (nordichackathon2026.blogs.dsv.su.se), which
+   runs WordPress's
    Twenty Twenty-Five: base #FFFFFF, contrast #111111, accent-3 #503AA8,
    accent-4 #686868, accent-5 #FBFAF3, accent-1 #FFEE58, set in Manrope with
    Fira Code for code, headings at 400 rather than bold, and nothing rounded.
@@ -6692,11 +6668,12 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   font-size: 0.84rem; }
 .shot-err { font-size: 0.82rem; color: var(--fail); }
 </style>
+{{theme_link}}
 </head>
 <body>
 <header>
   <div class="head-row">
-    <p class="site-title"><a href="/">Nordic Hackathon 2026</a></p>
+    <p class="site-title"><a href="/">{{event_name}}</a></p>
     <div class="head-nav">
       <nav class="tabs">
         <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard" aria-current="page">Leaderboard</a>
@@ -6718,14 +6695,13 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
       </button>
     </div>
   </div>
-  <h1>Nordic Hackathon 2026</h1>
+  <h1>{{event_name}}</h1>
   <div class="sub-row">
-    <p class="sub">Submit your European Patient Summary (<span class="hint"
-    title="HL7 Europe publishes the European Patient Summary for FHIR R4 only - there is no R5 edition, and the EHDS implementing act that will settle a FHIR version for Europe is not due until March 2027. R4 is what EPS, IPS and MyHealth@EU build on today.">FHIR
+    <p class="sub">Submit your {{primary_label}} (<span class="hint"
+    title="HL7 Europe publishes its EHDS guides, the European Patient Summary among them, for FHIR R4 only - there is no R5 edition, and the EHDS implementing act that will settle a FHIR version for Europe is not due until March 2027. R4 is what EPS, IPS and MyHealth@EU build on today.">FHIR
     R4 Bundle</span>) and get
-    it validated against the HL7 EU EPS 1.0.0-ballot profile.</p>
-    <a class="spec-link" href="https://hl7.eu/fhir/eps/1.0.0-ballot/"
-       target="_blank" rel="noopener">EPS 1.0.0-ballot spec</a>
+    it validated against the {{primary_guide}} profile.</p>
+    {{primary_spec_link}}
   </div>
 </header>
 <main>
@@ -6881,7 +6857,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   </section>
 
   <section class="card">
-    <h2>Submit your EPS</h2>
+    <h2>Submit a document</h2>
     <label for="token">Company token</label>
     <input type="text" id="token" placeholder="paste your company token"
       autocomplete="off" spellcheck="false">
@@ -6968,12 +6944,12 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <p class="muted" style="margin:0">There are two pathways to using this
   platform and you should do both - 1) submit the document(s) for validation,
   scoring, and clinical view and 2) exchange them with other participants in
-  the Hackathon.</p>
+  the event.</p>
   <div class="lanes">
     <div class="lane">
       <span class="lane-n">Pathway 1 &middot; Validate</span>
       <h3>Send it to Provbana</h3>
-      <p class="muted">Matchbox checks it against HL7 EU EPS, the leaderboard
+      <p class="muted">Matchbox checks it against its guide, the leaderboard
       scores it and the clinical view renders it. Your best valid document
       of each type is published below for others to fetch.</p>
       <p class="muted" style="margin:0"><a href="#submit">Submit a bundle</a></p>
@@ -7029,19 +7005,19 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 </main>
 <footer>
-  <p>Part of the <a href="https://nordichackathon2026.blogs.dsv.su.se" target="_blank" rel="noopener">Nordic Hackathon
-  2026</a>, 18-20 November in Kista.</p>
+  {{event_part_of}}
   <p>Bundles are validated by <a href="https://github.com/ahdis/matchbox"
   target="_blank" rel="noopener">Matchbox</a>, the open-source FHIR validation and
   mapping server from <a href="https://ahdis.ch/" target="_blank" rel="noopener">ahdis</a>,
   which runs the official <a href="https://github.com/hapifhir/org.hl7.fhir.core"
   target="_blank" rel="noopener">HL7 FHIR validator</a> underneath.</p>
-  <p>Structure, profiles and cardinality are checked in full, against the EPS
-  guide - or, for one of the <a href="#other-documents">other EHDS document
+  <p>Structure, profiles and cardinality are checked in full, against the
+  {{primary_guide_name}} guide - or, for one of the <a href="#other-documents">other EHDS document
   types</a>, against its own HL7 Europe guide. External code systems those
   guides do not themselves carry and that require a license (such as SNOMED CT,
   LOINC, WHO ATC) are not checked.</p>
-  <p class="colophon">Runs on Provbana, built by <a href="https://vadimperetok.in"
+  <p class="colophon">Runs on <a href="https://github.com/vadi2/provbana"
+  target="_blank" rel="noopener">Provbana</a>, built by <a href="https://vadimperetok.in"
   target="_blank" rel="noopener">Vadim Peretokin</a>.</p>
 </footer>
 <script>
@@ -7163,11 +7139,10 @@ function updatePracticeNote() {
    leaderboard cell; the long labels come from the server so the two lists
    cannot drift apart. Seeded rather than left empty so the first leaderboard
    paint - which can beat the fetch - still renders readable chips. */
-const DOC_SHORT = { eps: "PS", laboratory: "LAB", mpd: "eP/eD",
-                    imaging: "IMG", hdr: "HDR" };
-let DOC_LABELS = { eps: "European Patient Summary", laboratory: "Laboratory Report",
-                   mpd: "Medication Prescription and Dispense",
-                   imaging: "Imaging Report", hdr: "Hospital Discharge Report" };
+const EVENT_DOCS = {{event_docs}};
+const PRIMARY_DOC = EVENT_DOCS.find((d) => d.primary).id;
+const DOC_SHORT = Object.fromEntries(EVENT_DOCS.map((d) => [d.id, d.short]));
+let DOC_LABELS = Object.fromEntries(EVENT_DOCS.map((d) => [d.id, d.label]));
 const docShort = (id) => DOC_SHORT[id] || id;
 const docLabel = (id) => DOC_LABELS[id] || id;
 
@@ -7848,14 +7823,9 @@ $("#issue-groups").addEventListener("click", (ev) => {
    send a team looking for the wrong fix. Set from X-Document-Type on every
    submission; the patient summary is the standing answer before the first
    one, and the answer for almost every one after it. */
-const EXPLAIN_GUIDES = {
-  eps: ["European Patient Summary", "https://hl7.eu/fhir/eps/"],
-  laboratory: ["Laboratory Report", "https://hl7.eu/fhir/laboratory/"],
-  mpd: ["Medication Prescription and Dispense", "https://hl7.eu/fhir/mpd/"],
-  imaging: ["Imaging Report", "https://hl7.eu/fhir/imaging/"],
-  hdr: ["Hospital Discharge Report", "https://hl7.eu/fhir/hdr/"],
-};
-let explainDoc = "eps";
+const EXPLAIN_GUIDES = Object.fromEntries(EVENT_DOCS.map((d) => [d.id,
+  [d.guide === d.label ? d.label : d.guide + " (" + d.label + ")", d.spec]]));
+let explainDoc = PRIMARY_DOC;
 
 /* ChatGPT, Claude and Le Chat take the question in the URL and open with it
    already in the composer. Gemini's web app has no such parameter, so it
@@ -7885,9 +7855,10 @@ function explainPrompt(groups, severity, reported) {
       ? "The " + reported + " " + noun + ", merged into " + groups.length
         + " distinct findings"
       : "The " + groups.length + " " + noun;
-  const guide = EXPLAIN_GUIDES[explainDoc] || EXPLAIN_GUIDES.eps;
-  return "I am validating a FHIR bundle against the HL7 Europe " + guide[0]
-    + " implementation guide (" + guide[1] + ") with the official "
+  const guide = EXPLAIN_GUIDES[explainDoc] || EXPLAIN_GUIDES[PRIMARY_DOC];
+  return "I am validating a FHIR bundle against the " + guide[0]
+    + " implementation guide" + (guide[1] ? " (" + guide[1] + ")" : "")
+    + " with the official "
     + "HL7 FHIR validator. Explain what " + (many ? "these " + noun + " mean"
                                                   : "this " + noun + " means")
     + " in plain terms and what to change in the bundle to fix "
@@ -8188,13 +8159,13 @@ $("#submit-btn").addEventListener("click", async () => {
     const errors = parseInt(res.headers.get("X-Errors") || "0", 10);
     const sections = parseInt(res.headers.get("X-Sections") || "0", 10);
     const resources = parseInt(res.headers.get("X-Resources") || "0", 10);
-    const docType = res.headers.get("X-Document-Type") || "eps";
+    const docType = res.headers.get("X-Document-Type") || PRIMARY_DOC;
     explainDoc = docType;
     const mine = parseInt(res.headers.get("X-Submission-Score") || "0", 10);
     const extras = parseInt(res.headers.get("X-Secondary-Categories") || "0", 10);
     const bestEps = parseInt(res.headers.get("X-Best-Patient-Summary") || "0", 10);
     const firstPass = res.headers.get("X-First-Pass") === "true";
-    const isPrimary = docType === "eps";
+    const isPrimary = docType === PRIMARY_DOC;
     const banner = $("#banner");
     banner.className = "banner " + (pass ? "pass" : "fail");
     /* Verdict and number on the banner, arithmetic on hover: the score is
@@ -8419,9 +8390,9 @@ function renderSampleList(box) {
         + '" title="click to open"><td><strong><a class="cv-open" href="#clinical/sample/'
         + esc(s.id) + '">' + esc(s.name) + "</a></strong>"
         + '<div class="cv-sub">' + esc(s.tagline) + "</div>"
-        + (s.personnummer
-            ? '<div class="cv-sub">' + esc(s.identifierLabel || "Personnummer") + " "
-              + esc(s.personnummer) + "</div>"
+        + (s.identifier
+            ? '<div class="cv-sub">' + esc(s.identifierLabel || "National ID") + " "
+              + esc(s.identifier) + "</div>"
             : "")
         + "</td>"
         + "<td>" + esc(s.language) + "</td>"
@@ -9663,7 +9634,7 @@ function renderClinicalDoc(d) {
   }
   html += cvModesHtml();
   // what kind of document this is, in the title when it has none of its own
-  html += "<h2>" + esc(comp.title || docLabel(d.doc_type || "eps")) + "</h2>";
+  html += "<h2>" + esc(comp.title || docLabel(d.doc_type || PRIMARY_DOC)) + "</h2>";
   html += '<p class="muted co-name" style="margin:2px 0 0">'
     + (comp.title && d.doc_type ? esc(docLabel(d.doc_type)) + " &middot; " : "")
     + esc(d.team)
@@ -9766,7 +9737,7 @@ function showPreviewDoc(scroll) {
 function renderPreviewBox(box) {
   box.innerHTML = '<div class="cv-paste">'
     + '<p class="muted" style="margin:0">Pick a Bundle .json or paste one below.'
-    + " It is only rendered here, not uploaded to the hackathon.</p>"
+    + " It is only rendered here, not submitted.</p>"
     + '<textarea id="cv-paste" spellcheck="false" aria-label="FHIR Bundle JSON to preview" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
     + '<div class="row"><button type="button" id="cv-paste-go">Preview</button>'
     + '<button type="button" class="ghost" id="cv-pick">Choose a file&hellip;</button></div>'
@@ -9837,9 +9808,9 @@ function interopCurls() {
      any instance where teams have started from it. */
   $("#curl-patient").textContent =
     "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier="
-      + "http://electronichealth.se/identifier/personnummer|194302096997'\n" +
+      + "SYSTEM|NUMBER'\n" +
     "# the same number in any identifier system:\n" +
-    "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier=194302096997'";
+    "curl -s '" + origin + "/fhir/Bundle?composition.patient.identifier=NUMBER'";
 }
 $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"));
 
@@ -9867,7 +9838,7 @@ async function refreshShotCount(docId) {
    stays the short one every team already has in their scripts. */
 function documentPath(p) {
   return "/fhir/Organization/" + p.team_slug + "/$document"
-    + (p.doc_type === "eps" ? "" : "?type=" + p.doc_type);
+    + (p.doc_type === PRIMARY_DOC ? "" : "?type=" + p.doc_type);
 }
 
 /* One card per document, not per company: a company publishes its best valid
@@ -10551,6 +10522,48 @@ applyRoute(false);
 </body>
 </html>
 """
+
+
+def render_index(template: str) -> str:
+    """INDEX_HTML with the event's name, primary document and links filled in.
+
+    Done once at import: none of it changes while the process runs.
+    """
+    esc = html_mod.escape
+    ev = EVENT["event"]
+    primary = PRIMARY_DOCUMENT
+    version = primary["igs"][0].partition("#")[2] if primary["igs"] else ""
+    guide = primary.get("guide") or primary["long_label"]
+    guide_version = guide + (" " + version if version else "")
+    name = esc(ev["name"])
+    part_of = ('<a href="%s" target="_blank" rel="noopener">%s</a>' % (esc(ev["url"]), name)
+               if ev["url"] else name)
+    docs = [{"id": d["id"], "short": d["short"], "label": d["long_label"],
+             "guide": d.get("guide") or d["long_label"], "spec": d.get("spec") or "",
+             "primary": d["primary"]} for d in EHDS_DOCUMENTS]
+    values = {
+        "event_name": name,
+        "event_part_of": "<p>Part of the %s%s.</p>" % (
+            part_of, ", " + esc(ev["when_where"]) if ev["when_where"] else ""),
+        "primary_label": esc(primary["long_label"]),
+        "primary_guide": esc(guide_version),
+        "primary_guide_name": esc(guide),
+        "primary_spec_link": (
+            '<a class="spec-link" href="%s"\n       target="_blank" rel="noopener">%s spec</a>'
+            % (esc(primary["spec"]), esc(guide_version)) if primary.get("spec") else ""),
+        # Inside a <script>: JSON is valid JS, and "</" is the one sequence
+        # that could end the element early.
+        "event_docs": json.dumps(docs, ensure_ascii=False).replace("</", "<\\/"),
+        "theme_link": ('<link rel="stylesheet" href="/theme.css">'
+                       if os.path.isfile(THEME_CSS) else ""),
+    }
+    for key, value in values.items():
+        template = template.replace("{{%s}}" % key, value)
+    assert "{{" not in template, "unfilled placeholder in INDEX_HTML"
+    return template
+
+
+INDEX_PAGE = render_index(INDEX_HTML)
 
 
 # ---------------------------------------------------------------- OpenAPI

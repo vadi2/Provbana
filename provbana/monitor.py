@@ -67,9 +67,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # requests carry USER_AGENT and app.py leaves them out of the counts, or the
 # monitor would be the most loyal API client in every digest.
 STATUS_URL = os.environ.get("STATUS_URL", "http://localhost:8095/fhir/$status")
-USER_AGENT = "hackathon2026-monitor"
+USER_AGENT = "provbana-monitor"
 
-SITE = os.environ.get("SITE_ADDRESS", "hackathon2026.vadimperetok.in")
+SITE = os.environ.get("SITE_ADDRESS", "localhost")
 MAIL_TO = os.environ.get("MAIL_TO", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "")
 SMTP_HOST = os.environ.get("SMTP_HOST", "")
@@ -416,6 +416,17 @@ def _day_totals(conn: sqlite3.Connection, day: str) -> dict:
     }
 
 
+def _event_name() -> str:
+    """The event's name for the digest's first line. A broken event.toml is
+    the service's to report - it will not start - so the digest falls back
+    rather than going unsent."""
+    try:
+        import event
+        return event.load()["event"]["name"]
+    except Exception:
+        return "Provbana"
+
+
 def digest(path: str, day: date) -> tuple[str, str]:
     """(subject, body) for one UTC day."""
     d = day.isoformat()
@@ -424,7 +435,7 @@ def digest(path: str, day: date) -> tuple[str, str]:
         subs = t["submissions"]
         passed = sum(1 for s in subs if s.get("passed"))
         teams = sorted({s["team"] for s in subs})
-        lines = ["Nordic Hackathon 2026 - %s (UTC)" % day.strftime("%A %d %B")]
+        lines = ["%s - %s (UTC)" % (_event_name(), day.strftime("%A %d %B"))]
         ends = os.environ.get("PRACTICE_ENDS", "").strip()
         if ends:
             try:

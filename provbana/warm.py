@@ -37,6 +37,14 @@ import time
 
 import app
 
+
+def warm_body() -> bytes:
+    """The event's first worked example, or an empty document for an event
+    without any: the engines compile before Matchbox looks at the content."""
+    return ((app.read_sample_bytes(app.SAMPLES[0]["id"]) if app.SAMPLES else None)
+            or b'{"resourceType": "Bundle", "type": "document"}')
+
+
 # Long enough that a warm pass is a rounding error against the validator's day,
 # short enough to sit well inside the shortest disuse window measured (~75min).
 INTERVAL = int(os.environ.get("WARM_INTERVAL", "1200"))
@@ -95,9 +103,7 @@ def main() -> int:
     if not (args.loop or args.once):
         ap.error("choose --loop or --once")
 
-    here = os.path.dirname(os.path.abspath(__file__))
-    with open(os.path.join(here, "samples", "andrea-cross-border.json"), "rb") as fh:
-        body = fh.read()
+    body = warm_body()
 
     if args.once:
         warmed = warm_once(body)

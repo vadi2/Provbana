@@ -19,7 +19,7 @@ SEBasePatient slice for it, chosen so no personnummer that could belong to a
 real child appears here. The other identifier values and the phone numbers
 are placeholders in the real national namespaces.
 
-    python3 samples/generate.py
+    python3 events/nordic-hackathon-2026/samples/generate.py
 """
 import json, uuid, html, os
 from datetime import datetime

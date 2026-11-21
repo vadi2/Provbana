@@ -28,9 +28,11 @@ import urllib.error
 import urllib.request
 import zlib
 
+import event
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 EXAMPLES = os.path.join(HERE, "examples")
-SAMPLES = os.path.join(HERE, "samples")
+SAMPLES = os.path.join(event.event_dir(), "samples")
 
 # Bundles by the shape they produce, so the plan below reads by intent.
 BUNDLES = {
@@ -45,7 +47,7 @@ BUNDLES = {
     # chips on it are populated in a preview rather than being dead UI that
     # only ever appears at the event. These two are the guides' own published
     # examples and pass as shipped; the imaging guide's examples fail its own
-    # profile (see matchbox/config/application.yaml), so seeding that would put
+    # profile (see the event's matchbox.yaml), so seeding that would put
     # a red herring on the demo board.
     "lab": os.path.join(EXAMPLES, "lab-example.json"),
     "mpd": os.path.join(EXAMPLES, "mpd-example.json"),

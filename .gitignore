@@ -1,9 +1,9 @@
 .venv/
 __pycache__/
 .pytest_cache/
-connectathon/data/
-connectathon/backups/
-connectathon/data.replaced-*/
+provbana/data/
+provbana/backups/
+provbana/data.replaced-*/
 .claude/
 
 # Production secrets - see .env.example for the template.
