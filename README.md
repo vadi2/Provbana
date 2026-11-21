@@ -12,6 +12,34 @@ validated against their own guide, for a flat bonus rather than the summary's po
 A submission says nothing about which it is; the service reads that off the bundle. See
 [Document types](connectathon/README.md#document-types).
 
+## What it looks like
+
+The live leaderboard, with a chip for each other document type a company has passed:
+
+![Leaderboard](docs/screenshots/leaderboard.png)
+
+Submitting a bundle gets a verdict in seconds: what Matchbox found, grouped and linked
+to the line it lands on, with the bundle itself embedded below and marked up:
+
+![Validation result](docs/screenshots/submit.png)
+
+Each company's best document of each type is published for the others to fetch, load
+into their own system and report back on with a screenshot:
+
+![Interop testing](docs/screenshots/interop.png)
+
+The clinical view renders any submitted document the way a clinician would want to read
+it. The dashboard puts critical alerts and their care plans first and calls out what is
+missing or possibly outdated; the timeline lays every dated entry out in order, upcoming
+ones on top:
+
+![Clinical dashboard](docs/screenshots/clinical-dashboard.png)
+
+![Clinical timeline](docs/screenshots/clinical-timeline.png)
+
+The companies shown are demo data from `connectathon/seed_demo.py`, and the patient is
+the synthetic Ville scenario.
+
 | Directory | What it is |
 |---|---|
 | `connectathon/` | The service: FastAPI + SQLite in a single `app.py`, its tests, Dockerfile and [README](connectathon/README.md) with run instructions, scoring rules and the API. |
