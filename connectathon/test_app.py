@@ -3838,6 +3838,19 @@ def test_coverage_counts_against_every_eps_section():
     assert cov["42348-3"]["name"] == "Advance directives"
 
 
+def test_a_reason_given_in_a_sub_section_sets_the_section_state():
+    doc = json.loads(bundle_with_section(
+        {"title": "Allergies", "code": {"coding": [{"code": "48765-2"}]},
+         "section": [{"title": "Drug allergies",
+                      "emptyReason": {"coding": [{"code": "nilknown"}]}}]}))
+    doc["entry"][0]["resource"]["type"] = {"coding": [{"code": "60591-5"}]}
+    summary = app_module.summarize_bundle(doc)
+    assert summary["sections"][0]["empty_reason"] == "None known"
+    assert summary["sections"][0]["state"] == "none-known"
+    cov = {c["code"]: c for c in summary["coverage"]}
+    assert cov["48765-2"]["state"] == "none-known"
+
+
 def test_advance_directives_are_not_a_care_plan():
     assert app_module._section_kind(
         {"code": {"coding": [{"code": "42348-3"}]}}, "") == "directive"

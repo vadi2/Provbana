@@ -1818,7 +1818,7 @@ def _section_codes(section) -> set:
     return {str(c.get("code")) for c in code["coding"] if isinstance(c, dict)}
 
 
-def _section_state(section, items, narrative) -> str:
+def _section_state(reason, items, narrative) -> str:
     """data | stated-none | none-known | missing.
 
     stated-none: an explicit "no known X" entry. none-known: emptyReason
@@ -1829,7 +1829,6 @@ def _section_state(section, items, narrative) -> str:
         return "data"
     if any(i.get("assertion") == "none-known" for i in items):
         return "stated-none"
-    reason = section.get("emptyReason")
     if not items and isinstance(reason, dict):
         codes = {_squash(str(c.get("code") or "")) for c in reason.get("coding") or []
                  if isinstance(c, dict)}
@@ -2512,9 +2511,8 @@ def summarize_bundle(bundle) -> dict:
                 while stack:
                     node, sub = stack.pop()
                     if sub:
-                        reason = _cc_display(node.get("emptyReason"))
-                        if reason:
-                            sub_reasons.append(reason)
+                        if _cc_display(node.get("emptyReason")):
+                            sub_reasons.append(node["emptyReason"])
                         elif not isinstance(node.get("entry"), list):
                             text = _section_narrative(node)
                             if text:
@@ -2542,9 +2540,11 @@ def summarize_bundle(bundle) -> dict:
                                           or _cc_display(child.get("code"))
                                           or "Untitled section"))
                 empty_reason = narrative = None
+                reason = section.get("emptyReason")
+                if not _cc_display(reason):
+                    reason = sub_reasons[0] if sub_reasons and not sub_texts else None
                 if not items:
-                    empty_reason = _cc_display(section.get("emptyReason")) or (
-                        sub_reasons[0] if sub_reasons and not sub_texts else None)
+                    empty_reason = _cc_display(reason)
                     if empty_reason:
                         empty_reason = EMPTY_REASON_LABELS.get(
                             _squash(empty_reason), empty_reason
@@ -2555,7 +2555,7 @@ def summarize_bundle(bundle) -> dict:
                         # views show that rather than "No entries".
                         narrative = _section_narrative(section) or (
                             "\n".join(sub_texts) or None)
-                state = _section_state(section, items, narrative)
+                state = _section_state(reason, items, narrative)
                 for code in _section_codes(section):
                     section_states.setdefault(code, state)
                 summary["sections"].append(
@@ -2596,9 +2596,9 @@ def summarize_bundle(bundle) -> dict:
         # with no clinical entry at all shows what it has rather than nothing.
         content = [e["resource"] for e in entries
                    if e["resource"].get("resourceType") not in ("Composition", "Patient")]
-        items = [_render_resource(r, by_ref) for r in content
+        items = [_render_resource(r, by_ref, alert_targets) for r in content
                  if r.get("resourceType") in ITEM_CATEGORIES]
-        items = items or [_render_resource(r, by_ref) for r in content]
+        items = items or [_render_resource(r, by_ref, alert_targets) for r in content]
         if items:
             summary["sections"].append({"title": "Entries", "kind": "other",
                                         "items": items, "empty_reason": None,
