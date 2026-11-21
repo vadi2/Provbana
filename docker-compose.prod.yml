@@ -1,4 +1,4 @@
-# The event stack, as it runs on the VPS behind hackathon2026.vadimperetok.in.
+# The event stack, as it runs on the VPS behind $SITE_ADDRESS.
 #
 #   docker compose -f docker-compose.prod.yml up -d --build
 #
@@ -16,9 +16,16 @@
 #
 # itb/docker-compose.yml stays as it is - it is the local development
 # validator, and its project name pins the itb_default network that
-# connectathon/README.md's `docker run` line joins.
+# provbana/README.md's `docker run` line joins.
+#
+# Which event it runs is EVENT_DIR in .env, a folder under events/; its
+# matchbox.yaml is the validator's config and the folder itself is mounted
+# read-only at /event for the containers that read it.
 
-name: hackathon2026
+# The project name is what the volumes are named after, so a box that was
+# brought up under another name keeps it with PROJECT_NAME in .env - changing
+# it would start an empty stack beside the old one.
+name: ${PROJECT_NAME:-provbana}
 
 # Docker's json-file driver keeps every line ever logged unless told not to.
 # This box is up from September to November; matchbox alone is chatty enough to
@@ -38,7 +45,7 @@ services:
     volumes:
       # Read-only here: on the event box the package list is changed by editing
       # the file and recreating the container, never by the container itself.
-      - ./matchbox/config:/config:ro
+      - ./${EVENT_DIR:-events/nordic-hackathon-2026}/matchbox.yaml:/config/application.yaml:ro
       # The FHIR package cache lives in ~/.fhir and is 95 MB of downloaded IGs.
       # Without this it sits in the container's writable layer and is thrown
       # away by every recreate, so a validator restarted at the venue would
@@ -50,7 +57,7 @@ services:
       #
       # /database is deliberately not persisted: matchbox rebuilds it from the
       # packages at boot, and a stale copy is exactly how an edit to the IG
-      # list in matchbox/config/application.yaml would fail to take effect.
+      # list in the event's matchbox.yaml would fail to take effect.
       - matchbox_home:/home/matchbox
     environment:
       # Read once at boot, like application.yaml. Bump both numbers together -
@@ -68,7 +75,7 @@ services:
     # No ports: reached as http://matchbox:8080/matchboxv3/fhir from the app.
 
   app:
-    build: ./connectathon
+    build: ./provbana
     restart: unless-stopped
     environment:
       DATA_DIR: /srv/data
@@ -90,8 +97,12 @@ services:
       # data/ rather than in it: reset.py's nightly wipe never touches it, and
       # neither does a backup restore, which swaps data/ wholesale.
       USAGE_DB: /srv/usage/usage.db
+      # The default namespace for the identifiers it mints, when event.toml
+      # gives no canonical_base.
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
     volumes:
       - state:/srv
+      - ./${EVENT_DIR:-events/nordic-hackathon-2026}:/event:ro
     depends_on:
       - matchbox
     # Small next to the validator's, and that is the point: whatever a
@@ -104,7 +115,7 @@ services:
   backup:
     # Same image as the service - backup.py opens the database directly, so it
     # has to see the same bytes on the same filesystem, not an HTTP endpoint.
-    build: ./connectathon
+    build: ./provbana
     restart: unless-stopped
     command: ["python", "backup.py", "--loop"]
     environment:
@@ -127,7 +138,7 @@ services:
     # practice, and stops for good at PRACTICE_ENDS - reset.py's docstring has
     # the semantics. Unset PRACTICE_ENDS and this container idles, which is the
     # right state for an event that has started.
-    build: ./connectathon
+    build: ./provbana
     restart: unless-stopped
     command: ["python", "reset.py", "--loop"]
     environment:
@@ -153,7 +164,7 @@ services:
     # deploy time; without this container that wears off long before the event
     # starts, and the first team to submit an imaging report eats a 502.
     # warm.py's docstring has the measurements.
-    build: ./connectathon
+    build: ./provbana
     restart: unless-stopped
     command: ["python", "warm.py", "--loop"]
     environment:
@@ -163,6 +174,8 @@ services:
       # from cold needs minutes. warm.py overrides it per call.
       WARM_INTERVAL: ${WARM_INTERVAL:-1200}
       WARM_TIMEOUT: ${WARM_TIMEOUT:-600}
+    volumes:
+      - ./${EVENT_DIR:-events/nordic-hackathon-2026}:/event:ro
     depends_on:
       - matchbox
     # Five HTTP calls every twenty minutes. The work is all on the validator's
@@ -176,14 +189,14 @@ services:
     # stops saying "up", and a digest of the previous day every morning.
     # monitor.py's docstring has what is stored and what counts as broken.
     # Without SMTP_HOST it mails nobody and writes each message to its log.
-    build: ./connectathon
+    build: ./provbana
     restart: unless-stopped
     command: ["python", "monitor.py", "--loop"]
     environment:
       USAGE_DB: /srv/usage/usage.db
       # $$ is compose's escape for a literal $.
       STATUS_URL: http://app:8095/fhir/$$status
-      SITE_ADDRESS: ${SITE_ADDRESS:-hackathon2026.vadimperetok.in}
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
       PRACTICE_ENDS: ${PRACTICE_ENDS:-}
       MAIL_TO: ${MAIL_TO:-}
       MAIL_FROM: ${MAIL_FROM:-}
@@ -194,6 +207,7 @@ services:
       DIGEST_HOUR: ${DIGEST_HOUR:-6}
     volumes:
       - state:/srv
+      - ./${EVENT_DIR:-events/nordic-hackathon-2026}:/event:ro
     depends_on:
       - app
     mem_limit: 256m
@@ -212,7 +226,7 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     environment:
-      SITE_ADDRESS: ${SITE_ADDRESS:-hackathon2026.vadimperetok.in}
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
     depends_on:
       - app
     logging: *logging

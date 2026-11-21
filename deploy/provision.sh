@@ -8,7 +8,9 @@
 # deploy/deploy.sh, once DNS points at the address this prints.
 set -euo pipefail
 
-NAME=${NAME:-hackathon2026}
+NAME=${NAME:-provbana}
+# The account deploy/deploy.sh logs in as, created by cloud-init.
+DEPLOY_USER=${DEPLOY_USER:-deploy}
 # 16 vCPU / 32 GB / 320 GB, EUR 29.99/mo ex VAT + EUR 0.50 primary IPv4.
 #
 # Do not trust `hcloud server-type list`'s locations[].available flag when
@@ -21,13 +23,22 @@ NAME=${NAME:-hackathon2026}
 TYPE=${TYPE:-cx53}
 LOCATION=${LOCATION:-hel1}  # Helsinki - closest Hetzner region to Stockholm
 IMAGE=${IMAGE:-ubuntu-24.04}
-SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/id_ed25519_hackathon2026.pub}
+SSH_KEY_FILE=${SSH_KEY_FILE:-$HOME/.ssh/id_ed25519_provbana.pub}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
 : "${HCLOUD_TOKEN:?set HCLOUD_TOKEN (a Read & Write project token)}"
 export HCLOUD_TOKEN
 
 command -v hcloud >/dev/null || { echo "hcloud not on PATH" >&2; exit 1; }
+[ -f "$SSH_KEY_FILE" ] || { echo "no public key at $SSH_KEY_FILE - set SSH_KEY_FILE" >&2; exit 1; }
+
+# cloud-init.yaml is a template: the account and the key are this run's, so
+# nobody's personal key is baked into the repo.
+USER_DATA=$(mktemp)
+trap 'rm -f "$USER_DATA"' EXIT
+sed -e "s|__DEPLOY_USER__|$DEPLOY_USER|g" \
+	-e "s|__SSH_PUBLIC_KEY__|$(head -n1 "$SSH_KEY_FILE")|" \
+	"$HERE/cloud-init.yaml" >"$USER_DATA"
 
 echo "==> SSH key"
 if hcloud ssh-key describe "$NAME" >/dev/null 2>&1; then
@@ -78,8 +89,8 @@ else
 		--image "$IMAGE" \
 		--ssh-key "$NAME" \
 		--firewall "$NAME" \
-		--user-data-from-file "$HERE/cloud-init.yaml" \
-		--label project=eps-hackathon
+		--user-data-from-file "$USER_DATA" \
+		--label project=provbana
 fi
 
 # --firewall above only applies on create, so a server that came up before the
@@ -104,10 +115,10 @@ cat <<EOF
     IPv6  ${IPV6:-none}
 
 Next:
-  1. Cloudflare: A record  hackathon2026  ->  $IPV4,  DNS only (grey cloud).
-     Grey cloud is not optional - the zone is on SSL/TLS "Flexible", and
-     proxying this name would have Cloudflare talk plain HTTP to Caddy on 443.
+  1. DNS: an A record for your SITE_ADDRESS  ->  $IPV4.  Behind Cloudflare,
+     make it DNS only (grey cloud): Caddy gets its own certificate, and a zone
+     on SSL/TLS "Flexible" would talk plain HTTP to Caddy on 443.
   2. Wait for the bootstrap to finish (installs Docker, ~2-3 min):
-       ssh -i ${SSH_KEY_FILE%.pub} vadi@$IPV4 'until [ -f /var/lib/cloud/hackathon2026-ready ]; do sleep 5; done; echo ready'
-  3. deploy/deploy.sh $IPV4
+       ssh -i ${SSH_KEY_FILE%.pub} $DEPLOY_USER@$IPV4 'until [ -f /var/lib/cloud/provbana-ready ]; do sleep 5; done; echo ready'
+  3. DEPLOY_USER=$DEPLOY_USER SSH_KEY=${SSH_KEY_FILE%.pub} deploy/deploy.sh $IPV4
 EOF

@@ -18,7 +18,7 @@
 #   	email you@example.com
 #   }
 
-{$SITE_ADDRESS:hackathon2026.vadimperetok.in} {
+{$SITE_ADDRESS} {
 	# A backstop, not the real limit: app.py enforces MAX_BODY_BYTES (5 MB for
 	# a bundle) and MAX_IMAGE_BYTES (2 MB) itself and returns a message that
 	# says which. This just stops something absurd streaming into Python.
@@ -35,7 +35,7 @@
 	}
 
 	# Subdomain-scoped, no includeSubDomains and no preload: this must not be
-	# able to pin anything onto vadimperetok.in itself.
+	# able to pin anything onto the parent domain itself.
 	header Strict-Transport-Security "max-age=31536000"
 
 	# To `docker compose -f docker-compose.prod.yml logs caddy`.

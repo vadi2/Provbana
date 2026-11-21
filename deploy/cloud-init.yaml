@@ -1,6 +1,7 @@
 #cloud-config
-# Bootstrap for the hackathon2026 VPS. Passed to `hcloud server create
-# --user-data-from-file deploy/cloud-init.yaml`, so it runs once, at first boot.
+# Bootstrap for the event VPS. A template: deploy/provision.sh fills in
+# __DEPLOY_USER__ and __SSH_PUBLIC_KEY__ and passes the result to `hcloud server
+# create --user-data-from-file`, so it runs once, at first boot.
 #
 # It does not deploy the app - it only makes the box ready to receive it. The
 # deploy itself is deploy/deploy.sh, which runs from your laptop over SSH.
@@ -11,14 +12,14 @@ package_update: true
 package_upgrade: true
 
 users:
-  - name: vadi
+  - name: __DEPLOY_USER__
     shell: /bin/bash
     sudo: "ALL=(ALL) NOPASSWD:ALL"
     ssh_authorized_keys:
-      - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIP2h5RuUaLVYe29pB9wzrLCY9mBjzn0CkBJqVax5ywh+ hackathon2026.vadimperetok.in (eps-hackathon deploy)
+      - __SSH_PUBLIC_KEY__
 
 # Keys only, everywhere. Hetzner injects the same key for root, which stays as
-# break-glass access if the vadi account's sudo ever breaks.
+# break-glass access if the deploy account's sudo ever breaks.
 ssh_pwauth: false
 
 write_files:
@@ -48,7 +49,7 @@ runcmd:
   - echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" > /etc/apt/sources.list.d/docker.list
   - apt-get update
   - DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin unattended-upgrades
-  - usermod -aG docker vadi
+  - usermod -aG docker __DEPLOY_USER__
   - systemctl enable --now docker
   - systemctl restart ssh
   # The marker deploy.sh waits on, so a deploy cannot race the bootstrap. Gated
@@ -57,4 +58,4 @@ runcmd:
   # the list, so an unconditional touch here would declare a box ready that
   # never installed docker, and deploy.sh would take that at its word and sync
   # onto it, failing somewhere far less obvious.
-  - command -v docker && docker compose version && touch /var/lib/cloud/hackathon2026-ready
+  - command -v docker && docker compose version && touch /var/lib/cloud/provbana-ready

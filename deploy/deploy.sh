@@ -8,9 +8,11 @@
 set -euo pipefail
 
 HOST=${1:?usage: deploy/deploy.sh <ip-or-host>}
-USER=${DEPLOY_USER:-vadi}
-KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519_hackathon2026}
-DEST=${DEST:-/opt/hackathon2026}
+# The same defaults as provision.sh. A box set up before the rename keeps its
+# own: DEPLOY_USER, SSH_KEY and DEST from the environment, PROJECT_NAME in .env.
+USER=${DEPLOY_USER:-deploy}
+KEY=${SSH_KEY:-$HOME/.ssh/id_ed25519_provbana}
+DEST=${DEST:-/opt/provbana}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
 SSH=(ssh -i "$KEY" -o StrictHostKeyChecking=accept-new "$USER@$HOST")
@@ -36,14 +38,16 @@ if ! grep -qE '^REGISTER_CODE=.+' "$ROOT/.env"; then
 	echo "    note: REGISTER_CODE is empty - anyone who finds the URL can register." >&2
 fi
 
-# Compared before the sync overwrites the box's copy. Matchbox reads
-# application.yaml once, at boot, and compose cannot see a bind-mounted file
-# change - so a package added to the IG list would sit there unloaded until
-# something unrelated happened to recreate the container.
-MATCHBOX_CONF=matchbox/config/application.yaml
+# Compared before the sync overwrites the box's copy. Matchbox reads the
+# event's matchbox.yaml once, at boot, and compose cannot see a bind-mounted
+# file change - so a package added to the IG list would sit there unloaded
+# until something unrelated happened to recreate the container.
+EVENT_DIR=$(grep -oP '(?<=^EVENT_DIR=).+' "$ROOT/.env" || echo events/nordic-hackathon-2026)
+[ -f "$ROOT/$EVENT_DIR/event.toml" ] || { echo "EVENT_DIR=$EVENT_DIR has no event.toml" >&2; exit 1; }
+MATCHBOX_CONF=$EVENT_DIR/matchbox.yaml
 
 echo "==> Waiting for the cloud-init bootstrap"
-"${SSH[@]}" 'until [ -f /var/lib/cloud/hackathon2026-ready ]; do sleep 5; done'
+"${SSH[@]}" 'until [ -f /var/lib/cloud/provbana-ready ]; do sleep 5; done'
 
 echo "==> Syncing to $USER@$HOST:$DEST"
 "${SSH[@]}" "sudo install -d -o $USER -g $USER $DEST"
@@ -68,9 +72,9 @@ rsync -az --delete --inplace \
 	--exclude '.venv/' \
 	--exclude '__pycache__/' \
 	--exclude '.pytest_cache/' \
-	--exclude 'connectathon/data/' \
-	--exclude 'connectathon/backups/' \
-	--exclude 'connectathon/data.replaced-*/' \
+	--exclude 'provbana/data/' \
+	--exclude 'provbana/backups/' \
+	--exclude 'provbana/data.replaced-*/' \
 	--exclude '.env' \
 	"$ROOT/" "$USER@$HOST:$DEST/"
 
@@ -105,7 +109,7 @@ echo "==> Waiting for the validator to load its IGs (a minute or two from cold)"
 import json,urllib.request
 # \\\$status answers with a FHIR Parameters resource, so the value is one part
 # among many rather than a top-level key. 'degraded' means Matchbox is up but
-# missing a package application.yaml should have loaded, which scores real
+# missing a package matchbox.yaml should have loaded, which scores real
 # submissions wrong, so only 'up' will do.
 p=json.load(urllib.request.urlopen('http://localhost:8095/fhir/\\\$status'))
 m=[x.get('valueString') for x in p['parameter'] if x['name']=='matchbox']
@@ -125,10 +129,10 @@ echo "==> Warming the validator"
 # So spend that minute here instead, with a timeout long enough to absorb it.
 # Keeping it warm afterwards is the warm container's job - Matchbox drops the
 # engines again after tens of minutes idle, so this alone would have worn off
-# long before the doors open. See connectathon/warm.py.
+# long before the doors open. See provbana/warm.py.
 #
 # Every category gets its own engine, so every category pays that cost once.
-# The patient summary is warmed first and is the one that has to succeed - it
+# The primary document is warmed first and is the one that has to succeed - it
 # is what the event scores. The rest are warmed with the same sample, which is
 # not a document of their kind and will fail validation; that is fine and the
 # verdict is discarded, because compiling the profile snapshots is the whole
@@ -136,9 +140,9 @@ echo "==> Warming the validator"
 # costs a slow first submission of a second-class document, so it is reported
 # and not fatal.
 "${SSH[@]}" "cd $DEST && docker compose -f docker-compose.prod.yml exec -T app python -c \"
-import time, app
+import time, app, warm
 app.MATCHBOX_TIMEOUT = 300
-body = open('samples/andrea-cross-border.json', 'rb').read()
+body = warm.warm_body()
 t = time.monotonic()
 app.validate_with_matchbox(body, app.PRIMARY_DOCUMENT)
 print('    %s warm after %.0fs' % (app.PRIMARY_DOCUMENT['id'], time.monotonic() - t))
