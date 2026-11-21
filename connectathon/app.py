@@ -2902,6 +2902,17 @@ def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict
 # ---------------------------------------------------------------- matchbox
 
 
+# An extension nobody defined is allowed, as the base spec allows it. Matchbox
+# already lets one through on someone else's domain, but an unknown one under a
+# loaded guide's namespace (hl7.eu, hl7.se) is an error - and the resource then
+# stops matching its Bundle slice, failing the bundle twice over. Suppressed in
+# the validator, not filtered here, so the slice matching recovers too. The
+# "no definition for URL" warning that comes with it still shows the submitter;
+# under hl7.org's own core namespace that one stays an error, since only HL7
+# mints extensions there.
+SUPPRESSED_MATCHBOX_ERRORS = ("Extension_EXT_Unknown_NotHere",)
+
+
 def validate_with_matchbox(body: bytes, doc: dict | None = None) -> dict:
     """POST the bundle to Matchbox $validate; return the OperationOutcome dict.
 
@@ -2916,7 +2927,8 @@ def validate_with_matchbox(body: bytes, doc: dict | None = None) -> dict:
     Monkeypatched in tests.
     """
     doc = doc or PRIMARY_DOCUMENT
-    query = [("profile", doc["profile"])] + [("igs", ig) for ig in doc["igs"]]
+    query = ([("profile", doc["profile"])] + [("igs", ig) for ig in doc["igs"]]
+             + [("suppressErrors", m) for m in SUPPRESSED_MATCHBOX_ERRORS])
     url = f"{MATCHBOX_URL}/$validate?{urllib.parse.urlencode(query)}"
     req = urllib.request.Request(
         url,

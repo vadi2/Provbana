@@ -2097,6 +2097,14 @@ def test_validate_asks_matchbox_for_the_extra_packages(monkeypatch):
     assert "igs=hl7se.fhir.base%231.1.0" in captured[0][0].full_url
 
 
+def test_every_category_allows_unknown_extensions(monkeypatch):
+    for doc in app_module.EHDS_DOCUMENTS:
+        captured = []
+        fake_urlopen(monkeypatch, FakeResponse(OK_OUTCOME), captured)
+        app_module.validate_with_matchbox(b'{"resourceType":"Bundle"}', doc)
+        assert "suppressErrors=Extension_EXT_Unknown_NotHere" in captured[0][0].full_url, doc["id"]
+
+
 def test_each_category_is_validated_in_its_own_engine(monkeypatch):
     """The packages are the category's, not one pile shared by all of them.
 
