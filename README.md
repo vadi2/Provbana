@@ -35,4 +35,4 @@ DATA_DIR=./data MATCHBOX_URL=http://localhost:8090/matchboxv3/fhir .venv/bin/pyt
 
 Then open <http://localhost:8095/>. `connectathon/README.md` has the rest.
 
-There is no licence file yet - add one before the repository is shared beyond the organising team.
+Released under the [MIT licence](LICENSE).

@@ -8,3 +8,6 @@ connectathon/data.replaced-*/
 
 # Production secrets - see .env.example for the template.
 .env
+
+# Local credentials for the retired ITB test bed - never commit.
+keys.env
