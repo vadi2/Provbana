@@ -129,12 +129,16 @@ EHDS_DOCUMENTS = [
         # into and checks. Verified by breaking a MedicationRequest inside an
         # otherwise valid bundle: the failure comes back attributed "(from
         # http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd)",
-        # so the profile really is being applied and not merely loaded.
+        # so the profile really is being applied and not merely loaded. An
+        # order that claims nothing meets base R4 alone, which is why
+        # require_entry_profile_claims() fails one rather than paying for it.
         "profile": "http://hl7.org/fhir/StructureDefinition/Bundle",
         "igs": ["hl7.fhir.eu.mpd#1.0.0"],
         "bundles": [],
         "loinc": [],
-        # What an entry has to claim for a bundle to be read as MPD.
+        # What an entry has to claim for a bundle to be read as MPD. For MPD
+        # alone, require_entry_profile_claims() also demands that every
+        # MedicationRequest/MedicationDispense claims one of these.
         "entry_profiles": [
             "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd",
             "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd",
@@ -327,6 +331,21 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+# AUTOINCREMENT for the reason endpoints has it: without it SQLite hands the id
+# of a withdrawn top row to the next upload, and Binary/N is served as immutable,
+# so anyone who saw the withdrawn screenshot would keep seeing it under the new
+# one's note - and a link already shared would come to mean another picture.
+RENDERINGS_COLUMNS = """(
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
+                submission_id INTEGER NOT NULL REFERENCES submissions(id),
+                ts            TEXT NOT NULL,
+                note          TEXT NOT NULL DEFAULT '',
+                filename      TEXT NOT NULL,
+                mime          TEXT NOT NULL
+            )"""
+
+
 def init_db() -> None:
     os.makedirs(os.path.join(DATA_DIR, "submissions"), exist_ok=True)
     with connect() as conn:
@@ -340,15 +359,7 @@ def init_db() -> None:
                 first_pass  INTEGER NOT NULL DEFAULT 0,
                 created_at  TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS renderings (
-                id            INTEGER PRIMARY KEY,
-                consumer_id   INTEGER NOT NULL REFERENCES teams(id),
-                submission_id INTEGER NOT NULL REFERENCES submissions(id),
-                ts            TEXT NOT NULL,
-                note          TEXT NOT NULL DEFAULT '',
-                filename      TEXT NOT NULL,
-                mime          TEXT NOT NULL
-            );
+            CREATE TABLE IF NOT EXISTS renderings %s;
             CREATE TABLE IF NOT EXISTS submissions (
                 id        INTEGER PRIMARY KEY,
                 team_id   INTEGER NOT NULL REFERENCES teams(id),
@@ -378,7 +389,35 @@ def init_db() -> None:
                 description TEXT NOT NULL DEFAULT ''
             );
             """
+            % RENDERINGS_COLUMNS
         )
+        # SQLite cannot add AUTOINCREMENT to an existing table, so a database
+        # from before it has its renderings copied into a rebuilt one. Ids are
+        # kept, and the copy seeds the sequence from the highest of them.
+        # Foreign keys are off for the copy, as SQLite's own rebuild recipe
+        # says: a row pointing at a long-gone submission must not stop the
+        # service from starting.
+        renderings_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'renderings'"
+        ).fetchone()[0]
+        if "AUTOINCREMENT" not in renderings_sql:
+            conn.executescript(
+                """
+                PRAGMA foreign_keys = OFF;
+                BEGIN;
+                CREATE TABLE renderings_new %s;
+                INSERT INTO renderings_new
+                    (id, consumer_id, submission_id, ts, note, filename, mime)
+                    SELECT id, consumer_id, submission_id, ts, note, filename, mime
+                    FROM renderings;
+                DROP TABLE renderings;
+                ALTER TABLE renderings_new RENAME TO renderings;
+                COMMIT;
+                PRAGMA foreign_keys = ON;
+                """
+                % RENDERINGS_COLUMNS
+            )
         # Migrate pre-richness databases in place.
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(submissions)")}
         for col in ("sections", "resources"):
@@ -675,7 +714,12 @@ def _quantity_str(quantity) -> str | None:
     unit = quantity.get("unit")
     if not isinstance(unit, str):
         unit = quantity.get("code") if isinstance(quantity.get("code"), str) else ""
-    return f"{value} {_unit_text(unit)}".strip()
+    # "<5 mg/L" is a different result from "5 mg/L": below the assay's limit,
+    # not a measured 5.
+    comparator = quantity.get("comparator")
+    if comparator not in ("<", "<=", ">=", ">"):
+        comparator = ""
+    return f"{comparator}{value} {_unit_text(unit)}".strip()
 
 
 def _unit_text(unit) -> str:
@@ -684,6 +728,34 @@ def _unit_text(unit) -> str:
     unit = re.sub(r"\{([^}]*)\}", lambda m: m.group(1).replace("_", " "), unit)
     unit = re.sub(r"\b10\*(\d+)", "\u00d710^\\1", unit)
     return re.sub(r"(?<![A-Za-z])u(?=(?:g|mol|L|kat|m|s)\b)", "\u00b5", unit)
+
+
+def _ratio_str(ratio) -> str | None:
+    """1:64 for a titre; "5 mg / 1 mL" when the parts carry units."""
+    if not isinstance(ratio, dict):
+        return None
+    num = _quantity_str(ratio.get("numerator"))
+    den = _quantity_str(ratio.get("denominator"))
+    if not (num and den):
+        return None
+    return f"{num}:{den}" if " " not in num + den else f"{num} / {den}"
+
+
+def _range_str(rng) -> str | None:
+    if not isinstance(rng, dict):
+        return None
+    low, high = rng.get("low"), rng.get("high")
+    low_s, high_s = _quantity_str(low), _quantity_str(high)
+    if low_s and high_s:
+        # One unit is enough when both ends share it: "2-4 mmol/L".
+        if (low.get("unit"), low.get("code")) == (high.get("unit"), high.get("code")):
+            low_s = _quantity_str(dict(low, unit="", code=None))
+        return f"{low_s}-{high_s}"
+    if low_s:
+        return f">={low_s}"
+    if high_s:
+        return f"<={high_s}"
+    return None
 
 
 def _period_str(period) -> str | None:
@@ -717,20 +789,34 @@ def _choice_str(resource, prefix) -> str | None:
     )
 
 
-def _observation_value(obs) -> str | None:
+def _value_str(holder) -> str | None:
+    """The value[x] of an Observation or one of its components, as text."""
     value = (
-        _quantity_str(obs.get("valueQuantity"))
-        or _cc_display(obs.get("valueCodeableConcept"))
-        or _first_str(obs, "valueString")
+        _quantity_str(holder.get("valueQuantity"))
+        or _cc_display(holder.get("valueCodeableConcept"))
+        or _first_str(holder, "valueString", "valueDateTime", "valueTime")
+        or _ratio_str(holder.get("valueRatio"))
+        or _range_str(holder.get("valueRange"))
+        or _period_str(holder.get("valuePeriod"))
     )
     if value:
         return value
-    if isinstance(obs.get("valueBoolean"), bool):
-        return "yes" if obs["valueBoolean"] else "no"
-    if isinstance(obs.get("valueInteger"), int) and not isinstance(
-        obs.get("valueInteger"), bool
+    if isinstance(holder.get("valueBoolean"), bool):
+        return "yes" if holder["valueBoolean"] else "no"
+    if isinstance(holder.get("valueInteger"), int) and not isinstance(
+        holder.get("valueInteger"), bool
     ):
-        return str(obs["valueInteger"])
+        return str(holder["valueInteger"])
+    if isinstance(holder.get("valueSampledData"), dict):
+        # A waveform has no one-line rendering, but it is a value all the same.
+        return "sampled data"
+    return None
+
+
+def _observation_value(obs) -> str | None:
+    value = _value_str(obs)
+    if value:
+        return value
     components = obs.get("component")
     if isinstance(components, list):
         parts = []
@@ -738,11 +824,7 @@ def _observation_value(obs) -> str | None:
             if not isinstance(comp, dict):
                 continue
             label = _cc_display(comp.get("code"))
-            val = (
-                _quantity_str(comp.get("valueQuantity"))
-                or _cc_display(comp.get("valueCodeableConcept"))
-                or _first_str(comp, "valueString")
-            )
+            val = _value_str(comp)
             if label and val:
                 parts.append(f"{label} {val}")
             elif val:
@@ -823,7 +905,22 @@ def _dosage_detail(resource) -> str | None:
         if text:
             parts.append(text)
             continue
+        # No text: a prescription is often structured only ("4 Tablet, every
+        # day, late evening, for 42 days"), and that is a dose all the same.
         bits = []
+        rates = dosage.get("doseAndRate")
+        for rate in rates if isinstance(rates, list) else []:
+            if not isinstance(rate, dict):
+                continue
+            dose = _quantity_str(rate.get("doseQuantity")) or _range_str(rate.get("doseRange"))
+            if dose:
+                # UCUM annotations ("{tbl}") are units only to a machine.
+                bits.append(re.sub(r"\{([^{}]*)\}", r"\1", dose))
+            speed = (_quantity_str(rate.get("rateQuantity"))
+                     or _ratio_str(rate.get("rateRatio"))
+                     or _range_str(rate.get("rateRange")))
+            if speed:
+                bits.append(f"at {speed}")
         route = _cc_display(dosage.get("route"))
         if route:
             bits.append(route)
@@ -832,9 +929,88 @@ def _dosage_detail(resource) -> str | None:
             when = _cc_display(timing.get("code"))
             if when:
                 bits.append(when)
+            if isinstance(timing.get("repeat"), dict):
+                bits.extend(_timing_repeat_bits(timing["repeat"]))
+        need = _cc_display(dosage.get("asNeededCodeableConcept"))
+        if need:
+            bits.append(f"as needed for {need}")
+        elif dosage.get("asNeededBoolean") is True:
+            bits.append("as needed")
         if bits:
             parts.append(", ".join(bits))
     return "; ".join(parts) or None
+
+
+TIMING_UNITS = {"s": "second", "min": "minute", "h": "hour", "d": "day",
+                "wk": "week", "mo": "month", "a": "year"}
+
+# The common v3 TimingEvent codes in words; anything else shows as its code.
+TIMING_EVENTS = {
+    "MORN": "morning", "MORN.early": "early morning", "MORN.late": "late morning",
+    "NOON": "noon", "AFT": "afternoon", "AFT.early": "early afternoon",
+    "AFT.late": "late afternoon", "EVE": "evening", "EVE.early": "early evening",
+    "EVE.late": "late evening", "NIGHT": "night", "PHS": "after sleep",
+    "HS": "before sleep", "WAKE": "on waking", "C": "with a meal",
+    "CM": "with breakfast", "CD": "with lunch", "CV": "with dinner",
+    "AC": "before a meal", "ACM": "before breakfast", "ACD": "before lunch",
+    "ACV": "before dinner", "PC": "after a meal", "PCM": "after breakfast",
+    "PCD": "after lunch", "PCV": "after dinner",
+}
+
+
+def _number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _span(n, n_max, unit) -> str:
+    """"4 hours", "4-6 hours", or "day" for a bare 1 of the unit."""
+    word = TIMING_UNITS[unit]
+    if n_max is not None:
+        return f"{n}-{n_max} {word}s"
+    return word if n == 1 else f"{n} {word}s"
+
+
+def _timing_repeat_bits(repeat) -> list:
+    """Timing.repeat as phrases: "2x per day", "every 4-6 hours", "for 42 days"."""
+    def num(key):
+        return repeat.get(key) if _number(repeat.get(key)) else None
+
+    def strings(key):
+        vals = repeat.get(key)
+        return [v for v in vals if isinstance(v, str)] if isinstance(vals, list) else []
+
+    bits = []
+    freq, freq_max = num("frequency"), num("frequencyMax")
+    period, period_max = num("period"), num("periodMax")
+    unit = repeat.get("periodUnit")
+    if period is not None and unit in TIMING_UNITS:
+        span = _span(period, period_max, unit)
+        if freq in (None, 1) and freq_max is None:
+            bits.append(f"every {span}")
+        else:
+            times = f"{freq}-{freq_max}" if freq_max is not None else f"{freq}"
+            bits.append(f"{times}x per {span}")
+    if strings("dayOfWeek"):
+        bits.append("on " + ", ".join(strings("dayOfWeek")))
+    if strings("timeOfDay"):
+        bits.append("at " + ", ".join(t[:5] for t in strings("timeOfDay")))
+    bits.extend(TIMING_EVENTS.get(e, e) for e in strings("when"))
+    bounds = repeat.get("boundsDuration")
+    if isinstance(bounds, dict) and _number(bounds.get("value")):
+        if bounds.get("code") in TIMING_UNITS:
+            value = bounds["value"]
+            word = TIMING_UNITS[bounds["code"]]
+            bits.append(f"for 1 {word}" if value == 1 else f"for {value} {word}s")
+        elif _quantity_str(bounds):
+            bits.append("for " + _quantity_str(bounds))
+    window = repeat.get("boundsPeriod")
+    if isinstance(window, dict):
+        start, end = _first_str(window, "start"), _first_str(window, "end")
+        if start and end:
+            bits.append(f"from {start} to {end}")
+        elif start or end:
+            bits.append(f"from {start}" if start else f"until {end}")
+    return bits
 
 
 def _humanize_type(rtype: str) -> str:
@@ -1224,10 +1400,20 @@ def _activity_scheduled(activity) -> str | None:
     return None
 
 
+# HumanName.use, best first: the name on the banner is the one the person
+# goes by now, not a maiden name listed before it.
+NAME_USE_RANK = {"official": 0, "usual": 1, None: 2, "temp": 2, "nickname": 3,
+                 "anonymous": 3, "old": 4, "maiden": 4}
+
+
 def _human_name(names) -> str | None:
+    """The current name out of a HumanName list, as text - or, with no
+    current one, the best of the rest."""
     if not isinstance(names, list):
         return None
-    for name in names:
+    today = datetime.now(timezone.utc).date().isoformat()
+    best = None
+    for index, name in enumerate(names):
         if not isinstance(name, dict):
             continue
         given = name.get("given")
@@ -1235,12 +1421,18 @@ def _human_name(names) -> str | None:
         family = name.get("family")
         if isinstance(family, str) and family.strip():
             parts.append(family.strip())
-        if parts:
-            return " ".join(parts)
-        text = name.get("text")
-        if isinstance(text, str) and text.strip():
-            return text.strip()
-    return None
+        text = " ".join(parts) or _first_str(name, "text")
+        if not text:
+            continue
+        use = name.get("use") if isinstance(name.get("use"), str) else None
+        rank = NAME_USE_RANK.get(use, 2)
+        period = name.get("period")
+        end = period.get("end") if isinstance(period, dict) else None
+        if isinstance(end, str) and end[:10] < today:
+            rank = NAME_USE_RANK["old"]   # an ended name is a former one
+        if best is None or (rank, index) < best[:2]:
+            best = (rank, index, text)
+    return best[2] if best else None
 
 
 def _reference_name(ref, by_ref, follow=True) -> str | None:
@@ -1427,7 +1619,8 @@ def _annotate_item(item, resource, rtype, by_ref, alert_targets=()) -> None:
         concept if rtype in MEDICATION_TYPES else resource.get("code"))
     flags: list = []
     gaps: list = []
-    if not code:
+    # a care team is people and phone numbers, with nothing to code
+    if not code and rtype != "CareTeam":
         gaps.append("not coded")
     if not date and category in DATE_EXPECTED and not absent:
         gaps.append("no date")
@@ -2247,7 +2440,9 @@ def summarize_bundle(bundle) -> dict:
     own 'resourceType/id'. Clinical resources not reachable from the
     Composition (directly via sections or transitively via references such as
     medicationReference) are listed under "unreferenced" as a data-quality
-    hint.
+    hint. A bundle that is not a document (an MPD prescription is a
+    collection) has no Composition to reach anything from, so its clinical
+    entries (or, with none, all of them) make up one "Entries" section.
     """
     summary: dict = {
         "patient": None,
@@ -2305,18 +2500,51 @@ def summarize_bundle(bundle) -> dict:
                     or "Untitled section"
                 )
                 items = []
-                refs = section.get("entry")
-                if isinstance(refs, list):
-                    for ref_entry in refs:
-                        if not isinstance(ref_entry, dict):
-                            continue
-                        target = _resolve_reference(ref_entry.get("reference"), by_ref)
-                        if target is not None:
-                            items.append(
-                                _render_resource(target, by_ref, alert_targets))
+                # A lab report keeps its results in sub-sections ("Blood
+                # examinations" under "Laboratory examinations"); their entries
+                # belong to the top-level section, tagged with the sub-section
+                # they came from. Depth-first in document order, and iterative
+                # for the same reason as _collect_references. A section with
+                # nothing of its own speaks through its sub-sections' emptyReason
+                # or, lacking one, their narrative - as a top-level one does.
+                sub_texts, sub_reasons = [], []
+                stack = [(section, None)]
+                while stack:
+                    node, sub = stack.pop()
+                    if sub:
+                        reason = _cc_display(node.get("emptyReason"))
+                        if reason:
+                            sub_reasons.append(reason)
+                        elif not isinstance(node.get("entry"), list):
+                            text = _section_narrative(node)
+                            if text:
+                                sub_texts.append(f"{sub}\n{text}")
+                    refs = node.get("entry")
+                    if isinstance(refs, list):
+                        for ref_entry in refs:
+                            if not isinstance(ref_entry, dict):
+                                continue
+                            target = _resolve_reference(ref_entry.get("reference"), by_ref)
+                            if target is None:
+                                continue
+                            item = _render_resource(target, by_ref, alert_targets)
+                            if sub:
+                                item["subsection"] = sub
+                            items.append(item)
+                    children = node.get("section")
+                    if isinstance(children, list):
+                        for child in reversed(children):
+                            if not isinstance(child, dict):
+                                continue
+                            # The nearest title only: a path would grow with
+                            # the depth, and the depth is the submitter's.
+                            stack.append((child, _first_str(child, "title")
+                                          or _cc_display(child.get("code"))
+                                          or "Untitled section"))
                 empty_reason = narrative = None
                 if not items:
-                    empty_reason = _cc_display(section.get("emptyReason"))
+                    empty_reason = _cc_display(section.get("emptyReason")) or (
+                        sub_reasons[0] if sub_reasons and not sub_texts else None)
                     if empty_reason:
                         empty_reason = EMPTY_REASON_LABELS.get(
                             _squash(empty_reason), empty_reason
@@ -2325,7 +2553,8 @@ def summarize_bundle(bundle) -> dict:
                         # No entries and no reason for the lack: the section's
                         # content is its narrative (a patient story), so the
                         # views show that rather than "No entries".
-                        narrative = _section_narrative(section)
+                        narrative = _section_narrative(section) or (
+                            "\n".join(sub_texts) or None)
                 state = _section_state(section, items, narrative)
                 for code in _section_codes(section):
                     section_states.setdefault(code, state)
@@ -2359,6 +2588,22 @@ def summarize_bundle(bundle) -> dict:
                     seen.add(id(target))
                     reachable.add(id(target))
                     queue.append(target)
+    elif bundle.get("type") != "document":
+        # A collection - a prescription travels as one - has no Composition for
+        # its entries to be orphaned from. Its clinical entries are its
+        # content; the rest (the prescriber, the RequestGroup tying the orders
+        # together) are their context, as an author is a document's. A bundle
+        # with no clinical entry at all shows what it has rather than nothing.
+        content = [e["resource"] for e in entries
+                   if e["resource"].get("resourceType") not in ("Composition", "Patient")]
+        items = [_render_resource(r, by_ref) for r in content
+                 if r.get("resourceType") in ITEM_CATEGORIES]
+        items = items or [_render_resource(r, by_ref) for r in content]
+        if items:
+            summary["sections"].append({"title": "Entries", "kind": "other",
+                                        "items": items, "empty_reason": None,
+                                        "narrative": None})
+        reachable = {id(e["resource"]) for e in entries}
     for entry in entries:
         resource = entry["resource"]
         if resource.get("resourceType") in ("Composition", "Patient"):
@@ -2453,12 +2698,15 @@ def _meta_profiles(resource) -> list[str]:
         return []
     meta = resource.get("meta")
     claimed = meta.get("profile") if isinstance(meta, dict) else None
-    return [c.split("|", 1)[0] for c in claimed or [] if isinstance(c, str)]
+    if not isinstance(claimed, list):
+        return []
+    return [c.split("|", 1)[0] for c in claimed if isinstance(c, str)]
 
 
 def _composition_type_codes(bundle: dict) -> set[str]:
     """LOINC codes on the first Composition's type, for identifying a document."""
-    for entry in bundle.get("entry") or []:
+    entries = bundle.get("entry")
+    for entry in entries if isinstance(entries, list) else []:
         resource = entry.get("resource") if isinstance(entry, dict) else None
         if not isinstance(resource, dict):
             continue
@@ -2468,7 +2716,7 @@ def _composition_type_codes(bundle: dict) -> set[str]:
         codings = ctype.get("coding") if isinstance(ctype, dict) else None
         return {
             c["code"]
-            for c in codings or []
+            for c in (codings if isinstance(codings, list) else [])
             if isinstance(c, dict)
             and isinstance(c.get("code"), str)
             and c.get("system") == "http://loinc.org"
@@ -2539,6 +2787,116 @@ def detect_document(bundle) -> dict:
     ):
         return DOCUMENTS_BY_ID["mpd"]
     return PRIMARY_DOCUMENT
+
+
+def version_is_loaded(version: str, loaded) -> bool:
+    """Whether a canonical's `|version` pin names a version the validator has.
+
+    Unversioned, one of `loaded`, or its major.minor - Matchbox resolves `|1.0`
+    to the 1.0.0 it has, but reports a bare major, `|1`, as "could not be
+    found"."""
+    return not version or any(
+        v == version or (version.count(".") == 1 and v.startswith(version + "."))
+        for v in loaded)
+
+
+def profile_versions(doc: dict) -> set:
+    """The versions of doc["profile"] the validator has: base R4's for a core
+    canonical (MPD's plain Bundle), otherwise its guide's, the first package."""
+    if doc["profile"].startswith("http://hl7.org/fhir/StructureDefinition/"):
+        return {"4.0.1"}
+    return {doc["igs"][0].partition("#")[2]} if doc["igs"] else set()
+
+
+def require_entry_profile_claims(outcome: dict, bundle: dict, doc: dict) -> dict:
+    """Fail an MPD submission whose orders were never checked against MPD.
+
+    MPD is validated against base Bundle, and Matchbox applies an MPD profile
+    only to an entry that claims one itself. So a MedicationRequest or
+    MedicationDispense with no claim is checked against base R4 alone, and a
+    bundle with none at all - an empty one sent with ?profile= - is checked
+    against nothing. Either would pass and earn the category bonus for MPD
+    conformance nobody checked, and leaving the claim out would be strictly
+    easier than making it. Each unclaimed order, or the absence of any order,
+    becomes an error here, so the bonus is paid only for orders that really
+    were held to the guide.
+
+    A claim pinned to a version the validator does not have counts as no
+    claim: Matchbox reports such a profile as "not checked" with only a
+    warning, so `...-eu-mpd|9.9.9` would otherwise buy the same free pass.
+    Unversioned, the version of the package the engine loads, or its
+    major.minor is checked - MPD's profiles carry their package's version,
+    which Matchbox reports back as "(from ...MedicationRequest-eu-mpd|1.0.0)",
+    and it resolves `|1.0` to that too. A bare major, `|1`, it reports as
+    "could not be found".
+
+    MPD-specific: the orders it requires are MedicationRequest and
+    MedicationDispense, so it is a no-op for every other category, even one
+    that comes to have `entry_profiles`. A category detected by its entries'
+    claims with no bundle profile of its own would need an equivalent check.
+    """
+    if doc.get("id") != "mpd":
+        return outcome
+    claims = set(doc["entry_profiles"])
+    loaded = {ig.split("#", 1)[1] for ig in doc["igs"] if "#" in ig}
+
+    def checked_claim(resource) -> bool:
+        meta = resource.get("meta")
+        claimed = meta.get("profile") if isinstance(meta, dict) else None
+        for c in claimed if isinstance(claimed, list) else []:
+            if not isinstance(c, str):
+                continue
+            url, _, version = c.partition("|")
+            if url in claims and version_is_loaded(version, loaded):
+                return True
+        return False
+
+    entries = bundle.get("entry")
+    added, orders = [], 0
+    for i, entry in enumerate(entries if isinstance(entries, list) else []):
+        resource = entry.get("resource") if isinstance(entry, dict) else None
+        if not isinstance(resource, dict):
+            continue
+        rtype = resource.get("resourceType")
+        # The types detect_document reads a claimless prescription from.
+        if rtype not in ("MedicationRequest", "MedicationDispense"):
+            continue
+        orders += 1
+        if not checked_claim(resource):
+            own = [p for p in doc["entry_profiles"]
+                   if p.rsplit("/", 1)[-1].startswith(rtype + "-")]
+            added.append({
+                "severity": "error",
+                "code": "required",
+                "diagnostics": "This %s claims no MPD profile the validator "
+                "has, so it was not checked against the MPD guide. Add %s, "
+                "unversioned, to its meta.profile."
+                % (rtype, " or ".join(own) or "its MPD profile"),
+                "expression": ["Bundle.entry[%d].resource" % i],
+            })
+    if not orders:
+        added.append({
+            "severity": "error",
+            "code": "required",
+            "diagnostics": "A prescription or dispense needs at least one "
+            "MedicationRequest or MedicationDispense claiming its MPD profile "
+            "in meta.profile, and this bundle has neither.",
+            "expression": ["Bundle"],
+        })
+    if not added:
+        return outcome
+    issues = outcome.get("issue")
+    # Matchbox's own "the validation has passed" would now contradict the
+    # verdict, so it goes.
+    kept = [
+        issue for issue in (issues if isinstance(issues, list) else [])
+        if not (isinstance(issue, dict)
+                and issue.get("severity") == "information"
+                and "validation has passed" in str(issue.get("diagnostics")))
+    ]
+    checked = dict(outcome)
+    checked["issue"] = kept + added
+    return checked
 
 
 # ---------------------------------------------------------------- matchbox
@@ -2860,7 +3218,7 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
     # row however many bundles there are, and a scanner's thousand made-up
     # paths are one "(no route)" row rather than a thousand.
     route = getattr(request.scope.get("route"), "path", None) or "(no route)"
-    method = request.method
+    method = "HEAD" if request.scope.get(HEAD_AS_GET) else request.method
     # Caddy overwrites X-Real-IP with the connecting address, so it cannot be
     # forged from outside; locally there is no Caddy and the socket says.
     address = request.headers.get("x-real-ip") or (
@@ -2877,13 +3235,66 @@ def _count_request(request: Request, status: int, trace: str | None) -> None:
                      method=method, route=route, status=status)
 
 
+# Set on the scope of a HEAD answered as a GET, so the usage log still says HEAD.
+HEAD_AS_GET = "connectathon.head_as_get"
+
+
+class HeadAsGet:
+    """HEAD is GET without the body (RFC 9110), on every route that has a GET.
+
+    FastAPI registers only the methods a route names, so without this an
+    uptime checker or a link preview gets a 405 for the front page. Answered
+    as the GET would be, headers and all, with the body dropped here rather
+    than left to the server: uvicorn only drops it for a scope that still
+    says HEAD. Added last, so it wraps the other middleware and they see a GET.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http" or scope["method"] != "HEAD":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_without_body(message) -> None:
+            if message["type"] == "http.response.body":
+                message = dict(message, body=b"")
+            await send(message)
+
+        await self.app(dict(scope, method="GET", **{HEAD_AS_GET: True}),
+                       receive, send_without_body)
+
+
+app.add_middleware(HeadAsGet)
+
+
 # ------------------------------------------------------------ FHIR plumbing
 
 FHIR_JSON = "application/fhir+json"
-# The service's own canonical base, used in CapabilityStatement and in the
-# fullUrls of any searchset. Relative URLs would be ambiguous the moment a
-# response is saved to disk or passed to a second tool.
+# The path the FHIR API hangs off. CapabilityStatement and the fullUrls of a
+# searchset need the base absolute - a relative URL is ambiguous the moment a
+# response is saved to disk or passed to a second tool, and R4 forbids one in
+# fullUrl - so those take fhir_base(), which puts the origin in front.
 FHIR_BASE = "/fhir"
+
+
+def fhir_base(request: Request) -> str:
+    """The absolute FHIR base, as the client reached it.
+
+    Taken from the request rather than configured, so localhost and the public
+    name both answer with themselves. Caddy terminates TLS and says so in
+    X-Forwarded-Proto; uvicorn believes that header only from 127.0.0.1, and
+    Caddy is another container, so it is read here.
+    """
+    return str(request.base_url.replace(scheme=_scheme(request))).rstrip("/") \
+        + FHIR_BASE
+
+
+def _scheme(request: Request) -> str:
+    proto = request.headers.get("x-forwarded-proto", "").split(",")[0].strip()
+    return proto if proto in ("http", "https") else request.url.scheme
+
 
 # HTTP status -> the OperationOutcome issue code FHIR asks for. Anything not
 # listed falls back to "processing", the spec's own catch-all, so an
@@ -2986,29 +3397,72 @@ def parameters(pairs) -> dict:
     element *is* the null, and emitting one is invalid.
 
     A list value repeats the parameter, which is how FHIR expresses
-    multiplicity - it has no array type.
+    multiplicity - it has no array type. With nothing to say there is no
+    `parameter` at all: FHIR forbids an empty array as it forbids a null.
     """
-    return {"resourceType": "Parameters", "parameter": _named_params(pairs)}
+    resource = {"resourceType": "Parameters"}
+    named = _named_params(pairs)
+    if named:
+        resource["parameter"] = named
+    return resource
 
 
-def searchset(resources: list, total: int | None = None) -> dict:
+def search_params(request: Request, supported: set[str]) -> list[tuple[str, str]]:
+    """The (name, value) pairs of a search that this server applies, in order.
+
+    FHIR lets a server pass over a parameter it does not know - lenient is the
+    default handling - as long as the self link then shows what was really
+    searched on, which is what these pairs are for. A client that asks for
+    `Prefer: handling=strict` gets the 400 instead. A modifier or a chain is
+    another matter: passed over, `name:text=fab` would answer with every
+    company, so one not supported here is refused either way - FHIR requires
+    that of a modifier, and a chain ignored goes wrong the same way. A blank
+    value is the same as not asking, and is not applied.
+    """
+    # Preference names and values are case-insensitive (RFC 7240).
+    prefer = request.headers.get("prefer", "").lower().replace(" ", "")
+    strict = "handling=strict" in re.split(r"[,;]", prefer)
+    applied = []
+    for name, value in request.query_params.multi_items():
+        if name in supported:
+            if value:
+                applied.append((name, value))
+        elif strict or ":" in name or "." in name:
+            raise HTTPException(
+                400, detail="Search parameter `%s` is not supported here; this "
+                            "search takes %s" % (name, ", ".join(sorted(supported))))
+    return applied
+
+
+def searchset(request: Request, resources: list,
+              applied: list[tuple[str, str]], total: int | None = None) -> dict:
     """A searchset Bundle, which is how FHIR returns a list of resources.
 
     `total` defaults to the number carried, which is right whenever the whole
-    result is in one page - this server never pages, so it always is.
+    result is in one page - this server never pages, so it always is. No
+    match is no `entry`, never an empty one, which FHIR forbids. The self
+    link carries the `applied` parameters only, so a client can see which of
+    the ones it sent were passed over.
     """
-    return {
+    self_url = request.url.replace(
+        scheme=_scheme(request), query=urllib.parse.urlencode(applied, safe=":,/"))
+    bundle = {
         "resourceType": "Bundle",
         "type": "searchset",
         "total": len(resources) if total is None else total,
-        "entry": [
+        "link": [{"relation": "self", "url": str(self_url)}],
+    }
+    if resources:
+        base = fhir_base(request)
+        bundle["entry"] = [
             {
-                "fullUrl": "%s/%s/%s" % (FHIR_BASE, r["resourceType"], r["id"]),
+                "fullUrl": "%s/%s/%s" % (base, r["resourceType"], r["id"]),
                 "resource": r,
+                "search": {"mode": "match"},
             }
             for r in resources
-        ],
-    }
+        ]
+    return bundle
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -3055,6 +3509,20 @@ def validation_error_to_outcome(
     )
 
 
+def loads_json(raw: bytes):
+    """json.loads, refusing a lone UTF-16 surrogate as the ValueError every
+    caller already reads as "not valid JSON".
+
+    json.loads turns the escape "\\ud800" into a str that is no Unicode text,
+    and the first thing to encode it - SQLite, compare_digest, the response -
+    raises a 500 long after the parse said yes. Encoding it once here is what
+    finds one, wherever in the document it is.
+    """
+    payload = json.loads(raw)
+    json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return payload
+
+
 async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
     """Read the body, refusing anything over `limit` before it is all resident.
 
@@ -3083,18 +3551,36 @@ async def read_limited_body(request: Request, limit: int, what: str) -> bytes:
 def team_from_token(
     x_team_token: str | None, authorization: str | None
 ) -> sqlite3.Row:
-    """Resolve the X-Team-Token / Bearer credential to a team row or raise 401."""
+    """Resolve the X-Team-Token / Bearer credential to a team row or raise 401.
+
+    Every 401 names what was actually wrong with what was sent - the docs lead
+    with Bearer, so "missing X-Team-Token" would send a team with an unset
+    $TOKEN looking for a header it never used - and carries the
+    WWW-Authenticate challenge HTTP requires of a 401.
+    """
     token = x_team_token
-    if not token and authorization and authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
+    if not token and authorization:
+        scheme, _, credentials = authorization.strip().partition(" ")
+        if scheme.lower() != "bearer":
+            raise HTTPException(
+                401, detail="The Authorization header must be `Bearer TOKEN`",
+                headers={"WWW-Authenticate": "Bearer"})
+        token = credentials.strip()
+        if not token:
+            raise HTTPException(
+                401, detail="The Authorization header has no token after `Bearer`",
+                headers={"WWW-Authenticate": "Bearer"})
     if not token:
-        raise HTTPException(401, detail="Missing X-Team-Token header")
+        raise HTTPException(
+            401, detail="No company token - send `Authorization: Bearer TOKEN`",
+            headers={"WWW-Authenticate": "Bearer"})
     with connect() as conn:
         team = conn.execute(
             "SELECT id, name, slug FROM teams WHERE token = ?", (token,)
         ).fetchone()
     if team is None:
-        raise HTTPException(401, detail="Invalid company token")
+        raise HTTPException(401, detail="Invalid company token",
+                            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'})
     return team
 
 
@@ -3170,7 +3656,7 @@ async def parameters_body(request: Request) -> dict:
     """
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Request body")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "Parameters":
@@ -3218,18 +3704,27 @@ async def parameters_body(request: Request) -> dict:
 )
 def register(params: dict = Depends(parameters_body)) -> Response:
     if REGISTER_CODE:
-        supplied = params.get("code")
+        if "code" not in params:
+            raise HTTPException(403, detail="Registration code required")
+        supplied = params["code"]
         if not isinstance(supplied, str) or not secrets.compare_digest(
             supplied.encode("utf-8"), REGISTER_CODE.encode("utf-8")
         ):
-            raise HTTPException(403, detail="Registration code required")
+            raise HTTPException(403, detail="Registration code is incorrect")
     team = params.get("name")
     if not isinstance(team, str):
         raise HTTPException(
             400, detail="Parameters must carry a `name` with the company name"
         )
     # Collapse runs of whitespace so "Acme  Health" is the same company as
-    # "Acme Health" rather than a way around the one-registration rule.
+    # "Acme Health" rather than a way around the one-registration rule. The
+    # same goes for what cannot be seen at all: a decomposed "Å" is composed,
+    # and invisible format characters (zero-width spaces and joiners, BOMs)
+    # are dropped, or a name of nothing but those would list as a blank row.
+    # Dropped first: one between a letter and its accent would keep the pair
+    # from composing.
+    team = unicodedata.normalize(
+        "NFC", "".join(c for c in team if unicodedata.category(c) != "Cf"))
     team = " ".join(team.split())
     if not 2 <= len(team) <= 40:
         raise HTTPException(400, detail="Company name must be 2-40 characters")
@@ -3286,10 +3781,12 @@ def register(params: dict = Depends(parameters_body)) -> Response:
     ),
 )
 def search_organizations(
+    request: Request,
     name: list[str] | None = Query(None),
     name_contains: list[str] | None = Query(None, alias="name:contains"),
     name_exact: list[str] | None = Query(None, alias="name:exact"),
 ) -> Response:
+    applied = search_params(request, {"name", "name:contains", "name:exact"})
     with connect() as conn:
         rows = conn.execute(
             "SELECT id, name, slug FROM teams ORDER BY name COLLATE NOCASE"
@@ -3297,11 +3794,13 @@ def search_organizations(
         endpoints = endpoints_by_team(conn)
     return fhir_response(
         searchset(
+            request,
             [
                 organization_resource(r, endpoints.get(r["id"], ()))
                 for r in rows
                 if name_matches(r["name"], name, name_contains, name_exact)
-            ]
+            ],
+            applied,
         )
     )
 
@@ -3362,10 +3861,14 @@ def validate_bundle(
     # on it, so the accepted values are exactly the ones this event scores
     # against - one per EHDS category. Naming one settles the category outright,
     # which is the escape hatch for a document detect_document() reads wrongly.
+    # A version suffix the validator has is accepted and settles the same
+    # profile. One it does not have is refused: the bundle would be checked
+    # against another version than the one named, with nothing to say so.
     requested = None
     if profile is not None:
+        url, _, version = profile.partition("|")
         requested = next(
-            (d for d in EHDS_DOCUMENTS if d["profile"] == profile), None
+            (d for d in EHDS_DOCUMENTS if d["profile"] == url), None,
         )
         if requested is None:
             raise HTTPException(
@@ -3373,8 +3876,16 @@ def validate_bundle(
                 detail="This server validates against %s only"
                 % ", ".join(d["profile"] for d in EHDS_DOCUMENTS),
             )
+        have = profile_versions(requested)
+        if not version_is_loaded(version, have):
+            raise HTTPException(
+                400,
+                detail="This server has %s at version %s only; name it "
+                "unversioned or at that version"
+                % (url, " or ".join(sorted(have)) or "(unknown)"),
+            )
     try:
-        bundle = json.loads(body)
+        bundle = loads_json(body)
     except (ValueError, UnicodeDecodeError, RecursionError):
         # RecursionError: json rejects deeply nested input by blowing the stack,
         # which is still the client's bad payload, not a server fault.
@@ -3396,6 +3907,7 @@ def validate_bundle(
     # not to check, and leave the banner asking them to fix errors it will not
     # show them.
     outcome = drop_uncheckable_terminology(outcome)
+    outcome = require_entry_profile_claims(outcome, bundle, doc)
 
     counts = {"fatal": 0, "error": 0, "warning": 0, "information": 0}
     issues = outcome.get("issue")
@@ -3548,10 +4060,9 @@ def _leaderboard_rows() -> list[dict]:
             primary_subs = [
                 s for s in team_subs if s["doc_type"] == PRIMARY_DOCUMENT["id"]
             ]
-            # Highest-scoring submission of the two sets; its timestamp is the
-            # moment the team first achieved its current best score (used as
-            # ranking tiebreak, so re-submitting never hurts).
-            best = min(primary_subs or team_subs, key=lambda s: (-s["score"], s["ts"]))
+            # The best summary, earliest of equals, for the richness columns.
+            best = min(primary_subs, key=lambda s: (-s["score"], s["ts"]),
+                       default=None)
             best_primary = max((s["score"] for s in primary_subs), default=0)
             # Registry order, not submission order, so the column reads the same
             # for every team however they got there.
@@ -3561,6 +4072,23 @@ def _leaderboard_rows() -> list[dict]:
                 if any(s["pass"] and s["doc_type"] == d["id"] for s in team_subs)
             ]
             score = team_score(best_primary, first_pass, len(secondary))
+            # The ranking tiebreak: the moment the team's current total was
+            # first reached, which is when the last of its terms arrived - the
+            # first summary to score its best, and the first pass in each other
+            # category it is credited for. The first-pass bonus needs no term
+            # of its own: it is won by the team's first passing summary, which
+            # is never later than its best. A failed attempt adds nothing to
+            # the total, so it never moves this - trying again must not cost a
+            # tied team its place. A team that has scored nothing at all falls
+            # back to its first attempt, which keeps it above the idle teams.
+            reached = [
+                min(s["ts"] for s in primary_subs if s["score"] == best_primary)
+            ] if best_primary else []
+            reached += [
+                min(s["ts"] for s in team_subs if s["pass"] and s["doc_type"] == doc_id)
+                for doc_id in secondary
+            ]
+            best_ts = max(reached) if reached else team_subs[0]["ts"]
             rows.append(
                 {
                     "organization": team["name"],
@@ -3578,8 +4106,8 @@ def _leaderboard_rows() -> list[dict]:
                     # row above it, and the status and category chips already
                     # say the team submitted, so empty cannot be misread as
                     # never having tried.
-                    "bestSections": best["sections"] if primary_subs else None,
-                    "bestResources": best["resources"] if primary_subs else None,
+                    "bestSections": best["sections"] if best else None,
+                    "bestResources": best["resources"] if best else None,
                     # Absent rather than false for a team with no summary yet:
                     # "has not passed the track's document" is the thing the
                     # column is for, and 0 would read as a passing empty one.
@@ -3587,7 +4115,7 @@ def _leaderboard_rows() -> list[dict]:
                     "secondaryCategories": secondary,
                     "lastSubmission": team_subs[-1]["ts"],
                     "firstPass": first_pass,
-                    "_best_ts": best["ts"],
+                    "_best_ts": best_ts,
                 }
             )
         else:
@@ -3609,7 +4137,7 @@ def _leaderboard_rows() -> list[dict]:
                 }
             )
 
-    # Score desc, then whoever reached their best score first, then name.
+    # Score desc, then whoever reached their current score first, then name.
     # Attempts and last submission are deliberately not tiebreaks: trying
     # again must never hurt a team's rank.
     rows.sort(
@@ -3627,8 +4155,8 @@ def _leaderboard_rows() -> list[dict]:
     description=(
         "One `entry` parameter per registered company, best score first. "
         "Companies that have registered but never submitted appear at the "
-        "bottom with no score. This is an operation rather than a search "
-        "because a ranking is computed on the way out - it is not a resource "
+        "bottom with a score of 0 and no submission details. This is an "
+        "operation rather than a search because a ranking is computed on the way out - it is not a resource "
         "the server stores, and pretending otherwise would mean inventing one."
     ),
 )
@@ -3643,7 +4171,7 @@ def leaderboard() -> Response:
 
 def _loads_or_none(raw: bytes):
     try:
-        return json.loads(raw)
+        return loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         return None
 
@@ -3659,6 +4187,23 @@ def safe_summary(bundle) -> dict:
         return summarize_bundle(bundle)
     except Exception:  # noqa: BLE001 - anything at all, by design
         return summarize_bundle(None)
+
+
+ROW_ID = re.compile(r"[0-9]+")
+
+
+def row_id(value: str) -> int | None:
+    """The row id a FHIR id names, or None when it cannot name a row.
+
+    ASCII digits only: str.isdigit() also takes '²', '①' and '١', which int()
+    either refuses or quietly maps onto some other id. And below 2**63, the
+    most SQLite can hold - binding anything larger is an OverflowError, not
+    "no such row".
+    """
+    if not ROW_ID.fullmatch(value):
+        return None
+    number = int(value)
+    return number if number < 2 ** 63 else None
 
 
 def _submission_row(sub_id: int) -> sqlite3.Row | None:
@@ -3896,8 +4441,9 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
     slug, which always carries a letter. One space means a partner's document
     and a worked example are fetched exactly the same way.
     """
-    if bundle_id.isdigit():
-        row = _submission_row(int(bundle_id))
+    sub_id = row_id(bundle_id)
+    if sub_id is not None:
+        row = _submission_row(sub_id)
         if row is None:
             return None
         raw = read_submission_bytes(row["team_slug"], row["filename"])
@@ -3905,7 +4451,7 @@ def resolve_bundle(bundle_id: str) -> tuple[bytes, str] | None:
             return None
         # The category is in the name so a folder of downloads stays sortable
         # once a team has sent more than patient summaries.
-        return raw, "%s-%s-%s.json" % (row["team_slug"], bundle_id, row["doc_type"])
+        return raw, "%s-%d-%s.json" % (row["team_slug"], sub_id, row["doc_type"])
     raw = read_sample_bytes(bundle_id)
     if raw is None:
         return None
@@ -3969,15 +4515,19 @@ def token_matches(wanted: tuple[str | None, str], identifiers: set) -> bool:
         "no Composition and so no composition.patient, and are not searched. "
         "`composition.patient.identifier` is a FHIR token: `system|value`, "
         "`|value` for an identifier with no system, or a bare `value` for any "
-        "system. Several, separated by commas, match any of them. Each "
-        "entry's id is the one Bundle/{id} reads it back by."
+        "system. Several, separated by commas, match any of them; the "
+        "parameter repeated must match every time. Each entry's id is the one "
+        "Bundle/{id} reads it back by."
     ),
 )
 def search_bundles(
-    identifier: str | None = Query(None, alias="composition.patient.identifier"),
+    request: Request,
+    identifier: list[str] | None = Query(None, alias="composition.patient.identifier"),
 ) -> Response:
-    wanted = [parse_token(t) for t in (identifier or "").split(",") if t]
-    if not any(value for _, value in wanted):
+    applied = search_params(request, {"composition.patient.identifier"})
+    wanted = [[parse_token(t) for t in ors.split(",") if t] for ors in identifier or []]
+    wanted = [ors for ors in wanted if any(value for _, value in ors)]
+    if not wanted:
         raise HTTPException(
             400, detail="Search by composition.patient.identifier=system|value")
     # Only the types that are documents: one with no Bundle profile travels as
@@ -4004,13 +4554,13 @@ def search_bundles(
             continue
         bundle = _loads_or_none(raw)
         identifiers = document_patient_identifiers(bundle)
-        if any(token_matches(w, identifiers) for w in wanted):
+        if all(any(token_matches(w, identifiers) for w in ors) for ors in wanted):
             # The document's own Bundle.id is the author's and is not unique
             # here - companies have sent the very same document. This server's
             # id is the submission, the one Bundle/{id} reads; the document's
             # lasting identity is Bundle.identifier, which is left as sent.
             documents.append(dict(bundle, id=str(row["id"])))
-    return fhir_response(searchset(documents))
+    return fhir_response(searchset(request, documents, applied))
 
 
 @app.get("/fhir/Bundle/{bundle_id}",
@@ -4023,6 +4573,11 @@ def search_bundles(
     ),
 )
 def read_bundle(bundle_id: str) -> Response:
+    # "$validate" fits {bundle_id} too, and Starlette prefers this full match
+    # to the POST route's method mismatch. The router answers PUT with 405 on
+    # its own; GET needs saying here, or it reads as an unknown Bundle.
+    if bundle_id == "$validate":
+        raise HTTPException(405, detail="Method Not Allowed", headers={"Allow": "POST"})
     found = resolve_bundle(bundle_id)
     if found is None:
         raise HTTPException(404, detail="Unknown Bundle")
@@ -4067,6 +4622,13 @@ def exchange_list(
             ):
                 continue
             for best in published_documents(conn, team["id"]):
+                # Screenshots, and the systems they came from: one company can
+                # post several pictures of the same document.
+                shots, systems = conn.execute(
+                    "SELECT COUNT(*), COUNT(DISTINCT consumer_id) FROM renderings "
+                    "WHERE submission_id = ?",
+                    (best["id"],),
+                ).fetchone()
                 entries.append(
                     (
                         "entry",
@@ -4079,11 +4641,8 @@ def exchange_list(
                             "recorded": best["ts"],
                             "sections": best["sections"],
                             "resources": best["resources"],
-                            "renderings": conn.execute(
-                                "SELECT COUNT(*) FROM renderings "
-                                "WHERE submission_id = ?",
-                                (best["id"],),
-                            ).fetchone()[0],
+                            "renderings": shots,
+                            "renderingSystems": systems,
                         },
                     )
                 )
@@ -4185,12 +4744,11 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
     opened - `subject` cannot be used for that, because R4 restricts it to a
     Patient or similar and the thing being rendered here is a document.
     """
-    return {
+    resource = {
         "resourceType": "DocumentReference",
         "id": str(row["id"]),
         "status": "current",
         "date": row["ts"],
-        "description": row["note"] or None,
         "author": [{
             "reference": "Organization/%s" % row["consumer_slug"],
             "display": row["consumer_name"],
@@ -4209,9 +4767,18 @@ def documentreference_resource(row: sqlite3.Row) -> dict:
             "related": [{"reference": "Bundle/%d" % row["submission_id"]}]
         },
     }
+    # FHIR JSON has no null: a screenshot without a note has no description.
+    if row["note"]:
+        resource["description"] = row["note"]
+    return resource
 
 
-def fetch_rendering(conn: sqlite3.Connection, rendering_id: int) -> sqlite3.Row | None:
+def fetch_rendering(
+    conn: sqlite3.Connection, rendering_id: int | None
+) -> sqlite3.Row | None:
+    """The rendering with this id; None also for an id row_id() refused."""
+    if rendering_id is None:
+        return None
     return conn.execute(
         RENDERING_SELECT + " WHERE r.id = ?", (rendering_id,)
     ).fetchone()
@@ -4227,7 +4794,7 @@ def read_rendering_bytes(consumer_slug: str, filename: str) -> bytes | None:
 
 
 def owned_rendering(
-    conn: sqlite3.Connection, rendering_id: int, team: sqlite3.Row
+    conn: sqlite3.Connection, rendering_id: int | None, team: sqlite3.Row
 ) -> sqlite3.Row:
     """The rendering, if this team is the one that uploaded it."""
     row = fetch_rendering(conn, rendering_id)
@@ -4248,9 +4815,27 @@ async def docref_body(
     request: Request, team: sqlite3.Row = Depends(current_team)
 ) -> dict:
     """The uploaded DocumentReference, read only once the uploader is known."""
-    raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
     try:
-        payload = json.loads(raw)
+        raw = await read_limited_body(request, MAX_DOCREF_BODY_BYTES, "Screenshot")
+    except HTTPException as exc:
+        if exc.status_code != 413:
+            raise
+        # The envelope's size and cap mean nothing to someone holding a 2.2 MB
+        # PNG, so say it as _attachment_bytes would: the image and its limit.
+        # Three bytes of image per four of base64 is close enough for "about";
+        # a chunked body, or one longer than it declared, is only known to be
+        # past the cap.
+        declared = request.headers.get("content-length", "")
+        size = ("about %d" % (int(declared) * 3 // 4)
+                if declared.isdigit() and int(declared) > MAX_DOCREF_BODY_BYTES
+                else "over %d" % MAX_IMAGE_BYTES)
+        raise HTTPException(
+            413,
+            detail="Screenshot too large (%s bytes); limit is %d bytes"
+            % (size, MAX_IMAGE_BYTES),
+        )
+    try:
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "DocumentReference":
@@ -4429,44 +5014,89 @@ def add_rendering(
     description=(
         "Newest first, as a searchset. Filter by `related` (a Bundle id), by "
         "`custodian` (the company whose document it is) or by `author` (the "
-        "company that took the screenshot). Unfiltered it is every screenshot "
-        "the event has collected."
+        "company that took the screenshot). Each takes the bare id or "
+        "Type/id, and a comma-separated list matches any of them. Unfiltered "
+        "it is every screenshot the event has collected."
     ),
 )
 def list_renderings(
-    related: int | None = None,
-    custodian: str | None = None,
-    author: str | None = None,
+    request: Request,
+    related: list[str] | None = Query(None),
+    custodian: list[str] | None = Query(None),
+    author: list[str] | None = Query(None),
 ) -> Response:
+    applied = search_params(request, {"related", "custodian", "author"})
     where, params = [], []
-    if related is not None:
-        where.append("r.submission_id = ?")
-        params.append(related)
-    if custodian:
-        where.append("p.slug = ?")
-        params.append(custodian)
-    if author:
-        where.append("c.slug = ?")
-        params.append(author)
+    # A reference takes the bare id or Type/id. Repeats are ANDed and the
+    # commas inside one ORed, as FHIR reads every search parameter.
+    for column, values, prefix in (("p.slug", custodian, "Organization/"),
+                                   ("c.slug", author, "Organization/")):
+        for ors in search_terms(values, fold=False):
+            where.append("%s IN (%s)" % (column, ", ".join("?" * len(ors))))
+            params.extend(o.removeprefix(prefix) for o in ors)
+    for ors in search_terms(related, fold=False):
+        # A Bundle id that names no submission - a sample's slug, say - is
+        # one nobody has screenshotted, not a malformed search.
+        ids = [i for i in (row_id(o.removeprefix("Bundle/")) for o in ors)
+               if i is not None]
+        if not ids:
+            return fhir_response(searchset(request, [], applied))
+        where.append("r.submission_id IN (%s)" % ", ".join("?" * len(ids)))
+        params.extend(ids)
     sql = RENDERING_SELECT
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY r.ts DESC, r.id DESC"
     with connect() as conn:
         rows = [documentreference_resource(row) for row in conn.execute(sql, params)]
-    return fhir_response(searchset(rows))
+    return fhir_response(searchset(request, rows, applied))
 
 
 @app.get("/fhir/DocumentReference/{rendering_id}",
     tags=["Interop"],
     summary="One screenshot's metadata",
 )
-def read_rendering(rendering_id: int) -> Response:
+def read_rendering(rendering_id: str) -> Response:
     with connect() as conn:
-        row = fetch_rendering(conn, rendering_id)
+        row = fetch_rendering(conn, row_id(rendering_id))
     if row is None:
         raise HTTPException(404, detail="Unknown DocumentReference")
     return fhir_response(documentreference_resource(row))
+
+
+# The JSON spellings FHIR accepts in Accept and _format. XML is not served here,
+# so asking for it gets the image, as any other non-FHIR request does.
+FHIR_JSON_FORMATS = {"json", "application/json", "application/fhir+json",
+                     "application/json+fhir"}
+
+
+def wants_fhir_json(request: Request) -> bool:
+    """Whether this read asked for the resource rather than the content.
+
+    _format wins over Accept, as FHIR says. A query string turns an unescaped
+    + into a space, so _format=application/fhir+json has to be put back. In
+    Accept, FHIR JSON has to be listed and nothing else preferred over it.
+    """
+    fmt = request.query_params.get("_format")
+    if fmt is not None:
+        return fmt.replace(" ", "+").strip().lower() in FHIR_JSON_FORMATS
+    fhir_q = other_q = 0.0
+    for item in request.headers.get("accept", "").split(","):
+        media, *params = (p.strip().lower() for p in item.split(";"))
+        if not media:
+            continue
+        q = 1.0
+        for p in params:
+            if p.startswith("q="):
+                try:
+                    q = float(p[2:])
+                except ValueError:
+                    pass
+        if media != "json" and media in FHIR_JSON_FORMATS:
+            fhir_q = max(fhir_q, q)
+        else:
+            other_q = max(other_q, q)
+    return fhir_q > 0 and fhir_q >= other_q
 
 
 @app.get("/fhir/Binary/{rendering_id}",
@@ -4475,17 +5105,27 @@ def read_rendering(rendering_id: int) -> Response:
     description=(
         "The image bytes, served as the type its own bytes proved. FHIR serves "
         "a Binary as its own content type when that is what the client asked "
-        "for, which is what lets an <img> point straight at it."
+        "for, which is what lets an <img> point straight at it. Ask for FHIR "
+        "JSON instead - `Accept: application/fhir+json`, or `_format=json` - "
+        "and it is a Binary resource with the image base64-encoded in `data`."
     ),
 )
-def rendering_image(rendering_id: int) -> Response:
+def rendering_image(rendering_id: str, request: Request) -> Response:
     with connect() as conn:
-        row = fetch_rendering(conn, rendering_id)
+        row = fetch_rendering(conn, row_id(rendering_id))
     if row is None:
         raise HTTPException(404, detail="Unknown Binary")
     raw = read_rendering_bytes(row["consumer_slug"], row["filename"])
     if raw is None:
         raise HTTPException(404, detail="Rendering image file missing")
+    # The same URL answers two ways, so a cache has to keep them apart.
+    if wants_fhir_json(request):
+        return fhir_response(
+            {"resourceType": "Binary", "id": str(row["id"]),
+             "contentType": row["mime"],
+             "data": base64.b64encode(raw).decode("ascii")},
+            Vary="Accept",
+        )
     return Response(
         content=raw,
         media_type=row["mime"],
@@ -4500,8 +5140,10 @@ def rendering_image(rendering_id: int) -> Response:
             # Already compressed. GZipMiddleware goes by size alone, so saying
             # the encoding out loud is what stops it spending CPU for nothing.
             "Content-Encoding": "identity",
-            # The bytes behind an id never change, only ever disappear.
+            # The bytes behind an id never change, only ever disappear: ids
+            # are AUTOINCREMENT, so a withdrawn one is never handed out again.
             "Cache-Control": "public, max-age=31536000, immutable",
+            "Vary": "Accept",
         },
     )
 
@@ -4519,7 +5161,7 @@ def rendering_image(rendering_id: int) -> Response:
     ),
 )
 def update_rendering(
-    rendering_id: int,
+    rendering_id: str,
     payload: dict = Depends(docref_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
@@ -4529,13 +5171,13 @@ def update_rendering(
     if not isinstance(note, str):
         raise HTTPException(400, detail="\"description\" must be a string")
     with connect() as conn:
-        owned_rendering(conn, rendering_id, team)
+        row = owned_rendering(conn, row_id(rendering_id), team)
         conn.execute(
             "UPDATE renderings SET note = ? WHERE id = ?",
-            (note.strip()[:MAX_NOTE_CHARS], rendering_id),
+            (note.strip()[:MAX_NOTE_CHARS], row["id"]),
         )
         return fhir_response(
-            documentreference_resource(fetch_rendering(conn, rendering_id))
+            documentreference_resource(fetch_rendering(conn, row["id"]))
         )
 
 
@@ -4546,11 +5188,11 @@ def update_rendering(
     description="Only the company that uploaded it can remove it; 403 otherwise.",
 )
 def delete_rendering(
-    rendering_id: int, team: sqlite3.Row = Depends(current_team)
+    rendering_id: str, team: sqlite3.Row = Depends(current_team)
 ) -> Response:
     with connect() as conn:
-        row = owned_rendering(conn, rendering_id, team)
-        conn.execute("DELETE FROM renderings WHERE id = ?", (rendering_id,))
+        row = owned_rendering(conn, row_id(rendering_id), team)
+        conn.execute("DELETE FROM renderings WHERE id = ?", (row["id"],))
     # A withdrawn screenshot that is still on disk has not been withdrawn.
     try:
         os.remove(
@@ -4649,6 +5291,14 @@ def parse_endpoint(payload: dict) -> dict:
             or any(c.isspace() or not c.isprintable() for c in address)):
         raise HTTPException(
             400, detail="address must be an absolute http or https URL")
+    # https://user:pass@host is a credential, refused for the same reason
+    # Endpoint.header is below. Any "@" before the host counts, an empty
+    # user name included.
+    if "@" in parts.netloc:
+        raise HTTPException(
+            400, detail="address must not carry a user name or password - this "
+                        "list is public. Say how to authenticate in the "
+                        "description instead")
     if len(address) > MAX_ADDRESS_CHARS:
         raise HTTPException(
             400, detail="address is longer than %d characters" % MAX_ADDRESS_CHARS)
@@ -4722,10 +5372,11 @@ def insert_endpoint(conn: sqlite3.Connection, team_id: int, fields: dict) -> int
     ).lastrowid
 
 
-def fetch_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | None:
-    # An id past what SQLite can hold is no endpoint, rather than an
-    # OverflowError on binding it.
-    if abs(endpoint_id) >= 2 ** 63:
+def fetch_endpoint(
+    conn: sqlite3.Connection, endpoint_id: int | None
+) -> sqlite3.Row | None:
+    """The endpoint with this id; None also for an id row_id() refused."""
+    if endpoint_id is None:
         return None
     return conn.execute(ENDPOINT_SELECT + " WHERE e.id = ?", (endpoint_id,)).fetchone()
 
@@ -4750,7 +5401,7 @@ def _extension_values(element, url: str, key: str, name: str) -> list:
 
 
 def owned_endpoint(
-    conn: sqlite3.Connection, endpoint_id: int, team: sqlite3.Row
+    conn: sqlite3.Connection, endpoint_id: int | None, team: sqlite3.Row
 ) -> sqlite3.Row:
     """The endpoint, if this company is the one advertising it. It is public,
     so somebody else's is a 403 and not a 404."""
@@ -4768,7 +5419,7 @@ async def endpoint_body(
     """The Endpoint resource, read only once the caller is known."""
     raw = await read_limited_body(request, MAX_JSON_BODY_BYTES, "Endpoint")
     try:
-        payload = json.loads(raw)
+        payload = loads_json(raw)
     except (ValueError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, detail="Body is not valid JSON")
     if not isinstance(payload, dict) or payload.get("resourceType") != "Endpoint":
@@ -4805,10 +5456,13 @@ def create_endpoint(
         held = conn.execute(
             "SELECT COUNT(*) FROM endpoints WHERE team_id = ?", (team["id"],)
         ).fetchone()[0]
+        # Worded for the page as much as the API: the page shows it as it
+        # comes, under "Add an address" and beside Edit and Remove buttons,
+        # not PUT and DELETE.
         if held >= MAX_ENDPOINTS:
             raise HTTPException(
-                422, detail="A company can advertise %d endpoints - delete one, "
-                            "or PUT over it" % MAX_ENDPOINTS)
+                422, detail="A company can list %d addresses - remove one, "
+                            "or edit one of them instead" % MAX_ENDPOINTS)
         row = fetch_endpoint(conn, insert_endpoint(conn, team["id"], fields))
     return fhir_response(
         endpoint_resource(row),
@@ -4828,33 +5482,36 @@ def create_endpoint(
     ),
 )
 def search_endpoints(
-    organization: str | None = None,
-    connection_type: str | None = Query(None, alias="connection-type"),
+    request: Request,
+    organization: list[str] | None = Query(None),
+    connection_type: list[str] | None = Query(None, alias="connection-type"),
 ) -> Response:
+    applied = search_params(request, {"organization", "connection-type"})
     # A reference search parameter takes the bare id or Type/id; a token one
     # may carry its system before a |, which is dropped rather than checked.
-    slugs = {v.removeprefix("Organization/") for v in organization.split(",")} \
-        if organization else None
-    kinds = {v.rpartition("|")[2] for v in connection_type.split(",")} \
-        if connection_type else None
+    # Repeats are ANDed, the commas inside one ORed.
+    slugs = [{o.removeprefix("Organization/") for o in ors}
+             for ors in search_terms(organization, fold=False)]
+    kinds = [{o.rpartition("|")[2] for o in ors}
+             for ors in search_terms(connection_type, fold=False)]
     with connect() as conn:
         rows = conn.execute(
             ENDPOINT_SELECT + " ORDER BY t.name COLLATE NOCASE, e.id"
         ).fetchall()
-    return fhir_response(searchset([
+    return fhir_response(searchset(request, [
         endpoint_resource(r) for r in rows
-        if (slugs is None or r["team_slug"] in slugs)
-        and (kinds is None or r["kind"] in kinds)
-    ]))
+        if all(r["team_slug"] in ors for ors in slugs)
+        and all(r["kind"] in ors for ors in kinds)
+    ], applied))
 
 
 @app.get("/fhir/Endpoint/{endpoint_id}",
     tags=["Interop"],
     summary="One advertised endpoint",
 )
-def read_endpoint(endpoint_id: int) -> Response:
+def read_endpoint(endpoint_id: str) -> Response:
     with connect() as conn:
-        row = fetch_endpoint(conn, endpoint_id)
+        row = fetch_endpoint(conn, row_id(endpoint_id))
     if row is None:
         raise HTTPException(404, detail="Unknown Endpoint")
     return fhir_response(endpoint_resource(row))
@@ -4869,28 +5526,34 @@ def read_endpoint(endpoint_id: int) -> Response:
     ),
 )
 def update_endpoint(
-    endpoint_id: int,
+    endpoint_id: str,
     payload: dict = Depends(endpoint_body),
     team: sqlite3.Row = Depends(current_team),
 ) -> Response:
-    if payload.get("id") not in (None, str(endpoint_id)):
+    body_id = payload.get("id")
+    # A numeric id would otherwise be reported as differing from the URL's
+    # while printing the same digits.
+    if body_id is not None and not isinstance(body_id, str):
         raise HTTPException(
-            400, detail="The body's id is %r but the URL's is %d"
-                        % (payload["id"], endpoint_id))
+            400, detail="The body's id must be a JSON string, as every FHIR id is")
+    if body_id not in (None, endpoint_id):
+        raise HTTPException(
+            400, detail="The body's id is %s but the URL's is %s"
+                        % (json.dumps(body_id), json.dumps(endpoint_id)))
     fields = parse_endpoint(payload)
     with connect() as conn:
         # The ownership check and the write see the same row, or a DELETE
         # landing between them leaves nothing to read back.
         conn.execute("BEGIN IMMEDIATE")
-        owned_endpoint(conn, endpoint_id, team)
+        row = owned_endpoint(conn, row_id(endpoint_id), team)
         conn.execute(
             "UPDATE endpoints SET updated_at = ?, kind = ?, name = ?, "
             "address = ?, description = ? WHERE id = ?",
             (datetime.now(timezone.utc).isoformat(), fields["kind"],
              fields["name"], fields["address"], fields["description"],
-             endpoint_id),
+             row["id"]),
         )
-        return fhir_response(endpoint_resource(fetch_endpoint(conn, endpoint_id)))
+        return fhir_response(endpoint_resource(fetch_endpoint(conn, row["id"])))
 
 
 @app.delete("/fhir/Endpoint/{endpoint_id}",
@@ -4900,11 +5563,11 @@ def update_endpoint(
     description="Only the company advertising it can remove it; 403 otherwise.",
 )
 def delete_endpoint(
-    endpoint_id: int, team: sqlite3.Row = Depends(current_team)
+    endpoint_id: str, team: sqlite3.Row = Depends(current_team)
 ) -> Response:
     with connect() as conn:
-        owned_endpoint(conn, endpoint_id, team)
-        conn.execute("DELETE FROM endpoints WHERE id = ?", (endpoint_id,))
+        row = owned_endpoint(conn, row_id(endpoint_id), team)
+        conn.execute("DELETE FROM endpoints WHERE id = ?", (row["id"],))
     return Response(status_code=204)
 
 
@@ -4945,7 +5608,7 @@ def matchbox_status() -> tuple[str, list[str]]:
         "being told any of it."
     ),
 )
-def metadata() -> Response:
+def metadata(request: Request) -> Response:
     return fhir_response(
         {
             "resourceType": "CapabilityStatement",
@@ -4956,7 +5619,7 @@ def metadata() -> Response:
             "software": {"name": app.title, "version": APP_VERSION},
             "implementation": {
                 "description": "Nordic Hackathon 2026 EPS validation service",
-                "url": FHIR_BASE,
+                "url": fhir_base(request),
             },
             "fhirVersion": "4.0.1",
             "format": [FHIR_JSON, "json"],
@@ -5211,6 +5874,7 @@ def ui_document(doc_id: str) -> dict:
         raw = read_sample_bytes(doc_id)
         if raw is None:
             raise HTTPException(404, detail="Unknown sample")
+        bundle = _loads_or_none(raw)
         return {
             "id": meta["id"],
             "team": meta["name"],
@@ -5222,11 +5886,15 @@ def ui_document(doc_id: str) -> dict:
             "score": None,
             "bundle_readable": True,
             "sample": dict(meta, disclaimer=SAMPLE_DISCLAIMER),
-            "summary": safe_summary(_loads_or_none(raw)),
+            # What the views may expect of it: a lab report or a prescription
+            # has no allergy section to be missing.
+            "doc_type": detect_document(bundle)["id"],
+            "summary": safe_summary(bundle),
         }
-    if not doc_id.isdigit():
+    sub_id = row_id(doc_id)
+    if sub_id is None:
         raise HTTPException(404, detail="Unknown document")
-    row = _submission_row(int(doc_id))
+    row = _submission_row(sub_id)
     if row is None:
         raise HTTPException(404, detail="Unknown submission")
     raw = read_submission_bytes(row["team_slug"], row["filename"])
@@ -5245,6 +5913,7 @@ def ui_document(doc_id: str) -> dict:
         # The stored verdict stands even when the file no longer parses, so say
         # so explicitly: an empty summary otherwise reads as an empty document.
         "bundle_readable": bundle is not None,
+        "doc_type": row["doc_type"],
         "summary": safe_summary(bundle),
     }
 
@@ -5267,6 +5936,7 @@ async def ui_preview(request: Request) -> dict:
         "ts": None,
         "preview": True,
         "bundle_readable": True,
+        "doc_type": detect_document(bundle)["id"],
         "summary": safe_summary(bundle),
     }
 
@@ -5553,6 +6223,13 @@ th { text-align: left; color: var(--muted); font-size: 0.76rem;
 td { padding: 9px 10px; border-bottom: 1px solid var(--border); }
 tr:last-child td { border-bottom: none; }
 .table-wrap { overflow-x: auto; }
+/* A company name is any 2-40 characters, spaces or not: one long word has to
+   break rather than widen the page on a phone, or the leaderboard's name
+   column on any screen, pushing its last columns out of view. */
+.co-name { overflow-wrap: anywhere; }
+/* That also lets a table shrink the column to a letter: on a phone, where the
+   leaderboard scrolls anyway, ordinary names then broke mid-word. */
+td.co-name { min-width: 8em; }
 tr.rank-1 td { background: var(--gold-bg); }
 tr.rank-2 td { background: var(--silver-bg); }
 tr.rank-3 td { background: var(--bronze-bg); }
@@ -5629,6 +6306,10 @@ input[type=file] { font-size: 0.84rem; color: var(--muted); }
 .issue-toolbar { display: flex; align-items: center; justify-content: space-between;
   gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
 .issue-toolbar .issue-summary { margin-bottom: 0; }
+/* The menu opens leftwards from the button's right edge, so the button stays
+   at the right even when a phone wraps it onto its own line - at the left, the
+   menu started off the screen. */
+.issue-toolbar .menu-wrap { margin-left: auto; }
 .menu-wrap { position: relative; display: inline-block; }
 /* Needed because the rule above is an author rule and outranks the UA sheet's
    [hidden] { display: none } - without this, wrap.hidden = true has no effect
@@ -5669,6 +6350,19 @@ table.issues td.loc {
    path underneath wraps a syllable at a time. */
 table.issues td.loc, table.issues th.loc-h { min-width: 190px; }
 .loc-where { display: block; margin-top: 2px; overflow-wrap: anywhere; }
+/* A phone has room for one column, not three: severity and that floor took
+   all of it and left the message - what a team reads - past the right edge,
+   behind a scroll nothing showed. Each finding becomes a block instead, the
+   message under its severity and location at full width. */
+@media (max-width: 640px) {
+  table.issues thead { display: none; }
+  table.issues, table.issues tbody { display: block; }
+  table.issues tr { display: flex; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  table.issues tr:last-child { border-bottom: none; }
+  table.issues td { border-bottom: none; }
+  table.issues td.loc { flex: 1; min-width: 0; max-width: none; }
+  table.issues td.msg { flex-basis: 100%; padding-top: 0; }
+}
 .count-badge { display: inline-block; font-size: 0.68rem; font-weight: 600;
   color: var(--muted); border: 1px solid var(--border); border-radius: var(--r-ctl);
   padding: 0 6px; margin-left: 4px; white-space: nowrap; }
@@ -5754,6 +6448,7 @@ select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
   border-radius: var(--r-card); padding: 14px 16px; margin: 12px 0 6px; }
 .patient-name { font-size: var(--fs-large); }
 h3.cv-sec { margin: 22px 0 4px; font-size: var(--fs-large); }
+h4.cv-subsec { margin: 12px 0 0; font-size: 0.95rem; }
 .cv-items { list-style: none; padding: 0; margin: 4px 0 10px; }
 .cv-items li { padding: 8px 2px; border-bottom: 1px solid var(--border); }
 .cv-items li:last-child { border-bottom: none; }
@@ -5801,10 +6496,14 @@ td.cv-scenario { max-width: 30rem; font-size: 0.8rem; line-height: 1.45;
 .cv-mode:hover { color: var(--accent); background: transparent; }
 .cv-mode.active { background: var(--btn); color: var(--btn-on); }
 /* Floating it here would leave the title a useless sliver, so it goes back to
-   being a full-width row above the document. */
+   being a full-width row above the document. A phone can be narrower than the
+   three labels, so they wrap onto further rows instead of being clipped; the
+   separator is a shadow up and to the left, which the box clips at its edges
+   and so only shows between buttons, across rows as well as along them. */
 @media (max-width: 640px) {
-  .cv-modes { float: none; position: static; margin: 0 0 12px; }
-  .cv-mode { flex: 1; text-align: center; }
+  .cv-modes { float: none; position: static; margin: 0 0 12px; flex-wrap: wrap; }
+  .cv-mode { flex: 1 1 auto; text-align: center; border-left: none;
+    box-shadow: -1px -1px 0 var(--field-border); }
 }
 /* the float is the last thing in the card, so the card has to be told to
    contain it or it collapses behind the buttons */
@@ -5963,6 +6662,9 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 /* the gallery: one document, every system that rendered it, side by side */
 .shots { display: grid; gap: 14px; margin-top: 14px;
   grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); }
+/* As with .menu-wrap: display: grid outranks the UA [hidden] rule, and the
+   count button could open the gallery but never fold it away again. */
+.shots[hidden] { display: none; }
 .shot { border: 1px solid var(--border); border-radius: var(--r-card);
   overflow: hidden; background: var(--bg); display: flex; flex-direction: column; }
 .shot img { display: block; width: 100%; height: 168px; object-fit: cover;
@@ -5972,6 +6674,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 .shot-note { font-size: 0.84rem; white-space: pre-wrap; overflow-wrap: anywhere; }
 .shot-note.empty { color: var(--muted); font-style: italic; }
 .shot-own { display: flex; gap: 6px; margin-top: 2px; }
+/* Hidden while the note is edited, so Withdraw is not beside Save note. */
+.shot-own[hidden] { display: none; }
 .shot-edit textarea { width: 100%; min-height: 62px; font-family: inherit;
   font-size: 0.84rem; }
 .shot-err { font-size: 0.82rem; color: var(--fail); }
@@ -6081,7 +6785,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <section class="card" id="register-card">
     <div id="company-view" hidden>
       <h2>Your company</h2>
-      <p class="muted" style="margin:0">Registered as <strong
+      <p class="muted" style="margin:0">Registered as <strong class="co-name"
       id="company-name"></strong>. <button type="button" class="linkish"
       id="reg-another">Register a different company</button></p>
       <h3 class="company-sub">Where others can send you data</h3>
@@ -6147,7 +6851,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
     <div class="error-note" id="reg-error" role="alert"></div>
     <div id="reg-back-wrap" hidden>
       <p class="muted" style="margin:10px 0 0">Registering replaces the token
-      saved in this browser <strong id="reg-replace-name"></strong> - keep a
+      saved in this browser <strong class="co-name" id="reg-replace-name"></strong> - keep a
       copy first: <code id="reg-replace-token"></code></p>
       <p class="muted" style="margin:6px 0 0"><button type="button"
       class="linkish" id="reg-back">Back to your company</button></p>
@@ -6237,7 +6941,6 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <h2>Clinical view of submitted documents</h2>
   <label for="cv-team">Company</label>
   <select id="cv-team"></select>
-  <p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>
   <input type="file" id="cv-file" accept=".json,application/json,application/fhir+json" hidden>
   <div id="cv-list" style="margin-top:12px"></div>
 </section>
@@ -6399,7 +7102,7 @@ function partnerRow(e) {
   return { team: e.organization, team_slug: e.organizationSlug,
            doc_type: e.documentType, exchange_id: e.id, ts: e.recorded,
            sections: e.sections, resources: e.resources,
-           renderings: e.renderings };
+           renderings: e.renderings, rendering_systems: e.renderingSystems };
 }
 /* FHIR has no null, so a company that has never submitted has no bestErrors
    part at all rather than one set to null. Absent becomes null here, once, so
@@ -6483,6 +7186,8 @@ async function loadDocuments() {
 loadDocuments();
 
 /* ---- leaderboard ---- */
+/* The rows as last written, so a poll can tell which ones actually changed. */
+let lbRowsHtml = [];
 async function refreshLeaderboard() {
   updatePracticeNote();
   try {
@@ -6491,14 +7196,17 @@ async function refreshLeaderboard() {
     const rows = paramEntries(await res.json(), "entry").map(leaderboardRow);
     $("#lb-empty").style.display = rows.length ? "none" : "block";
     $("#lb").style.display = rows.length ? "table" : "none";
-    $("#lb-body").innerHTML = rows.map((r) => `
-      <tr class="${r.rank <= 3 ? "rank-" + r.rank : ""}">
+    /* No podium for a team that has not scored: at the start, or while fewer
+       than three teams have scored, rank alone would hand a medal to whoever
+       sorts first by name. */
+    const html = rows.map((r) => `
+      <tr class="${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}">
         <td>${r.rank}</td>
-        <td>${r.attempts
+        <td class="co-name">${r.attempts
           ? `<a href="#clinical/company/${encodeURIComponent(r.team_slug)}"
                title="see this company's documents">${esc(r.team)}</a>`
           : esc(r.team)}${r.first_pass
-          ? ' <span title="First pass: first company to submit a valid document">'
+          ? ' <span title="First pass: first company to submit a valid patient summary">'
             + '\u{1F525}</span>' : ""}</td>
         <td><strong>${r.score}</strong></td>
         <td>${r.passed ? '<span class="badge pass">VALID</span>'
@@ -6511,7 +7219,25 @@ async function refreshLeaderboard() {
         <td>${r.best_resources === null ? "-" : r.best_resources}</td>
         <td>${r.best_errors === null ? "-" : r.best_errors}</td>
         <td class="muted">${r.last_submission ? fmtWhen(r.last_submission) : "-"}</td>
-      </tr>`).join("");
+      </tr>`.trim());
+    /* Only the rows that changed are rewritten. Replacing the whole body every
+       five seconds destroyed the focused link and any selected text even when
+       nothing had moved; a row that did change still loses them, so focus is
+       put back on the same company's link wherever it now sits. */
+    const body = $("#lb-body");
+    const active = document.activeElement;
+    const focusedHref = body.contains(active) ? active.getAttribute("href") : null;
+    if (body.rows.length !== html.length || lbRowsHtml.length !== html.length) {
+      body.innerHTML = html.join("");
+    } else {
+      html.forEach((h, i) => { if (h !== lbRowsHtml[i]) body.rows[i].outerHTML = h; });
+    }
+    lbRowsHtml = html;
+    if (focusedHref && !active.isConnected) {
+      const link = [...body.querySelectorAll("a")]
+        .find((a) => a.getAttribute("href") === focusedHref);
+      if (link) link.focus();
+    }
   } catch (e) { /* transient network error - retry on next tick */ }
 }
 refreshLeaderboard();
@@ -6569,8 +7295,34 @@ function showTab(name) {
   if (name === "submit") checkValidator();
 }
 
+/* A deep link to a card scrolls to it before the tab's lists have loaded, and
+   they land above it and push it out of view. So the card stays pinned to the
+   top while the page is still growing, until the reader scrolls, clicks or
+   types, or the route moves on. Dragging a scrollbar may fire none of those,
+   so the pin also lapses once the loads have had time to arrive. */
+const PIN_MS = 10000;
+let pinnedAnchor = null;
+let pinnedUntil = 0;
+new ResizeObserver(() => {
+  if (pinnedAnchor && Date.now() < pinnedUntil) pinnedAnchor.scrollIntoView({ block: "start" });
+}).observe(document.body);
+for (const type of ["wheel", "touchstart", "keydown", "pointerdown"]) {
+  window.addEventListener(type, () => { pinnedAnchor = null; },
+                          { capture: true, passive: true });
+}
+
+/* Set by a link click to the hash it is heading for. A link into another tab
+   lands at the top of the page, like following a link to a new page would,
+   rather than at the old tab's scroll offset; Back and Forward are not link
+   clicks, so the browser still restores where you were. */
+let followedHash = null;
+
 function applyRoute(scroll) {
   const parts = routeParts();
+  pinnedAnchor = null;
+  const followed = followedHash === location.hash;
+  followedHash = null;
+  const from = document.querySelector(".tab-panel.active");
   /* A hash that is not a tab may be a deep link to a card inside one, such as
      #other-documents or #send-direct. The card's own tab is shown, a folded
      card is opened, and it is scrolled into view; anything else falls through
@@ -6581,20 +7333,22 @@ function applyRoute(scroll) {
   const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0]
     : panel ? panel.id.replace(/^tab-/, "") : "leaderboard";
   showTab(tab);
+  if (followed && !panel && from && from.id !== "tab-" + tab) window.scrollTo(0, 0);
   if (panel) {
     if (anchor.tagName === "DETAILS") anchor.open = true;
     anchor.scrollIntoView({ block: "start" });
+    pinnedAnchor = anchor;
+    pinnedUntil = Date.now() + PIN_MS;
   }
   if (tab !== "clinical") return;
   if (!parts[1]) {
     go("clinical/sample/" + DEFAULT_SAMPLE + "/" + CV_DEFAULT, true);
     return;
   }
-  if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode = parts[3];
-  /* The tab link remembers the document you were reading, so a trip to the
-     leaderboard and back does not throw your place away. */
-  document.querySelector('.tab-btn[data-tab="clinical"]')
-    .setAttribute("href", location.hash);
+  /* A route without a view opens in the default one, not in whichever view
+     the last document was left in, so a link and a reload of it agree. */
+  cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3] : CV_DEFAULT;
+  rememberClinicalRoute();
   /* A company route shows that company's list and no document. If the tab was
      already open the picker is moved here; otherwise initClinical, kicked off
      by showTab above, reads the route once the list has loaded. */
@@ -6604,6 +7358,27 @@ function applyRoute(scroll) {
 
 window.addEventListener("hashchange", () => applyRoute(true));
 
+/* A link to the hash already in the address bar fires no hashchange, so a card
+   folded after following one would not open again from it. Those clicks are
+   routed here instead; a modified click (new tab or window) is the browser's. */
+document.addEventListener("click", (ev) => {
+  if (ev.defaultPrevented || ev.button !== 0
+      || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) return;
+  const link = ev.target.closest('a[href^="#"]');
+  if (!link || link.target) return;
+  if (link.hash !== location.hash) { followedHash = link.hash; return; }
+  ev.preventDefault();
+  applyRoute(true);
+});
+
+/* The tab link remembers the document you were reading, so a trip to the
+   leaderboard and back does not throw your place away. Anything that rewrites
+   a #clinical hash without a hashchange has to call this itself. */
+function rememberClinicalRoute() {
+  document.querySelector('.tab-btn[data-tab="clinical"]')
+    .setAttribute("href", location.hash);
+}
+
 /* ---- register ---- */
 $("#reg-btn").addEventListener("click", async () => {
   const name = $("#reg-name").value.trim();
@@ -6611,6 +7386,10 @@ $("#reg-btn").addEventListener("click", async () => {
   const errBox = $("#reg-error");
   errBox.style.display = "none";
   $("#token-box").style.display = "none";
+  /* A double click or a second Enter would otherwise send the same name
+     twice, and the loser's 409 would wait in the hidden form. */
+  const btn = $("#reg-btn");
+  btn.disabled = true;
   try {
     const parts = [{ name: "name", valueString: name }];
     if (code) parts.push({ name: "code", valueString: code });
@@ -6643,7 +7422,10 @@ $("#reg-btn").addEventListener("click", async () => {
     if (!res.ok) {
       /* The organisers may gate registration; the field appears the moment the
          server says so, instead of cluttering an open event. */
-      if (res.status === 403) $("#reg-code-row").hidden = false;
+      if (res.status === 403) {
+        $("#reg-code-row").hidden = false;
+        setRegisterCurl(true);
+      }
       errBox.textContent = detailText(data) || ("Registration failed (" + res.status + ")");
       errBox.style.display = "block";
       return;
@@ -6658,6 +7440,8 @@ $("#reg-btn").addEventListener("click", async () => {
   } catch (e) {
     errBox.textContent = "Network error: " + e.message;
     errBox.style.display = "block";
+  } finally {
+    btn.disabled = false;
   }
 });
 ["#reg-name", "#reg-code"].forEach((sel) => $(sel).addEventListener("keydown", (ev) => {
@@ -7210,7 +7994,19 @@ $("#explain-menu").addEventListener("click", (ev) => {
 });
 document.addEventListener("click", closeExplainMenu);
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape") closeExplainMenu();
+  if (ev.key !== "Escape") return;
+  /* Hiding the item that has focus drops focus to <body>; it goes back to
+     the button that opened the menu instead. */
+  const fromMenu = $("#explain-menu").contains(document.activeElement);
+  closeExplainMenu();
+  if (fromMenu) $("#explain-btn").focus();
+});
+/* Tabbing past the last item left the menu open over the table. Only a move
+   to somewhere named closes it: a click on an item in a browser that does not
+   focus buttons reports no target, and closing then would swallow the click -
+   a click anywhere else is the document handler's. */
+$("#explain-wrap").addEventListener("focusout", (ev) => {
+  if (ev.relatedTarget && !ev.currentTarget.contains(ev.relatedTarget)) closeExplainMenu();
 });
 
 function renderIssues(issues, bundleText) {
@@ -7253,6 +8049,15 @@ function renderIssues(issues, bundleText) {
 }
 
 /* ---- submit ---- */
+/* fetch throws before sending a header with characters it cannot carry - a
+   token pasted with smart quotes, say - and every caller read that as a
+   network error. Tokens are plain ASCII, so such a token goes out with those
+   characters as "?": the server does not know it either way, and its 401 is
+   the true answer. */
+function bearer(token) {
+  return "Bearer " + token.replace(/[^\x21-\x7e]/g, "?");
+}
+
 /* The token is only typed in one place, but localStorage carries it across
    reloads so a participant pastes it once for the event. */
 function syncToken(value, from) {
@@ -7276,7 +8081,10 @@ async function checkValidator() {
     const h = partsToObject(hRaw.parameter);
     if (h.maxBundleBytes) maxBundleBytes = h.maxBundleBytes;
     if (h.maxNoteChars) maxNote = h.maxNoteChars;
-    if (h.registerCodeRequired) $("#reg-code-row").hidden = false;
+    if (h.registerCodeRequired) {
+      $("#reg-code-row").hidden = false;
+      setRegisterCurl(true);
+    }
     /* NaN if the server sends something unparseable, and NaN fails the
        comparison in updatePracticeNote, so a bad value hides the notice
        rather than showing "Invalid Date". */
@@ -7294,22 +8102,33 @@ async function checkValidator() {
 }
 checkValidator();
 
+/* The file rounded up and the limit down, so the two never print as the same
+   number: rounded alike, a file a byte over 5 MB read "That file is 5.0 MB;
+   the limit is 5 MB." */
+function tooBigMessage(size, limit) {
+  const tenths = (n, round) => round(n * 10 / 1048576) / 10;
+  return "That file is " + tenths(size, Math.ceil).toFixed(1) + " MB; the limit is "
+    + tenths(limit, Math.floor) + " MB.";
+}
+
 $("#file").addEventListener("change", async (ev) => {
   const f = ev.target.files[0];
   if (!f) return;
   const errBox = $("#submit-error");
-  if (f.size > maxBundleBytes) {
-    errBox.textContent = "That file is " + (f.size / 1048576).toFixed(1) + " MB; the limit is "
-      + Math.round(maxBundleBytes / 1048576) + " MB.";
+  /* A refused file takes the previous bundle with it: left in the box, it is
+     what Validate would send, under the new file's name in the picker. */
+  const refuse = (message) => {
+    ev.target.value = "";
+    $("#bundle").value = "";
+    errBox.textContent = message;
     errBox.style.display = "block";
-    return;
-  }
+  };
+  if (f.size > maxBundleBytes) return refuse(tooBigMessage(f.size, maxBundleBytes));
   try {
     $("#bundle").value = await f.text();
     errBox.style.display = "none";
   } catch (e) {
-    errBox.textContent = "Could not read the file: " + e.message;
-    errBox.style.display = "block";
+    refuse("Could not read the file: " + e.message);
   }
 });
 
@@ -7339,7 +8158,7 @@ $("#submit-btn").addEventListener("click", async () => {
       method: "POST",
       headers: {
         "Content-Type": "application/fhir+json",
-        "Authorization": "Bearer " + token,
+        "Authorization": bearer(token),
       },
       body,
     });
@@ -7436,11 +8255,18 @@ $("#submit-btn").addEventListener("click", async () => {
 
 /* ---- curl examples ---- */
 const origin = window.location.origin;
-$("#curl-register").textContent =
-  "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
-  "  -H 'Content-Type: application/fhir+json' \\\n" +
-  "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
-  + "[{\"name\":\"name\",\"valueString\":\"My Company\"}]}'";
+/* Redrawn with a `code` part once the server says registration is gated -
+   without one the example is a 403. */
+function setRegisterCurl(codeRequired) {
+  $("#curl-register").textContent =
+    "curl -s -X POST " + origin + "/fhir/\\$register \\\n" +
+    "  -H 'Content-Type: application/fhir+json' \\\n" +
+    "  -d '{\"resourceType\":\"Parameters\",\"parameter\":"
+    + "[{\"name\":\"name\",\"valueString\":\"My Company\"}"
+    + (codeRequired ? ",{\"name\":\"code\",\"valueString\":\"REGISTRATION_CODE\"}" : "")
+    + "]}'";
+}
+setRegisterCurl(false);
 $("#curl-submit").textContent =
   "curl -s -D - -X POST " + origin + "/fhir/Bundle/\\$validate \\\n" +
   "  -H 'Content-Type: application/fhir+json' \\\n" +
@@ -7659,7 +8485,7 @@ $("#cv-team").addEventListener("change", () => {
   else history.pushState(null, "", hash);
   hideDoc();
   // the tab link remembers where you were; that is now this list
-  document.querySelector('.tab-btn[data-tab="clinical"]').setAttribute("href", hash);
+  rememberClinicalRoute();
   renderCvList();
 });
 $("#cv-list").addEventListener("click", (ev) => {
@@ -8519,6 +9345,10 @@ function viewDashboard(d) {
           : '<div class="db-sub">' + esc(STATE_TEXT[allergySec.state])
             + " Confirm with the patient before giving a new drug.</div>");
     aCls = orphanAllergies.length ? "alert" : "";
+  } else if (d.doc_type && d.doc_type !== "eps") {
+    /* Only a patient summary has to say something about allergies; flagging a
+       lab report or a prescription for its silence flags it for what it is. */
+    aBody = null;
   } else {
     aBody = '<div class="db-big">Unknown</div><div class="db-sub">Information'
       + " missing: neither an allergy nor a statement that none is known"
@@ -8526,7 +9356,7 @@ function viewDashboard(d) {
           ? " (" + esc(allergySec.empty_reason) + ")" : "") + ".</div>";
     aCls = "alert";
   }
-  h += dbCard("Allergies and intolerances", aBody, aCls);
+  if (aBody) h += dbCard("Allergies and intolerances", aBody, aCls);
 
   /* What is wrong, what is taken for it and who is responsible are read
      against each other, so the three sit in one row of their own. */
@@ -8733,10 +9563,21 @@ function viewDocument(d) {
         + esc(STATE_TEXT[sec.state]) + "</p>";
     } else if (sec.items && sec.items.length) {
       const lab = cvSharedPerformer(sec.items);
-      html += (lab ? '<p class="muted cv-performer">All from ' + esc(lab) + ".</p>" : "")
-        + '<ul class="cv-items">'
-        + byRelevance(lab ? cvDropPerformer(sec.items) : sec.items).map(cvItemHtml).join("")
-        + "</ul>";
+      html += lab ? '<p class="muted cv-performer">All from ' + esc(lab) + ".</p>" : "";
+      // a section's own entries come first, then each sub-section's (a lab
+      // report's "Blood examinations") under its own sub-heading
+      const runs = [];
+      sec.items.forEach((it) => {
+        const sub = it.subsection || null;
+        if (!runs.length || runs[runs.length - 1].sub !== sub) runs.push({ sub, items: [] });
+        runs[runs.length - 1].items.push(it);
+      });
+      runs.forEach((r) => {
+        html += (r.sub ? '<h4 class="cv-subsec">' + esc(r.sub) + "</h4>" : "")
+          + '<ul class="cv-items">'
+          + byRelevance(lab ? cvDropPerformer(r.items) : r.items).map(cvItemHtml).join("")
+          + "</ul>";
+      });
     } else if (sec.narrative) {
       // a section that is its narrative (a patient story): the prose is the
       // content, shown as written
@@ -8809,8 +9650,11 @@ function renderClinicalDoc(d) {
       + " time; nothing under it was read from the file.</div>";
   }
   html += cvModesHtml();
-  html += "<h2>" + esc(comp.title || "Patient summary") + "</h2>";
-  html += '<p class="muted" style="margin:2px 0 0">' + esc(d.team)
+  // what kind of document this is, in the title when it has none of its own
+  html += "<h2>" + esc(comp.title || docLabel(d.doc_type || "eps")) + "</h2>";
+  html += '<p class="muted co-name" style="margin:2px 0 0">'
+    + (comp.title && d.doc_type ? esc(docLabel(d.doc_type)) + " &middot; " : "")
+    + esc(d.team)
     + (d.preview
         ? " of " + esc(d.filename || "pasted JSON")
           + " &middot; not uploaded, validated or scored"
@@ -8851,8 +9695,12 @@ $("#cv-doc").addEventListener("click", (ev) => {
 const CV_PREVIEW_KEY = "cv-preview";
 let cvPreview = null;
 
+/* The message lives in the preview pane, so redrawing the list for another
+   company or a document takes an old error away with it; one that arrives
+   after the reader has left the pane has nowhere to go and is dropped. */
 function previewMsg(text) {
   const box = $("#cv-preview-msg");
+  if (!box) return;
   box.textContent = text || "";
   box.style.display = text ? "block" : "none";
 }
@@ -8907,9 +9755,10 @@ function renderPreviewBox(box) {
   box.innerHTML = '<div class="cv-paste">'
     + '<p class="muted" style="margin:0">Pick a Bundle .json or paste one below.'
     + " It is only rendered here, not uploaded to the hackathon.</p>"
-    + '<textarea id="cv-paste" spellcheck="false" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
+    + '<textarea id="cv-paste" spellcheck="false" aria-label="FHIR Bundle JSON to preview" placeholder="{ &quot;resourceType&quot;: &quot;Bundle&quot;, ... }"></textarea>'
     + '<div class="row"><button type="button" id="cv-paste-go">Preview</button>'
     + '<button type="button" class="ghost" id="cv-pick">Choose a file&hellip;</button></div>'
+    + '<p class="muted" id="cv-preview-msg" role="status" style="display:none"></p>'
     + "</div>";
   $("#cv-pick").addEventListener("click", () => {
     $("#cv-file").value = "";  // picking the same file again should still fire
@@ -8943,19 +9792,21 @@ function interopCurls() {
     "curl -s '" + origin + "/fhir/Organization/PARTNER_SLUG/$document?type=laboratory'"
       + " -o partner-laboratory.json\n\n" +
     "# publish a screenshot of how it came out in your system - the image goes\n" +
-    "# in the attachment, base64-encoded:\n" +
-    "curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
+    "# in the attachment, base64-encoded. It is piped in, because a real\n" +
+    "# screenshot is too big to pass on the command line:\n" +
+    "{ printf '%s' '{\"resourceType\": \"DocumentReference\", \"status\": \"current\",\n" +
+    '    "description": "Allergies came through empty",\n' +
+    '    "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
+    '    "context": {"related": [{"reference": "Bundle/ID"}]},\n' +
+    '    "content": [{"attachment": {"contentType": "image/png", "data": "\'\n' +
+    "  base64 -w0 shot.png\n" +
+    "  printf '%s' '\"}}]}'\n" +
+    "} | curl -X POST " + origin + "/fhir/DocumentReference \\\n" +
     "     -H 'Authorization: Bearer TOKEN' \\\n" +
-    "     -H 'Content-Type: application/fhir+json' -d '{\n" +
-    '       "resourceType": "DocumentReference", "status": "current",\n' +
-    '       "description": "Allergies came through empty",\n' +
-    '       "custodian": {"reference": "Organization/PARTNER_SLUG"},\n' +
-    '       "context": {"related": [{"reference": "Bundle/ID"}]},\n' +
-    '       "content": [{"attachment": {"contentType": "image/png",\n' +
-    '                                   "data": "\'\"$(base64 -w0 shot.png)\"\'"}}]}\'\n' +
+    "     -H 'Content-Type: application/fhir+json' --data-binary @-\n" +
     "# ID is the Document # on the card you loaded; leave context out and it is\n" +
     "# taken to be their first card, the patient summary if they have one.\n" +
-    "# Every screenshot of one document:\n" +
+    "# every screenshot of one document:\n" +
     "curl -s '" + origin + "/fhir/DocumentReference?related=ID'\n\n" +
     "# or have documents sent to you: advertise where your system takes them\n" +
     "# in - hl7-fhir-rest for a FHIR base, or web-page for a how-to page:\n" +
@@ -8996,7 +9847,7 @@ async function refreshShotCount(docId) {
       .find((x) => String(x.exchange_id) === String(docId));
     const btn = document.querySelector('.io-partner[data-doc="' + docId
       + '"] [data-shots]');
-    if (p && btn) btn.textContent = shotCountLabel(p.renderings);
+    if (p && btn) btn.textContent = shotCountLabel(p.rendering_systems);
   } catch (e) { /* the count is decoration; the gallery below it is the truth */ }
 }
 
@@ -9014,8 +9865,8 @@ function partnerCard(p) {
   const id = p.exchange_id;
   return '<div class="io-partner" data-slug="' + esc(p.team_slug)
     + '" data-doc="' + id + '">'
-    + "<strong>" + esc(p.team) + "</strong> \u00b7 " + esc(docLabel(p.doc_type))
-    + '<p class="muted" style="margin:6px 0 0"><code>GET '
+    + '<strong class="co-name">' + esc(p.team) + "</strong> \u00b7 " + esc(docLabel(p.doc_type))
+    + '<p class="muted" style="margin:6px 0 0"><code class="co-name">GET '
     + esc(documentPath(p)) + "</code> \u00b7 Document #" + id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + id + '">view document</a>'
@@ -9023,7 +9874,7 @@ function partnerCard(p) {
     + '" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
     + '<button class="ghost" data-shots="' + id + '">'
-    + shotCountLabel(p.renderings) + "</button>"
+    + shotCountLabel(p.rendering_systems) + "</button>"
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */
@@ -9083,14 +9934,10 @@ async function whoAmI() {
   const token = $("#token").value.trim();
   const ask = ++meAsked;
   let next = null, state = "none";
-  /* fetch throws before sending a header with characters it cannot carry - a
-     token pasted with smart quotes, say - which would read as the server being
-     down, for ever. Tokens are plain ASCII, so anything else is just wrong. */
-  if (token && !/^[\x21-\x7e]+$/.test(token)) state = "rejected";
-  else if (token) {
+  if (token) {
     try {
       const res = await fetch("/fhir/Organization/$me", {
-        headers: { "Authorization": "Bearer " + token },
+        headers: { "Authorization": bearer(token) },
       });
       /* An Organization: `id` is the slug, `name` the company name. */
       if (res.ok) { next = await res.json(); state = "known"; }
@@ -9137,7 +9984,7 @@ function shotTile(s) {
     + '<img loading="lazy" src="' + s.image + '" alt="'
     + esc(s.producer) + "'s document as shown by " + esc(s.consumer) + '"></a>'
     + '<figcaption class="shot-meta">'
-    + '<span class="shot-who">' + esc(s.consumer) + "</span>"
+    + '<span class="shot-who co-name">' + esc(s.consumer) + "</span>"
     + '<span class="muted">' + fmtWhen(s.ts) + "</span>"
     + '<span class="shot-note' + (s.note ? '">' + esc(s.note)
         : ' empty">No note - ask them what it shows.') + "</span>"
@@ -9185,7 +10032,7 @@ async function uploadShot(docId) {
     const blob = await shrinkImage(file);
     const res = await fetch("/fhir/DocumentReference", {
       method: "POST",
-      headers: { "Authorization": "Bearer " + token,
+      headers: { "Authorization": bearer(token),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify({
         resourceType: "DocumentReference",
@@ -9257,7 +10104,7 @@ async function saveShotNote(id) {
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "PUT",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim(),
+      headers: { "Authorization": bearer($("#token").value.trim()),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify({
         resourceType: "DocumentReference", status: "current", description: next,
@@ -9289,7 +10136,7 @@ async function withdrawShot(id, confirmed) {
   try {
     const res = await fetch("/fhir/DocumentReference/" + id, {
       method: "DELETE",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+      headers: { "Authorization": bearer($("#token").value.trim()) },
     });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -9412,7 +10259,7 @@ async function loadEndpoints() {
     hint.textContent = groups.length ? ""
       : "No company has advertised an endpoint yet.";
     box.innerHTML = groups.map((g) =>
-      '<div class="io-partner"><strong>' + esc(g.team) + "</strong>"
+      '<div class="io-partner"><strong class="co-name">' + esc(g.team) + "</strong>"
       + g.rows.map((e) => epRow(e, false)).join("") + "</div>").join("");
     $("#my-eps").innerHTML = Object.values(myEndpoints)
       .map((e) => epRow(e, true)).join("");
@@ -9481,7 +10328,7 @@ async function epSave() {
   try {
     const res = await fetch("/fhir/Endpoint" + (epEditing ? "/" + epEditing : ""), {
       method: epEditing ? "PUT" : "POST",
-      headers: { "Authorization": "Bearer " + token,
+      headers: { "Authorization": bearer(token),
                  "Content-Type": "application/fhir+json" },
       body: JSON.stringify(body),
     });
@@ -9529,7 +10376,7 @@ async function epRemove(btn, confirmed) {
   try {
     const res = await fetch("/fhir/Endpoint/" + id, {
       method: "DELETE",
-      headers: { "Authorization": "Bearer " + $("#token").value.trim() },
+      headers: { "Authorization": bearer($("#token").value.trim()) },
     });
     if (res.status === 401) { await refreshCompany(); return; }
     /* 404 is the outcome asked for, reached some other way. */
@@ -9571,6 +10418,9 @@ function showCompanyCard(registering) {
   $("#reg-back").parentNode.hidden = !me;
   $("#reg-replace-name").textContent = me ? "for " + me.name : "";
   $("#reg-replace-token").textContent = saved;
+  /* The box shows the token just registered. Once the field holds another
+     one, it would be telling the participant to save the wrong token. */
+  if ($("#token-value").textContent !== saved) $("#token-box").style.display = "none";
   if (me) $("#company-name").textContent = me.name;
   /* The verdict on the token sits under the token field itself, which is
      often filled from localStorage rather than typed this session. */
@@ -9599,6 +10449,8 @@ async function refreshCompany() {
   await loadEndpoints();
 }
 $("#reg-another").addEventListener("click", () => {
+  /* A fresh form, not the last attempt's complaint. */
+  $("#reg-error").style.display = "none";
   showCompanyCard(true);
   $("#reg-name").focus();
 });
@@ -9831,6 +10683,33 @@ SUBMIT_RESPONSE_HEADERS = {
     "Content-Location": ("where this bundle is now readable", "string"),
 }
 
+# What every error is, whoever raised it - the two exception handlers turn
+# them all into one - and which FastAPI documents as a {detail: [...]} of its
+# own instead.
+OPERATION_OUTCOME_SCHEMA = {
+    "type": "object",
+    "description": "A FHIR R4 OperationOutcome; `issue[].diagnostics` says "
+                   "what went wrong.",
+    "required": ["resourceType", "issue"],
+    "properties": {
+        "resourceType": {"type": "string", "enum": ["OperationOutcome"]},
+        "issue": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "severity": {"type": "string"},
+                    "code": {"type": "string"},
+                    "diagnostics": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+# The types sniff_image() admits, which are the only ones a Binary is served as.
+BINARY_TYPES = ("image/png", "image/jpeg", "image/webp")
+
 # Endpoints that read the token. Anything else is open.
 TOKEN_REQUIRED = {
     ("/fhir/Endpoint", "post"),
@@ -9842,6 +10721,20 @@ TOKEN_REQUIRED = {
     ("/fhir/DocumentReference/{rendering_id}", "put"),
     ("/fhir/DocumentReference/{rendering_id}", "delete"),
 }
+
+
+def _takes_any_text(param: dict) -> bool:
+    """Whether an OpenAPI parameter accepts whatever text it is sent - an
+    optional string, or a list of them - so validating it cannot fail."""
+    if param.get("required") and param.get("in") != "path":
+        return False
+    schema = param.get("schema", {})
+    return all(
+        option.get("type") in ("string", "null")
+        or (option.get("type") == "array"
+            and option.get("items", {}).get("type") == "string")
+        for option in schema.get("anyOf", [schema])
+    )
 
 
 def custom_openapi() -> dict:
@@ -9870,6 +10763,12 @@ def custom_openapi() -> dict:
         routes=app.routes,
     )
     schema["components"] = schema.get("components", {})
+    # Never sent: validation_error_to_outcome answers in an OperationOutcome.
+    for name in ("HTTPValidationError", "ValidationError"):
+        schema["components"].get("schemas", {}).pop(name, None)
+    schema["components"].setdefault("schemas", {})["OperationOutcome"] = \
+        OPERATION_OUTCOME_SCHEMA
+    outcome = {FHIR_JSON: {"schema": {"$ref": "#/components/schemas/OperationOutcome"}}}
     schema["components"]["securitySchemes"] = {
         "TeamToken": {
             "type": "apiKey",
@@ -9894,6 +10793,33 @@ def custom_openapi() -> dict:
                 op["security"] = [{"TeamToken": []}]
             if key in OPENAPI_BODIES:
                 op["requestBody"] = OPENAPI_BODIES[key]
+            responses = op["responses"]
+            # FastAPI assumes application/json; the routes answer through
+            # fhir_response or bundle_response, both fhir+json.
+            for status, response in responses.items():
+                if status.startswith("2") and "application/json" in response.get(
+                        "content", {}):
+                    response["content"] = {FHIR_JSON: {"schema": {"type": "object"}}}
+            # FastAPI lists a 422 on anything with a parameter; only one it
+            # cannot take as given - a number, say - can actually fail.
+            responses.pop("422", None)
+            if any(not _takes_any_text(p) for p in op.get("parameters", [])):
+                responses["422"] = {"description": "A parameter of the wrong type",
+                                    "content": outcome}
+            if key in TOKEN_REQUIRED:
+                responses["401"] = {"description": "No token, or not a company's",
+                                    "content": outcome}
+            if "{" in path:
+                responses["404"] = {"description": "Nothing found there",
+                                    "content": outcome}
+            responses["default"] = {"description": "Any other error",
+                                    "content": outcome}
+    binary = schema["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
+    binary["content"] = {
+        mime: {"schema": {"type": "string", "format": "binary"}} for mime in BINARY_TYPES
+    }
+    # Asked for as FHIR JSON, the same read is a Binary resource instead.
+    binary["content"][FHIR_JSON] = {"schema": {"type": "object"}}
     submit = schema["paths"]["/fhir/Bundle/$validate"]["post"]["responses"]["200"]
     submit["description"] = "The Matchbox OperationOutcome for this bundle."
     submit["content"] = {"application/fhir+json": {"schema": {"type": "object"}}}

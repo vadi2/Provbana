@@ -382,7 +382,9 @@ A team's score is its best **patient summary**, plus a one-time **+20 first pass
 bonus for the first company ever to pass one, plus **+15** for each of the other
 [document types](#document-types) it also has a passing submission in. Nothing else
 scores - interop testing is deliberately unscored, so there is nothing to farm. Set
-`REGISTER_CODE` if you want registration closed as well.
+`REGISTER_CODE` if you want registration closed as well. Companies on the same score
+are ranked by who reached that score first, so another attempt - failed or not - never
+costs a company its place.
 
 The +15 is flat and paid once per category however many of that kind you send, and a
 non-summary earns no section or resource points at all: richness is measured against
@@ -434,6 +436,13 @@ Claim the profile in `meta.profile`, or pass `?profile=` on the submit call, to 
 it outright. `curl 'localhost:8095/fhir/$documents'` lists the lot, including whether
 Matchbox has each one's packages loaded.
 
+A prescription is checked against base `Bundle`, and the validator applies an MPD
+profile only to an entry that claims one. So an MPD submission passes only when it
+carries at least one `MedicationRequest` or `MedicationDispense` and every one of them
+claims its MPD profile in `meta.profile`, unversioned or at the version the validator
+loads (`|1.0.0`, or `|1.0`, which the validator resolves to it; not a bare `|1`). An order that claims nothing would meet base R4 alone, so it is failed with an
+error saying which profile to add rather than paid for conformance nobody checked.
+
 Each category is validated in its own engine: Matchbox scopes an engine to the
 requested profile's dependency closure, so a lab report checked with the summary's
 packages comes back with its conformance *unchecked* rather than checked and failed -
@@ -474,14 +483,23 @@ curl localhost:8095/fhir/metadata
 ```
 
 Endpoints that write authenticate with `Authorization: Bearer TOKEN` (or
-`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**.
+`X-Team-Token: TOKEN`). Reads are open. A missing or unknown token is **401**, with a
+`WWW-Authenticate: Bearer` challenge and a message saying what was wrong with what was sent.
 
 Anything the server computes rather than stores - a ranking, a health check, a token -
 comes back as a `Parameters` resource. That is FHIR's answer for exactly this, and it
 has two consequences worth knowing before you parse one: a repeated parameter name *is*
 the list (FHIR has no array type), and an absent parameter *is* the null (FHIR has no
 null), so a company that has never submitted simply has no `bestErrors` part rather
-than one set to `null`.
+than one set to `null`. The same goes for an empty list: a search with no matches has
+no `entry`, and an operation with nothing to report has no `parameter`.
+
+Searches (`Organization`, `Endpoint`, `DocumentReference`) read their parameters the
+FHIR way: commas inside one are ORed and a repeated parameter is ANDed. A parameter the
+search does not know is passed over, and the searchset's `self` link lists only the ones
+that were applied; send `Prefer: handling=strict` to get a **400** instead. A modifier or
+chain the search does not support (`name:text`, `organization.name`) is always a **400**,
+since ignoring it would answer with everything.
 
 ### Registration
 
@@ -495,8 +513,9 @@ curl -X POST 'localhost:8095/fhir/$register' -H 'Content-Type: application/fhir+
 
 Answers `Parameters` with a `token` and the company as an `Organization`. **400** if the
 name is not 2-40 characters, **403** if `REGISTER_CODE` is set and the `code` parameter
-is wrong or missing, **409** if the name is taken (whitespace-normalised;
-case-insensitive for ASCII letters only).
+is wrong or missing, **409** if the name is taken (whitespace-normalised, NFC-composed
+and with invisible format characters such as zero-width spaces dropped, before both
+checks; case-insensitive for ASCII letters only).
 
 If your system can take documents in directly, say where in the same call: an
 `endpoint` part carrying an [Endpoint](#advertising-where-your-system-takes-documents-in)
@@ -572,7 +591,11 @@ the track", not "a summary worth nothing", and the submit page says exactly that
 canonical it was therefore checked against. Worth reading first: a team that meant to
 send a lab report and sees `eps` here has its answer before it reads a single finding -
 the bundle never claimed what it was. `?profile=` settles it, and is rejected with
-**400** for any canonical outside the five.
+**400** for any canonical outside the five. It may carry a `|version`, but only the
+version the validator has loaded, or its major.minor (`Bundle-eu-lab|2.1.0` or `|2.1`;
+base R4's `Bundle|4.0.1` for MPD); any other version is a **400** naming the one it has,
+rather than a check against a version you did not ask for. `X-Document-Profile` shows
+the canonical unversioned.
 
 The web form does more with that same outcome than the API can. A location like
 `Bundle.entry[9].resource.dosage[0].doseAndRate[0].dose[x].value` is a locator, and
@@ -637,12 +660,13 @@ the room - can read without installing your product. It is a `DocumentReference`
 rides in `content[0].attachment.data` as base64.
 
 ```
-# publish a screenshot of a partner's document
-jq -n --arg slug COMPANY_SLUG --arg img "$(base64 -w0 shot.png)" '{
+# publish a screenshot of a partner's document - the image is piped into jq,
+# because a real screenshot is too big to pass as a command-line argument
+base64 -w0 shot.png | jq -Rs --arg slug COMPANY_SLUG '{
   resourceType: "DocumentReference", status: "current",
   custodian: {reference: ("Organization/" + $slug)},
   description: "Allergies came through empty",
-  content: [{attachment: {contentType: "image/png", data: $img}}]
+  content: [{attachment: {contentType: "image/png", data: .}}]
 }' | curl -X POST localhost:8095/fhir/DocumentReference \
        -H 'Authorization: Bearer TOKEN' \
        -H 'Content-Type: application/fhir+json' --data-binary @-
@@ -650,6 +674,8 @@ jq -n --arg slug COMPANY_SLUG --arg img "$(base64 -w0 shot.png)" '{
 curl 'localhost:8095/fhir/DocumentReference?related=12'
 curl 'localhost:8095/fhir/DocumentReference?custodian=COMPANY_SLUG&author=MY_SLUG'
 curl localhost:8095/fhir/Binary/3 -o shot.png
+# or as a FHIR Binary resource, the image base64-encoded in data
+curl -H 'Accept: application/fhir+json' localhost:8095/fhir/Binary/3
 # your own uploads only: correct the note, or withdraw the screenshot entirely
 curl -X PUT localhost:8095/fhir/DocumentReference/3 -H 'Authorization: Bearer TOKEN' \
      -H 'Content-Type: application/fhir+json' \
@@ -694,7 +720,8 @@ curl -X PUT localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN' \
 curl -X DELETE localhost:8095/fhir/Endpoint/3 -H 'Authorization: Bearer TOKEN'
 ```
 
-**400** for an address that is not an absolute http(s) URL or is over 2000 characters, a
+**400** for an address that is not an absolute http(s) URL, is over 2000 characters or
+carries a user name or password (`https://user:pass@host` - this list is public), a
 `connectionType` code other than these two (or with a `system` that is not that code's),
 a `status` other than `active` (delete an endpoint rather than parking it), a top-level
 R5 `description` (R4 has none - use the extension), a `header` (this list is public, so
@@ -712,12 +739,14 @@ curl 'localhost:8095/fhir/$leaderboard'
 
 One `entry` per registered company, best score first, carrying `rank`, `organization`,
 `organizationSlug`, `score`, `passed`, `attempts`, `firstPass` and - for companies that
-have submitted - `bestErrors`, `bestSections`, `bestResources` and `lastSubmission`.
+have submitted - `bestErrors` and `lastSubmission`. A company that has never submitted
+has a `score` of 0 and sorts below every company that has.
 `secondaryCategories` repeats once per non-summary [document
 type](#document-types) the company has passed, in registry order, and is absent
 for a company that has passed none. `bestPatientSummary` is the score the
-standing rests on, absent for a company that has not submitted a summary at all -
-`bestSections` and `bestResources` describe that same submission.
+standing rests on, and `bestSections` and `bestResources` describe that same
+submission; all three are absent for a company that has not submitted a summary at
+all, even one that has submitted other document types.
 
 The whole API is also described at `/openapi.json`, browsable at `/docs`.
 

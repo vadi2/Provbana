@@ -538,6 +538,10 @@ def test_leaderboard_ordering_and_fields(client, monkeypatch):
     # FHIR has no null, so the empty columns are absent rather than sent as one
     for absent in ("bestErrors", "bestSections", "bestResources", "lastSubmission"):
         assert absent not in idle, absent
+    # ...and the description says so, rather than promising "no score".
+    described = client.get("/openapi.json").json()["paths"]["/fhir/$leaderboard"]["get"]
+    assert "with a score of 0 and no submission details" in described["description"]
+    assert "no score" not in described["description"]
 
 
 def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkeypatch):
@@ -552,6 +556,56 @@ def test_tiebreak_first_to_reach_best_score_resubmitting_harmless(client, monkey
     lb = param_entries(client.get("/fhir/$leaderboard"))
     names = [r["organization"] for r in lb]
     assert names.index("Early") < names.index("Late")
+
+
+def test_tiebreak_a_failed_summary_does_not_cost_a_tied_team_its_place(client,
+                                                                     monkeypatch):
+    """A team with only other categories that then tries a summary and fails
+    has the same total it had - its place among equals cannot change either."""
+    consume_first_pass(client, monkeypatch)
+    tok_a = register(client, "Zulu Early")    # named to lose an alphabetical tie
+    tok_b = register(client, "Alpha Late")
+    submit(client, tok_a, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_b, outcome(), monkeypatch, body=secondary_bundle("laboratory"))
+    submit(client, tok_a, outcome(errors=3), monkeypatch)   # a failed summary
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Zulu Early"]["score"] == board["Alpha Late"]["score"]
+    assert board["Zulu Early"]["rank"] < board["Alpha Late"]["rank"]
+
+
+def test_tiebreak_goes_to_whoever_reached_the_total_first_not_the_summary(client,
+                                                                         monkeypatch):
+    """The other categories are part of the total, so reaching the same total
+    later - by adding a lab report after a rival did - ranks below them, even
+    with the earlier summary."""
+    consume_first_pass(client, monkeypatch)
+    tok_p = register(client, "Alpha Summary First")
+    tok_q = register(client, "Zulu Total First")
+    submit(client, tok_p, outcome(), monkeypatch)
+    submit(client, tok_q, outcome(), monkeypatch)
+    lab = secondary_bundle("laboratory")
+    submit(client, tok_q, outcome(), monkeypatch, body=lab)
+    submit(client, tok_p, outcome(), monkeypatch, body=lab)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Alpha Summary First"]["score"] == board["Zulu Total First"]["score"]
+    assert board["Zulu Total First"]["rank"] < board["Alpha Summary First"]["rank"]
+    # And a later failed lab report changes nothing for the leader.
+    submit(client, tok_q, outcome(errors=1), monkeypatch, body=lab)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Zulu Total First"]["rank"] < board["Alpha Summary First"]["rank"]
+
+
+def test_tiebreak_a_team_that_has_scored_nothing_keeps_its_first_attempt(client,
+                                                                        monkeypatch):
+    """Among teams on 0, one that has tried still ranks above one that has not,
+    and trying again does not move it."""
+    tok_a = register(client, "Zulu Tried")
+    register(client, "Alpha Idle")
+    submit(client, tok_a, outcome(errors=1), monkeypatch)
+    submit(client, tok_a, outcome(errors=1), monkeypatch,
+           body=secondary_bundle("laboratory"))
+    names = [r["organization"] for r in param_entries(client.get("/fhir/$leaderboard"))]
+    assert names.index("Zulu Tried") < names.index("Alpha Idle")
 
 
 def test_tiebreak_alphabetical_for_identical_teams(client):
@@ -784,6 +838,47 @@ def test_item_gaps_flag_missing_dose_and_date():
     assert problem["gaps"] == ["not coded", "no date"]
 
 
+def test_a_structured_dose_is_a_dose():
+    """An MPD prescription states its dose only in doseAndRate and
+    timing.repeat; reading text alone flagged every medicine "no dose"."""
+    def med(*dosage):
+        return {"resourceType": "MedicationRequest", "id": "m", "status": "active",
+                "medicationCodeableConcept": {"text": "x"}, "dosageInstruction": list(dosage)}
+    tablet = {"value": 4, "unit": "Tablet", "system": "http://snomed.info/sct"}
+    cases = [
+        ({"doseAndRate": [{"doseQuantity": tablet}], "timing": {"repeat": {
+            "frequency": 1, "period": 1, "periodUnit": "d", "when": ["EVE.late"],
+            "boundsDuration": {"value": 42, "unit": "day", "code": "d"}}}},
+         "4 Tablet, every day, late evening, for 42 days"),
+        ({"doseAndRate": [{"doseQuantity": {"value": 1, "unit": "{tbl}"}}],
+          "timing": {"repeat": {"frequency": 2, "period": 1, "periodUnit": "d"}},
+          "asNeededBoolean": False}, "1 tbl, 2x per day"),
+        ({"doseAndRate": [{"doseRange": {"low": {"value": 1, "unit": "mg"},
+                                         "high": {"value": 2, "unit": "mg"}}}],
+          "timing": {"repeat": {"frequency": 1, "period": 4, "periodMax": 6,
+                                "periodUnit": "h"}},
+          "asNeededCodeableConcept": {"text": "pain"}},
+         "1-2 mg, every 4-6 hours, as needed for pain"),
+        ({"timing": {"repeat": {"frequency": 1, "frequencyMax": 2, "period": 1,
+                                "periodUnit": "wk", "dayOfWeek": ["mon", "thu"],
+                                "timeOfDay": ["08:00:00"],
+                                "boundsPeriod": {"start": "2025-01-01"}}},
+          "asNeededBoolean": True},
+         "1-2x per week, on mon, thu, at 08:00, from 2025-01-01, as needed"),
+        ({"doseAndRate": [{"doseQuantity": {"value": 500, "unit": "mL"},
+                           "rateQuantity": {"value": 100, "unit": "mL/h"}}],
+          "timing": {"repeat": {"boundsDuration": {"value": 1, "code": "d"}}}},
+         "500 mL, at 100 mL/h, for 1 day"),
+    ]
+    for dosage, expected in cases:
+        item = _items(_doc("10160-0", "Medication", med(dosage)))[0]
+        assert item["detail"] == expected, (dosage, item["detail"])
+        assert "no dose" not in item["gaps"], dosage
+    # still a gap when nothing at all is said about the dose
+    bare = _items(_doc("10160-0", "Medication", med({"asNeededBoolean": False})))[0]
+    assert "no dose" in bare["gaps"]
+
+
 def test_observation_abnormal_flag_and_missing_value():
     bundle = {"resourceType": "Bundle", "entry": [
         {"fullUrl": "urn:uuid:c",
@@ -807,6 +902,42 @@ def test_observation_abnormal_flag_and_missing_value():
     assert hb["flags"] == ["abnormal"] and hb["code_system"] == "LOINC"
     assert hb["gaps"] == []
     assert set(mood["gaps"]) == {"not coded", "no date", "no value"}
+
+
+def test_observation_values_keep_comparator_ratio_and_range():
+    """"<5 mg/L" read as "5 mg/L" is a measured value that was never measured,
+    and a valid titre or range must not be flagged as missing its value."""
+    def obs(**value):
+        return {"resourceType": "Observation", "status": "final",
+                "code": {"text": "x"}, **value}
+    cases = [
+        (obs(valueQuantity={"value": 5, "comparator": "<", "unit": "mg/L"}), "<5 mg/L"),
+        (obs(valueQuantity={"value": 90, "comparator": ">", "unit": "mL/min"}),
+         ">90 mL/min"),
+        (obs(valueRatio={"numerator": {"value": 1}, "denominator": {"value": 64}}),
+         "1:64"),
+        (obs(valueRatio={"numerator": {"value": 5, "unit": "mg"},
+                         "denominator": {"value": 1, "unit": "mL"}}), "5 mg / 1 mL"),
+        (obs(valueRange={"low": {"value": 2, "unit": "mmol/L"},
+                         "high": {"value": 4, "unit": "mmol/L"}}), "2-4 mmol/L"),
+        (obs(valueRange={"low": {"value": 2, "unit": "mmol/L"}}), ">=2 mmol/L"),
+        (obs(valueRange={"high": {"value": 4}}), "<=4"),
+        (obs(valueDateTime="2025-03-04"), "2025-03-04"),
+        (obs(valueTime="08:30:00"), "08:30:00"),
+        (obs(valuePeriod={"start": "2025-01-01", "end": "2025-02-01"}),
+         "2025-01-01 to 2025-02-01"),
+        (obs(valueSampledData={"origin": {"value": 0}, "period": 10,
+                               "dimensions": 1, "data": "1 2 3"}), "sampled data"),
+        (obs(component=[{"code": {"text": "Systolic"}, "valueQuantity": {
+            "value": 140, "comparator": ">=", "unit": "mmHg"}},
+                        {"code": {"text": "Titre"}, "valueRatio": {
+            "numerator": {"value": 1}, "denominator": {"value": 8}}}]),
+         "Systolic >=140 mmHg, Titre 1:8"),
+    ]
+    for resource, expected in cases:
+        item = _items(_doc("30954-2", "Results", dict(resource, id="o")))[0]
+        assert item["detail"] == expected, (resource, item["detail"])
+        assert "no value" not in item["gaps"], resource
 
 
 def test_summary_quality_block():
@@ -910,6 +1041,77 @@ def test_submission_detail_and_raw_bundle(client, monkeypatch):
     assert raw.json()["resourceType"] == "Bundle"
 
 
+def test_the_clinical_view_knows_what_kind_of_document_it_shows(client, monkeypatch):
+    """A prescription is not a patient summary: the views need the type to stop
+    flagging it for the allergy section only a summary has to carry."""
+    token = register(client, "Alpha")
+    with open(os.path.join(os.path.dirname(__file__), "examples", "mpd-example.json"),
+              "rb") as fh:
+        mpd = fh.read()
+    submit(client, token, outcome(), monkeypatch, body=mpd)
+    sub_id = param_entries(client.get("/fhir/$submissions"))[0]["id"]
+    detail = client.get(f"/ui/documents/{sub_id}").json()
+    assert detail["doc_type"] == "mpd"
+    assert client.post("/ui/preview", content=mpd).json()["doc_type"] == "mpd"
+    assert client.post("/ui/preview", content=CLINICAL_BODY).json()["doc_type"] == "eps"
+    assert client.get("/ui/documents/arne-complex-care").json()["doc_type"] == "eps"
+    # a collection has no Composition to orphan its entries from: the three
+    # orders are its content, the prescriber and RequestGroup their context
+    summary = detail["summary"]
+    assert [(s["title"], len(s["items"])) for s in summary["sections"]] == [("Entries", 3)]
+    assert summary["unreferenced"] == []
+    text = client.get("/").text
+    assert 'esc(comp.title || docLabel(d.doc_type || "eps"))' in text
+    assert '} else if (d.doc_type && d.doc_type !== "eps") {' in text
+    assert "if (aBody) h += dbCard(" in text
+
+
+def test_a_company_document_list_shows_each_type(client, monkeypatch):
+    """A lab report, a prescription and a summary from one company must not
+    look alike in its list - the API says which is which, so the row does."""
+    token = register(client, "Alpha")
+    submit(client, token, outcome(), monkeypatch, body=secondary_bundle("mpd"))
+    entry, = param_entries(client.get("/fhir/$submissions"))
+    assert entry["documentType"] == "mpd"
+    text = client.get("/").text
+    row = text[text.index("function submissionRow("):text.index("function partnerRow(")]
+    assert "doc_type: e.documentType" in row
+    body = text[text.index("async function renderCvList("):]
+    body = body[:body.index("\n}\n")]
+    assert '<th scope="col">Document</th>' in body
+    assert "subs.map(cvListRow)" in body
+    row = text[text.index("function cvListRow("):]
+    assert "esc(docLabel(s.doc_type))" in row[:row.index("\n}\n")]
+
+
+def test_a_document_bundle_without_a_composition_still_reports_orphans():
+    """Only a bundle that is not a document reads as a list of entries; a
+    document that lost its Composition is broken, and says so."""
+    s = app_module.summarize_bundle({"resourceType": "Bundle", "type": "document",
+                                     "entry": [{"resource": {"resourceType": "Condition"}}]})
+    assert s["sections"] == [] and len(s["unreferenced"]) == 1
+
+
+def test_a_collection_with_nothing_clinical_shows_what_it_has():
+    s = app_module.summarize_bundle({"resourceType": "Bundle", "type": "collection",
+                                     "entry": [{"resource": {"resourceType": "Patient"}},
+                                               {"resource": {"resourceType": "DiagnosticReport",
+                                                             "code": {"text": "CT head"}}}]})
+    assert [[i["label"] for i in sec["items"]] for sec in s["sections"]] == [["CT head"]]
+    assert s["unreferenced"] == []
+
+
+@pytest.mark.parametrize("bundle", [
+    {"resourceType": "Bundle", "meta": {"profile": 5}},
+    {"resourceType": "Bundle", "entry": 5},
+    {"resourceType": "Bundle", "entry": [{"resource": {
+        "resourceType": "Composition", "type": {"coding": 5}}}]},
+])
+def test_document_detection_survives_malformed_fields(client, bundle):
+    assert app_module.detect_document(bundle)["id"] == "eps"
+    assert client.post("/ui/preview", json=bundle).status_code == 200
+
+
 def test_submission_404s(client, monkeypatch):
     assert client.get("/ui/documents/999").status_code == 404
     assert client.get("/fhir/Bundle/999").status_code == 404
@@ -934,6 +1136,27 @@ def test_preview_renders_a_bundle_without_storing_it(client):
     assert param_entries(client.get("/fhir/$submissions")) == []
     assert client.post("/ui/preview", content=b"not json").status_code == 400
     assert client.post("/ui/preview", content=b'{"resourceType": "Patient"}').status_code == 400
+
+
+def test_index_drops_a_preview_error_with_the_preview_pane(client):
+    """A failed preview's message sat above the list, outside what a redraw
+    replaces, so it stayed on screen under another company's list and over
+    any document opened next. It now lives in the preview pane itself."""
+    text = client.get("/").text
+    pane = text[text.index("function renderPreviewBox("):]
+    pane = pane[:pane.index("\n}\n")]
+    assert 'id="cv-preview-msg"' in pane
+    assert text.count('id="cv-preview-msg"') == 1   # not in the static card too
+    # an error that lands after the reader left the pane has nowhere to go
+    assert 'const box = $("#cv-preview-msg");\n  if (!box) return;' in text
+
+
+def test_index_names_the_preview_textarea(client):
+    """Its only text was the placeholder, a JSON fragment, which a screen
+    reader read out as the field's name."""
+    text = client.get("/").text
+    paste = re.search(r'<textarea id="cv-paste"[^>]*>', text).group(0)
+    assert 'aria-label="FHIR Bundle JSON to preview"' in paste
 
 
 # ---------------------------------------------------------------- interop
@@ -1085,10 +1308,61 @@ def test_index_offers_dashboard_timeline_and_document_views(client):
     assert 'const CV_DEFAULT = "document";' in text
     assert "let cvMode = CV_DEFAULT;" in text
     assert '+ "/" + CV_DEFAULT);' in text
+    # and a link that names no view (the list's own links, a partner's document)
+    # resets it too, so following one and reloading it show the same view
+    assert ("cvMode = parts[3] && Object.hasOwn(CV_VIEWS, parts[3]) ? parts[3]"
+            " : CV_DEFAULT;") in text
+    assert "if (parts[3] && Object.hasOwn(CV_VIEWS, parts[3])) cvMode" not in text
     # the switcher is rebuilt with each document rather than parked in the
     # picker card, so it has to come from the render path
     assert "function cvModesHtml(" in text
     assert "html += cvModesHtml();" in text
+
+
+def test_leaderboard_poll_rewrites_only_the_rows_that_changed(client):
+    """Replacing the whole body every five seconds destroyed the focused link
+    and any selected text even when nothing had moved."""
+    text = client.get("/").text
+    script = text[text.index("async function refreshLeaderboard("):]
+    script = script[:script.index("\nrefreshLeaderboard();")]
+    assert '$("#lb-body").innerHTML =' not in script
+    assert "if (h !== lbRowsHtml[i]) body.rows[i].outerHTML = h;" in script
+    assert "lbRowsHtml = html;" in script
+    # A row that did change gets focus put back on the same company's link.
+    assert "if (focusedHref && !active.isConnected)" in script
+    # Trimmed, or each rewritten row would leave a stray text node behind.
+    assert "</tr>`.trim());" in script
+
+
+def test_leaderboard_podium_is_only_for_teams_that_have_scored(client):
+    """At the start every team is on 0, and rank alone would hand gold, silver
+    and bronze to the first three names in the alphabet."""
+    text = client.get("/").text
+    assert '${r.score > 0 && r.rank <= 3 ? "rank-" + r.rank : ""}' in text
+    assert '${r.rank <= 3 ? "rank-"' not in text
+
+
+def test_first_pass_flame_names_what_earns_it(client):
+    """The bonus is for the first passing patient summary - a lab report that
+    passed earlier does not win it, so "a valid document" was wrong."""
+    text = client.get("/").text
+    assert "First pass: first company to submit a valid patient summary" in text
+    assert "first company to submit a valid document" not in text
+
+
+def test_view_switcher_wraps_rather_than_clips_on_a_phone(client):
+    """The three labels are wider than a phone's card, and the switcher clips
+    what overflows, so on a narrow screen they have to wrap - otherwise the
+    last view cannot be seen, tapped, or told apart as the active one."""
+    text = client.get("/").text
+    base = re.search(r"\n\.cv-modes \{[^}]*\}", text).group(0)
+    assert "overflow: hidden" in base  # the rounded corners rely on it
+    phone = re.search(r"@media \(max-width: 640px\) \{\n  \.cv-modes \{[^}]*\}\n"
+                      r"  \.cv-mode \{[^}]*\}\n\}", text)
+    assert phone, "the switcher's phone layout moved; keep this test pointed at it"
+    assert "flex-wrap: wrap" in phone.group(0)
+    # labels stay whole, so it is the row that wraps rather than the words
+    assert "white-space: nowrap" in re.search(r"\n\.cv-mode \{[^}]*\}", text).group(0)
 
 
 def test_index_navigates_through_the_hash(client):
@@ -1102,6 +1376,57 @@ def test_index_navigates_through_the_hash(client):
     assert 'const DEFAULT_SAMPLE = "arne-complex-care";' in text
     # and a partner's document is linked, not opened by a click handler
     assert "'<a href=\"#clinical/submission/'" in text
+
+
+def test_index_keeps_a_deep_linked_card_in_view_while_the_tab_loads(client):
+    """A cold #send-direct or #other-documents scrolled once, before the tab's
+    lists arrived; they then filled in above the card and pushed it off screen
+    on any connection slower than localhost."""
+    text = client.get("/").text
+    route = text[text.index("function applyRoute("):]
+    route = route[:route.index("\n}\n")]
+    # the card is pinned when it is scrolled to, and every route starts unpinned
+    assert route.index("pinnedAnchor = null;") < route.index("pinnedAnchor = anchor;")
+    # pinned means scrolled to again whenever the page changes height
+    assert ("if (pinnedAnchor && Date.now() < pinnedUntil)"
+            " pinnedAnchor.scrollIntoView(") in text
+    assert "}).observe(document.body);" in text
+    # a scrollbar drag fires no input event, so the pin has to lapse on its own
+    assert "pinnedUntil = Date.now() + PIN_MS;" in route
+    # and the reader taking over ends it, so nothing yanks the page back
+    assert ('for (const type of ["wheel", "touchstart", "keydown", "pointerdown"])'
+            in text)
+
+
+def test_index_reapplies_a_link_to_the_hash_already_shown(client):
+    """Following #other-documents, folding the card and following the link
+    again left it folded: the hash had not changed, so no hashchange fired and
+    applyRoute, which opens the card, never ran."""
+    text = client.get("/").text
+    handler = text[text.index('document.addEventListener("click", (ev) => {\n'
+                              "  if (ev.defaultPrevented"):]
+    handler = handler[:handler.index("\n});\n")]
+    assert "if (link.hash !== location.hash) {" in handler
+    assert "return; }\n  ev.preventDefault();\n  applyRoute(true);" in handler
+    # new-tab and new-window clicks stay with the browser
+    for key in ("metaKey", "ctrlKey", "shiftKey", "altKey"):
+        assert "ev." + key in handler
+
+
+def test_index_lands_a_link_into_another_tab_at_the_top(client):
+    """"Submit tab" at the foot of Interop kept Interop's scroll offset, so it
+    landed at the bottom of Submit, past the address form it pointed at. Only a
+    link click does this: Back and Forward keep the browser's restored offset."""
+    text = client.get("/").text
+    assert "if (link.hash !== location.hash) { followedHash = link.hash; return; }" in text
+    route = text[text.index("function applyRoute("):]
+    route = route[:route.index("\n}\n")]
+    assert "const followed = followedHash === location.hash;\n  followedHash = null;" in route
+    # measured before showTab swaps the panels, or every route is "the same tab"
+    assert route.index('const from = document.querySelector(".tab-panel.active");') \
+        < route.index("showTab(tab);")
+    assert ('if (followed && !panel && from && from.id !== "tab-" + tab)'
+            " window.scrollTo(0, 0);") in route
 
 
 def test_index_hides_identifier_assigning_authorities(client):
@@ -1193,6 +1518,67 @@ def test_index_offers_to_explain_the_errors_with_an_assistant(client):
     assert '"paste it"' in text
     # a plain-http venue box has no clipboard API: the prompt is shown instead
     assert 'id="explain-text"' in text
+
+
+def test_the_explain_menu_opens_on_screen_when_a_phone_wraps_the_toolbar(client):
+    """The menu hangs leftwards from the button's right edge. Wrapped onto its
+    own line at the left on a phone, the button took the menu 47px off the
+    screen - so the button keeps to the right of its line."""
+    text = client.get("/").text
+    assert ".menu { position: absolute; z-index: 5; top: calc(100% + 4px); right: 0;" in text
+    assert ".issue-toolbar { display: flex;" in text and "flex-wrap: wrap;" in text
+    assert ".issue-toolbar .menu-wrap { margin-left: auto; }" in text
+
+
+def test_the_explain_menu_hands_focus_back_and_closes_when_tabbed_out_of(client):
+    """Escape on an item dropped focus to <body>, and tabbing past the last
+    item left the menu open over the issue table."""
+    js = page_script(client)
+    esc_handler = js[js.index('if (ev.key !== "Escape") return;'):]
+    esc_handler = esc_handler[:esc_handler.index("\n});")]
+    assert ('const fromMenu = $("#explain-menu").contains(document.activeElement);'
+            in esc_handler)
+    # only from inside the menu: Escape anywhere else must not grab focus
+    assert 'if (fromMenu) $("#explain-btn").focus();' in esc_handler
+    focusout = js[js.index('$("#explain-wrap").addEventListener("focusout"'):]
+    focusout = focusout[:focusout.index("\n});")]
+    # a null target is a click the document handler deals with, not a tab-out
+    assert ("if (ev.relatedTarget && !ev.currentTarget.contains(ev.relatedTarget)) "
+            "closeExplainMenu();") in focusout
+
+
+def test_a_phone_reads_each_finding_as_a_block(client):
+    """At 375px the location's 190px floor and the severity took the whole
+    table, and the message column sat past the right edge of its scroller."""
+    text = client.get("/").text
+    assert "table.issues td.loc, table.issues th.loc-h { min-width: 190px; }" in text
+    narrow = text[text.index(".loc-where {"):]
+    narrow = narrow[narrow.index("@media (max-width: 640px) {"):]
+    narrow = narrow[:narrow.index("\n}")]
+    assert "table.issues tr { display: flex; flex-wrap: wrap;" in narrow
+    assert "table.issues td.loc { flex: 1; min-width: 0; max-width: none; }" in narrow
+    assert "table.issues td.msg { flex-basis: 100%;" in narrow
+
+
+def test_a_long_company_name_wraps_wherever_it_is_shown(client):
+    """A name is any 2-40 characters with no rule about spaces, so one long
+    word scrolled the Submit and Interop tabs sideways on a phone and pushed
+    the leaderboard's last columns out of view on a desktop."""
+    text = client.get("/").text
+    assert ".co-name { overflow-wrap: anywhere; }" in text
+    # with no floor the leaderboard column shrank to a letter on a phone
+    assert "td.co-name { min-width: 8em; }" in text
+    for shown in ('<strong class="co-name"\n      id="company-name">',
+                  '<strong class="co-name" id="reg-replace-name">',
+                  '<td class="co-name">${r.attempts',                     # leaderboard
+                  """'<strong class="co-name">' + esc(p.team)""",          # partner card
+                  '<code class="co-name">GET \'',                       # its slug
+                  """<strong class="co-name">' + esc(g.team)""",          # endpoints
+                  """<span class="shot-who co-name">' + esc(s.consumer)""",  # gallery
+                  """'<p class="muted co-name" style="margin:2px 0 0">'\n"""
+                  """    + (comp.title && d.doc_type ? esc(docLabel(d.doc_type))"""
+                  """ + " &middot; " : "")\n    + esc(d.team)"""):  # document header
+        assert shown in text, shown
 
 
 # ------------------------------------------------------------- sample documents
@@ -1386,6 +1772,55 @@ def test_a_section_with_no_entry_and_no_empty_reason_asserts_nothing():
     assert s["sections"][0]["empty_reason"] is None
 
 
+def test_sub_section_entries_belong_to_their_top_level_section():
+    """A lab report keeps every result in a sub-section. Dropping them left a
+    valid report showing a heading and nothing else, in every view."""
+    ref = lambda i: [{"reference": f"urn:uuid:res-{i}"}]
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Laboratory examinations", "entry": ref(0),
+         "text": {"div": "<div>Laboratory examinations</div>"}, "section": [
+            {"title": "Urine", "entry": ref(1), "section": [
+                {"code": {"text": "Sediment"}, "entry": ref(2)}]},
+            "not a section",
+            {"title": "Blood", "entry": ref(3)}]},
+        {"title": "Empty parent", "section": [{"title": "Nothing here"}]},
+        resources=4)))
+    lab, empty = s["sections"]
+    assert [(i["label"], i.get("subsection")) for i in lab["items"]] == [
+        ("observation 0", None), ("observation 1", "Urine"),
+        ("observation 2", "Sediment"), ("observation 3", "Blood")]
+    assert lab["narrative"] is None
+    assert empty["items"] == []
+    assert s["unreferenced"] == []
+    assert s["quality"]["items"] == 4
+
+
+def test_an_empty_section_speaks_through_its_sub_sections():
+    """With nothing of its own, a section's content is what its sub-sections
+    say: their prose, or their positive "nothing to report"."""
+    s = app_module.summarize_bundle(json.loads(bundle_with_section(
+        {"title": "Results", "section": [
+            {"title": "Comment", "text": {"div": "<div>Sample haemolysed</div>"}},
+            {"title": "Blood", "emptyReason": {"coding": [{"code": "nilknown"}]}}]},
+        {"title": "Allergies", "section": [
+            {"title": "Drug", "emptyReason": {"coding": [{"code": "nilknown"}]},
+             "text": {"div": "<div>No known drug allergies</div>"}}]},
+        {"title": "Problems", "text": {"div": "<div>See letter</div>"},
+         "section": [{"title": "Old", "text": {"div": "<div>Ignored</div>"}}]})))
+    results, allergies, problems = s["sections"]
+    assert (results["narrative"], results["empty_reason"]) == (
+        "Comment\nSample haemolysed", None)
+    assert (allergies["narrative"], allergies["empty_reason"]) == (None, "None known")
+    assert problems["narrative"] == "See letter"
+
+
+def test_document_view_heads_each_sub_section(client):
+    text = client.get("/").text
+    body = text[text.index("function viewDocument("):text.index("const CV_VIEWS")]
+    assert "it.subsection" in body
+    assert '<h4 class="cv-subsec">' in body
+
+
 def test_empty_sections_never_earn_points(client, monkeypatch):
     consume_first_pass(client, monkeypatch)
     token = register(client, "Alpha")
@@ -1504,6 +1939,61 @@ def test_a_body_that_is_not_parameters_is_rejected(client):
         assert diagnostics(res) == "Body must be a FHIR Parameters resource"
 
 
+LONE = "\\ud800"   # the JSON escape of a lone UTF-16 surrogate, as sent
+
+
+def test_a_lone_surrogate_is_a_400_on_every_json_body(client, monkeypatch):
+    """json.loads takes the escape, but the str it makes is no Unicode text:
+    whatever encodes it first - SQLite, compare_digest - used to raise a 500."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    headers = {"Content-Type": "application/fhir+json"}
+    auth = dict(headers, Authorization="Bearer " + tok_c)
+    ep = '{"resourceType": "Endpoint", "status": "active", "connectionType": ' \
+         '{"code": "web-page"}, "address": "https://x.example", "name": "%s"}' % LONE
+    shot = add_shot(client, tok_c, "producer").json()["id"]
+    calls = []
+    monkeypatch.setattr(app_module, "validate_with_matchbox",
+                        lambda body, doc=None: calls.append(body))
+    for path, method, body, hdrs in (
+        ("/fhir/$register", "POST", '{"resourceType": "Parameters", "parameter": '
+         '[{"name": "name", "valueString": "%sbad"}]}' % LONE, headers),
+        ("/fhir/$register", "POST", '{"resourceType": "Parameters", "parameter": '
+         '[{"name": "name", "valueString": "Surr"}, {"name": "endpoint", '
+         '"resource": %s}]}' % ep, headers),
+        ("/fhir/Endpoint", "POST", ep, auth),
+        ("/fhir/DocumentReference", "POST", '{"resourceType": "DocumentReference", '
+         '"custodian": {"reference": "Organization/%s"}}' % LONE, auth),
+        ("/fhir/DocumentReference/" + shot, "PUT", '{"resourceType": '
+         '"DocumentReference", "description": "%s"}' % LONE, auth),
+        ("/fhir/Bundle/$validate", "POST", '{"resourceType": "Bundle", "entry": '
+         '[{"resource": {"resourceType": "Composition", "title": "%s"}}]}' % LONE,
+         auth),
+    ):
+        res = client.request(method, path, content=body, headers=hdrs)
+        assert res.status_code == 400, (path, res.text)
+        assert diagnostics(res) == "Body is not valid JSON"
+    assert calls == []          # refused before it reached the validator
+    assert [e["resource"]["id"]
+            for e in client.get("/fhir/Organization").json()["entry"]] \
+        == ["consumer", "producer"]
+    # a pair of surrogates is one real character and goes through
+    res = client.post("/fhir/$register", headers=headers, content=(
+        '{"resourceType": "Parameters", "parameter": '
+        '[{"name": "name", "valueString": "Pair \\ud83d\\ude00 Co"}]}'))
+    assert res.status_code == 200
+    assert param_one(res, "organization")["name"] == "Pair \U0001F600 Co"
+
+
+def test_a_lone_surrogate_in_the_code_is_refused_before_it_is_compared(
+        client, monkeypatch):
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
+    res = client.post("/fhir/$register", headers={
+        "Content-Type": "application/fhir+json"}, content=(
+        '{"resourceType": "Parameters", "parameter": [{"name": "name", '
+        '"valueString": "Surr"}, {"name": "code", "valueString": "%s"}]}' % LONE))
+    assert res.status_code == 400
+
+
 # ------------------------------------------------------------ registration code
 
 def test_registration_is_open_by_default(client):
@@ -1513,12 +2003,19 @@ def test_registration_is_open_by_default(client):
 
 def test_registration_code_gates_when_set(client, monkeypatch):
     monkeypatch.setattr(app_module, "REGISTER_CODE", "s3cret")
-    assert register_res(client, "Alpha").status_code == 403
-    assert register_res(client, "Alpha", "wrong").status_code == 403
+    res = register_res(client, "Alpha")
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code required"
+    # someone who typed a code is told it is wrong, not that one is needed
+    res = register_res(client, "Alpha", "wrong")
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code is incorrect"
     # a non-string code must be refused, not compared
-    assert client.post("/fhir/$register", json={"resourceType": "Parameters",
+    res = client.post("/fhir/$register", json={"resourceType": "Parameters",
         "parameter": [{"name": "name", "valueString": "Alpha"},
-                      {"name": "code", "valueInteger": 1234}]}).status_code == 403
+                      {"name": "code", "valueInteger": 1234}]})
+    assert res.status_code == 403
+    assert diagnostics(res) == "Registration code is incorrect"
     assert register_res(client, "Alpha", "s3cret").status_code == 200
 
 
@@ -1539,6 +2036,12 @@ def test_a_document_that_no_longer_parses_says_so(client, monkeypatch):
     assert data["pass"] is True
     assert data["bundle_readable"] is False
     assert data["summary"]["sections"] == []
+    # one stored before lone surrogates were refused reads the same way,
+    # rather than as a 500 once the response is encoded
+    with open(stored, "wb") as fh:
+        fh.write(b'{"resourceType": "Bundle", "id": "\\ud800"}')
+    res = client.get("/ui/documents/%d" % sub["id"])
+    assert res.status_code == 200 and res.json()["bundle_readable"] is False
 
 
 # ----------------------------------------------------------- matchbox client
@@ -1882,6 +2385,43 @@ def test_metadata_describes_the_whole_api(client):
     assert [o["name"] for o in bundles["operation"]] == ["validate"]
 
 
+def test_searchset_full_urls_and_the_base_are_absolute(client, monkeypatch):
+    """R4 requires an absolute fullUrl; '/fhir/Organization/x' fails it."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    add_shot(client, tok_c, "producer")
+    advertise(client, tok_c, endpoint())
+    for path, first in (("/fhir/Organization", "Organization/consumer"),
+                        ("/fhir/Endpoint", "Endpoint/1"),
+                        ("/fhir/DocumentReference", "DocumentReference/1")):
+        entry = client.get(path).json()["entry"][0]
+        assert entry["fullUrl"] == "http://testserver/fhir/" + first, path
+        assert entry["search"] == {"mode": "match"}
+    assert client.get("/fhir/metadata").json()["implementation"]["url"] \
+        == "http://testserver/fhir"
+    # behind Caddy the TLS is Caddy's, and only its header says so
+    behind = {"X-Forwarded-Proto": "https", "Host": "hack.example"}
+    assert client.get("/fhir/Endpoint", headers=behind).json()["entry"][0][
+        "fullUrl"] == "https://hack.example/fhir/Endpoint/1"
+    assert client.get("/fhir/metadata", headers=behind).json()[
+        "implementation"]["url"] == "https://hack.example/fhir"
+    # anything but a scheme the URL can carry is not taken at its word
+    odd = {"X-Forwarded-Proto": "javascript"}
+    assert client.get("/fhir/metadata", headers=odd).json()[
+        "implementation"]["url"] == "http://testserver/fhir"
+
+
+def test_nothing_found_omits_the_array_rather_than_sending_it_empty(client):
+    """FHIR forbids an empty array: no match is no `entry`, no result no
+    `parameter`."""
+    for path in ("/fhir/Organization?name=zzz", "/fhir/Endpoint",
+                 "/fhir/DocumentReference"):
+        body = client.get(path).json()
+        assert body["total"] == 0 and "entry" not in body, path
+    body = client.get("/fhir/$submissions?organization=nope").json()
+    assert body == {"resourceType": "Parameters"}
+    assert app_module.parameters([("gone", None)]) == {"resourceType": "Parameters"}
+
+
 def test_every_error_is_an_operation_outcome(client, monkeypatch):
     """FHIR has one way to say what went wrong, and a client that can read a
     validation failure must not need a second parser for a 404."""
@@ -1946,8 +2486,8 @@ def test_organizations_are_searchable_by_name(client):
 
     def names(query):
         body = client.get("/fhir/Organization?" + query).json()
-        assert body["total"] == len(body["entry"])
-        return [e["resource"]["name"] for e in body["entry"]]
+        assert body["total"] == len(body.get("entry", []))
+        return [e["resource"]["name"] for e in body.get("entry", [])]
 
     assert names("name=aland") == ["Åland Hälsa"]          # case and accents
     assert names("name=health") == []                      # start of the name
@@ -1973,7 +2513,7 @@ def test_a_name_search_in_another_script_does_not_match_everyone(client):
 
     def names(query):
         body = client.get("/fhir/Organization", params=query).json()
-        return [e["resource"]["name"] for e in body["entry"]]
+        return [e["resource"]["name"] for e in body.get("entry", [])]
 
     assert names({"name": "日本"}) == ["日本ヘルス"]
     assert names({"name": "中国"}) == []
@@ -2056,6 +2596,46 @@ def test_openapi_declares_the_team_token_as_a_security_scheme(client):
     assert "x-team-token" not in names and "authorization" not in names
 
 
+def test_openapi_documents_what_the_server_really_sends(client):
+    """FastAPI assumes application/json and its own {detail} error shape; the
+    server sends fhir+json, the image itself, and OperationOutcomes."""
+    spec = client.get("/openapi.json").json()
+    outcome = {"application/fhir+json": {
+        "schema": {"$ref": "#/components/schemas/OperationOutcome"}}}
+    assert "HTTPValidationError" not in json.dumps(spec)
+    assert spec["components"]["schemas"]["OperationOutcome"]["properties"][
+        "resourceType"]["enum"] == ["OperationOutcome"]
+    for path, ops in spec["paths"].items():
+        for verb, op in ops.items():
+            responses = op["responses"]
+            assert responses["default"]["content"] == outcome, (path, verb)
+            for status, response in responses.items():
+                assert "application/json" not in response.get("content", {}), \
+                    (path, verb, status)
+                if not status.startswith("2"):
+                    assert response["content"] == outcome, (path, verb, status)
+    submissions = spec["paths"]["/fhir/$submissions"]["get"]["responses"]
+    assert list(submissions["200"]["content"]) == ["application/fhir+json"]
+    assert "422" in submissions          # count=abc
+    res = client.get("/fhir/$submissions?count=abc")
+    assert res.status_code == 422 and diagnostics(res)
+    # an id is a string and a search takes any text, so neither can fail to parse
+    for path, verb in (("/fhir/Binary/{rendering_id}", "get"),
+                       ("/fhir/Endpoint/{endpoint_id}", "put"),
+                       ("/fhir/Organization", "get")):
+        assert "422" not in spec["paths"][path][verb]["responses"], path
+    assert client.get("/fhir/Binary/abc").status_code == 404
+    assert "404" in spec["paths"]["/fhir/Endpoint/{endpoint_id}"]["get"]["responses"]
+    assert "401" in spec["paths"]["/fhir/Endpoint"]["post"]["responses"]
+    assert "401" not in spec["paths"]["/fhir/Endpoint"]["get"]["responses"]
+    # a Binary is the image, as whichever type its bytes proved, or a Binary
+    # resource for a client that asks for FHIR JSON
+    binary = spec["paths"]["/fhir/Binary/{rendering_id}"]["get"]["responses"]["200"]
+    assert set(binary["content"]) == {
+        app_module.sniff_image(raw)[0] for raw in (png_bytes(), JPEG, WEBP)
+    } | {"application/fhir+json"}
+
+
 def test_openapi_leaves_the_ui_out(client):
     paths = client.get("/openapi.json").json()["paths"]
     assert "/" not in paths and "/favicon.svg" not in paths
@@ -2120,6 +2700,20 @@ def test_index_links_leaderboard_companies_to_their_documents(client):
     assert 'if (parts[1] === "company") { hideDoc(); selectCompany(parts[2]); return; }' in text
     # a company with nothing submitted has nothing to link to
     assert "${r.attempts" in text
+
+
+def test_index_keeps_the_clinical_tab_link_in_step_with_a_rewritten_hash(client):
+    """The Clinical tab link is where a trip to another tab returns to, and
+    applyRoute keeps it current. replaceState fires no hashchange, so a hash
+    rewritten that way - picking another company on a company route - left the
+    link on the old company, and coming back undid the pick."""
+    text = client.get("/").text
+    assert text.count("function rememberClinicalRoute()") == 1
+    calls = [m.start() for m in re.finditer(r"history\.replaceState\(", text)]
+    assert len(calls) >= 2  # go() and the company picker
+    for at in calls:
+        after = text[at:at + 250]
+        assert "applyRoute(" in after or "rememberClinicalRoute();" in after, after
 
 
 # ---------------------------------------------------------------- samples
@@ -2263,6 +2857,25 @@ def test_register_collapses_whitespace_and_dedupes_on_it(client):
     assert param_one(res, "organization")["name"] == "Alpha Team"
     for clash in ("alpha team", "ALPHA   TEAM", " Alpha Team"):
         assert register_res(client, clash).status_code == 409, clash
+
+
+def test_register_dedupes_on_what_the_name_looks_like(client):
+    """Two names that render the same are one company, and a name nobody can
+    see is no name at all."""
+    res = register_res(client, "Åland Hälsa")
+    assert res.status_code == 200
+    for clash in ("Åland Hälsa",            # decomposed
+                  "Åland Hälsa​",        # trailing zero-width space
+                  "﻿Åland‍ Hälsa",   # BOM, zero-width joiner
+                  "A​̊land Hälsa"):       # one between letter and accent
+        assert register_res(client, clash).status_code == 409, repr(clash)
+    res = register_res(client, "Hälsa⁠ Co")
+    assert res.status_code == 200
+    assert param_one(res, "organization")["name"] == "Hälsa Co"
+    for blank in ("​​", "​‌⁠", "A​"):
+        res = register_res(client, blank)
+        assert res.status_code == 400, repr(blank)
+        assert diagnostics(res) == "Company name must be 2-40 characters"
 
 
 def test_register_rejects_non_string_and_missing_names(client):
@@ -2424,6 +3037,23 @@ def test_care_plan_shows_the_activity_not_the_plan(client):
     assert plan["status"] == "cancelled"
     assert "plan start" in plan["detail"]
     assert plan["note"]
+
+
+def test_the_banner_shows_the_current_name_not_the_first_listed():
+    """A maiden name listed first is still a former name."""
+    def name(names):
+        return app_module._patient_summary({"name": names})["name"]
+    maiden = {"use": "old", "family": "Maidenname", "given": ["Eva"]}
+    official = {"use": "official", "family": "Current", "given": ["Eva"]}
+    assert name([maiden, official]) == "Eva Current"
+    assert name([{"use": "nickname", "text": "Evi"}, {"text": "Eva Current"}]) == "Eva Current"
+    assert name([{"family": "Ended", "period": {"end": "2010-01-01"}},
+                 {"family": "Now"}]) == "Now"
+    assert name([{"text": "Eva Usual", "use": "usual"}, official]) == "Eva Current"
+    # with only a former name, that is still better than none
+    assert name([maiden, {"use": "official"}, "junk"]) == "Eva Maidenname"
+    assert name([{"use": "official", "given": ["A"]}, {"use": "official", "given": ["B"]}]) == "A"
+    assert name("junk") is None
 
 
 def test_device_use_shows_when_the_device_went_in(client):
@@ -3399,6 +4029,30 @@ def test_an_oversized_screenshot_is_refused_before_it_is_resident(client, monkey
     assert "limit is 1024 bytes" in diagnostics(res)
 
 
+def test_a_screenshot_past_the_envelope_is_refused_in_image_terms(client, monkeypatch):
+    """Most oversized screenshots trip the cap on the base64 body before the
+    image is ever decoded. The 413 still has to name the image limit people
+    were told about, not the envelope's own size and cap."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    monkeypatch.setattr(app_module, "MAX_IMAGE_BYTES", 1024)
+    monkeypatch.setattr(app_module, "MAX_DOCREF_BODY_BYTES", 1024 * 4 // 3 + 8192)
+    image = png_bytes() + b"\x00" * 20_000
+    body = json.dumps(docref("producer", image)).encode()
+    headers = {"X-Team-Token": tok_c, "Content-Type": "application/fhir+json"}
+    res = client.post("/fhir/DocumentReference", content=body, headers=headers)
+    assert res.status_code == 413
+    found = re.fullmatch(r"Screenshot too large \(about (\d+) bytes\); "
+                         r"limit is 1024 bytes", diagnostics(res))
+    assert found, diagnostics(res)
+    assert abs(int(found.group(1)) - len(image)) < 200
+    # sent chunked, the size is never declared - only that it is past the cap
+    res = client.post("/fhir/DocumentReference", headers=headers,
+                      content=(body[i:i + 4096] for i in range(0, len(body), 4096)))
+    assert res.status_code == 413
+    assert diagnostics(res) == \
+        "Screenshot too large (over 1024 bytes); limit is 1024 bytes"
+
+
 def test_a_runaway_note_is_truncated_not_refused(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     res = add_shot(client, tok_c, "producer", note="x" * (app_module.MAX_NOTE_CHARS + 500))
@@ -3424,13 +4078,128 @@ def test_renderings_list_filters_by_document_producer_and_consumer(client, monke
         == ["from third"]
     assert shots(client.get("/fhir/DocumentReference?custodian=nobody")) == []
     assert shots(client.get("/fhir/DocumentReference?related=99999")) == []
+    # a Bundle id that is a sample's slug has no screenshots, rather than a 422
+    res = client.get("/fhir/DocumentReference?related=andrea-cross-border")
+    assert res.status_code == 200 and shots(res) == []
+
+
+# Past what SQLite holds; non-ASCII digits str.isdigit() takes but int() either
+# refuses ('²', '①') or maps onto a real id (fullwidth and Arabic-Indic '1');
+# and plain ids that are not numbers at all.
+CRAFTED_IDS = ["99999999999999999999999", str(2 ** 63), "²", "①",
+               "１", "١", "abc"]
+
+
+def test_a_crafted_id_is_a_404_outcome_on_every_read_and_write(client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    shot = add_shot(client, tok_c, "producer").json()["id"]
+    ep = advertise(client, tok_c, endpoint()).json()["id"]
+    assert (shot, ep) == ("1", "1")     # so a digit read as 1 would find them
+    auth = {"Authorization": "Bearer " + tok_c}
+    for crafted in CRAFTED_IDS:
+        quoted = urllib.parse.quote(crafted)
+        for res in (
+            client.get("/fhir/Bundle/" + quoted),
+            client.get("/ui/documents/" + quoted),
+            client.get("/fhir/DocumentReference/" + quoted),
+            client.get("/fhir/Binary/" + quoted),
+            client.get("/fhir/Endpoint/" + quoted),
+            client.put("/fhir/DocumentReference/" + quoted, headers=auth,
+                       json={"resourceType": "DocumentReference", "description": "x"}),
+            client.delete("/fhir/DocumentReference/" + quoted, headers=auth),
+            advertise(client, tok_c, endpoint(), quoted),
+            client.delete("/fhir/Endpoint/" + quoted, headers=auth),
+        ):
+            assert res.status_code == 404, (crafted, res.request.url, res.text)
+            assert res.json()["issue"][0]["code"] == "not-found"
+        res = client.get("/fhir/DocumentReference?related=" + quoted)
+        assert res.status_code == 200 and shots(res) == [], crafted
+    # nothing was rewritten or withdrawn on the way
+    assert client.get("/fhir/DocumentReference/1").json().get("description") != "x"
+    assert client.get("/fhir/Endpoint/1").status_code == 200
+    # the download is named from the id the row holds
+    res = client.get("/fhir/Bundle/1")
+    assert res.status_code == 200
+    assert '"producer-1-' in res.headers["content-disposition"]
+
+
+def test_an_endpoint_put_whose_body_names_another_id_is_refused(client):
+    tok = register(client, "Owner")
+    ep = advertise(client, tok, endpoint()).json()["id"]
+    res = advertise(client, tok, dict(endpoint(), id="2"), ep)
+    assert res.status_code == 400
+    assert diagnostics(res) == "The body's id is \"2\" but the URL's is \"1\""
+    # a FHIR id is compared as the string it is, not as the number it reads as
+    assert advertise(client, tok, dict(endpoint(), id="01"), ep).status_code == 400
+    res = advertise(client, tok, dict(endpoint(name="Same"), id=ep), ep)
+    assert res.status_code == 200 and res.json()["name"] == "Same"
+
+
+def test_get_on_validate_is_405_not_an_unknown_bundle(client):
+    res = client.get("/fhir/Bundle/$validate")
+    assert res.status_code == 405
+    assert res.headers["allow"] == "POST"
+    assert res.json()["issue"][0]["code"] == "not-supported"
+    # the same answer as any other method the operation does not take
+    assert client.put("/fhir/Bundle/$validate").status_code == 405
+
+
+def test_renderings_search_takes_references_as_the_resources_carry_them(
+        client, monkeypatch):
+    """custodian, author and related are reference parameters: the value
+    copied out of a resource (Organization/x, Bundle/1) has to find it, and a
+    comma between values means either - as Endpoint?organization already does."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    submit(client, tok_d, outcome(), monkeypatch)
+    add_shot(client, tok_c, "producer", note="consumer on producer")
+    add_shot(client, tok_c, "third", note="consumer on third")
+    add_shot(client, tok_d, "producer", note="third on producer")
+    entries = param_entries(client.get("/fhir/$exchange"))
+    doc = {e["organizationSlug"]: e["id"] for e in entries}
+
+    def notes(query):
+        res = client.get("/fhir/DocumentReference?" + query)
+        assert res.status_code == 200, res.text
+        return sorted(d["description"] for d in shots(res))
+
+    on_producer = ["consumer on producer", "third on producer"]
+    assert notes("custodian=Organization/producer") == on_producer
+    assert notes("author=Organization/third") == ["third on producer"]
+    assert notes("related=Bundle/%d" % doc["producer"]) == on_producer
+    everything = sorted(on_producer + ["consumer on third"])
+    assert notes("custodian=producer,Organization/third") == everything
+    assert notes("author=consumer,third") == everything
+    assert notes("related=%d,Bundle/%d" % (doc["producer"], doc["third"])) \
+        == everything
+    # the filters still narrow one another
+    assert notes("custodian=Organization/producer&author=Organization/consumer") \
+        == ["consumer on producer"]
+    # an id that cannot be a Bundle matches nothing rather than being refused
+    assert notes("related=Bundle/abc") == []
+    assert notes("related=abc,Bundle/%d" % doc["third"]) == ["consumer on third"]
+    # and one past what SQLite can store is not an error either
+    assert notes("related=Bundle/%d" % 2 ** 63) == []
 
 
 def test_the_exchange_list_counts_the_renderings(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
-    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 0
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (0, 0)
     add_shot(client, tok_c, "producer")
-    assert param_entries(client.get("/fhir/$exchange"))[0]["renderings"] == 1
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (1, 1)
+    # a second picture from the same company is another screenshot, not
+    # another system that has shown the document
+    add_shot(client, tok_c, "producer")
+    add_shot(client, register(client, "Third"), "producer")
+    entry = param_entries(client.get("/fhir/$exchange"))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (3, 2)
+    # and "Seen in N other systems" is that count, on the card and on refresh
+    text = client.get("/").text
+    assert "rendering_systems: e.renderingSystems" in text
+    assert text.count("shotCountLabel(p.rendering_systems)") == 2
+    assert "shotCountLabel(p.renderings)" not in text
 
 
 def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monkeypatch):
@@ -3445,6 +4214,39 @@ def test_the_image_is_served_inert_and_as_the_type_its_bytes_proved(client, monk
     # already compressed: gzipping it again would be CPU for nothing
     assert res.headers["content-encoding"] == "identity"
     assert client.get("/fhir/Binary/99999").status_code == 404
+
+
+def test_a_binary_read_in_fhir_json_is_the_binary_resource(client, monkeypatch):
+    """A FHIR client reading Binary/N with its default Accept gets the resource,
+    with the bytes in data; an <img>, a browser or a bare curl still gets the
+    picture. Both answers live at one URL, so caches are told to keep them
+    apart."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    sid = add_shot(client, tok_c, "producer", image=JPEG).json()["id"]
+    url = "/fhir/Binary/%s" % sid
+    for query, accept in (("", "application/fhir+json"),
+                          ("", "application/json"),
+                          ("", "application/fhir+json, */*;q=0.1"),
+                          ("", "image/png;q=0.5, application/fhir+json"),
+                          ("?_format=json", None),
+                          # an unescaped + in a query string arrives as a space
+                          ("?_format=application/fhir+json", None),
+                          ("?_format=json", "image/*")):
+        res = client.get(url + query, headers={"Accept": accept} if accept else {})
+        assert res.headers["content-type"] == "application/fhir+json", (query, accept)
+        assert res.json() == {"resourceType": "Binary", "id": sid,
+                              "contentType": "image/jpeg",
+                              "data": base64.b64encode(JPEG).decode("ascii")}
+        assert "Accept" in res.headers["vary"]
+    for query, accept in (("", None), ("", "*/*"),
+                          ("", "image/avif,image/webp,image/*,*/*;q=0.8"),
+                          ("", "application/fhir+json;q=0"),
+                          ("", "image/png, application/fhir+json;q=0.5"),
+                          ("", "application/fhir+xml"),
+                          ("?_format=xml", "application/fhir+json")):
+        res = client.get(url + query, headers={"Accept": accept} if accept else {})
+        assert res.content == JPEG, (query, accept)
+        assert res.headers["vary"] == "Accept"
 
 
 def test_a_rendering_stays_pinned_to_the_document_it_was_taken_from(client, monkeypatch):
@@ -3675,7 +4477,7 @@ def test_documents_are_found_by_their_patients_identifier(client, monkeypatch):
     assert [e["resource"]["entry"][0]["resource"]["title"] for e in entries] == [
         "Beta's", "Alpha's"]
     alphas = entries[-1]
-    assert alphas["fullUrl"] == "/fhir/Bundle/%s" % alphas["resource"]["id"]
+    assert alphas["fullUrl"] == "http://testserver/fhir/Bundle/%s" % alphas["resource"]["id"]
     assert alphas["resource"] == dict(arne, id=alphas["resource"]["id"])
     assert client.get(alphas["fullUrl"]).json() == arne
     assert len({e["resource"]["id"] for e in entries}) == 2
@@ -3822,6 +4624,29 @@ def test_only_the_uploader_can_rewrite_the_note(client, monkeypatch):
         == "clearer take"
 
 
+def test_a_screenshot_without_a_note_has_no_description(client, monkeypatch):
+    """FHIR JSON has no null, so an absent note is an absent element - in the
+    upload's answer, the read, the search, and after a note is blanked."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    res = add_shot(client, tok_c, "producer")
+    sid = res.json()["id"]
+    put = client.put("/fhir/DocumentReference/%s" % sid,
+                     json={"resourceType": "DocumentReference", "description": "  "},
+                     headers={"X-Team-Token": tok_c})
+    for answer in (res, client.get("/fhir/DocumentReference/%s" % sid),
+                   client.get("/fhir/DocumentReference"), put):
+        assert answer.status_code in (200, 201)
+        assert "null" not in answer.text, answer.text
+    assert "description" not in put.json()
+    # and a body read back from the server can be written back to it
+    read = client.get("/fhir/DocumentReference/%s" % sid).json()
+    read["description"] = "Allergies came through empty"
+    again = client.put("/fhir/DocumentReference/%s" % sid, json=read,
+                       headers={"X-Team-Token": tok_c})
+    assert again.status_code == 200
+    assert again.json()["description"] == "Allergies came through empty"
+
+
 def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
     tok_p, tok_c = interop_setup(client, monkeypatch)
     tok_d = register(client, "Third")
@@ -3844,6 +4669,63 @@ def test_withdrawing_a_rendering_takes_the_file_with_it(client, monkeypatch):
                          headers={"X-Team-Token": tok_c}).status_code == 404
 
 
+def test_a_withdrawn_screenshot_id_is_never_handed_out_again(client, monkeypatch):
+    """Binary/N is cached as immutable. If the next upload took over a withdrawn
+    top id, a browser that had seen the withdrawn picture would keep showing it
+    under the new one's note."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    first = add_shot(client, tok_c, "producer", note="wrong one").json()["id"]
+    assert client.delete("/fhir/DocumentReference/%s" % first,
+                         headers={"X-Team-Token": tok_c}).status_code == 204
+    second = add_shot(client, tok_c, "producer", note="right one").json()["id"]
+    assert int(second) > int(first)
+    assert client.get("/fhir/Binary/%s" % first).status_code == 404
+
+
+def test_an_old_database_stops_reusing_rendering_ids(tmp_path, monkeypatch):
+    """CREATE TABLE IF NOT EXISTS leaves an existing renderings table alone, so
+    one from before AUTOINCREMENT has to be rebuilt in place, keeping its rows."""
+    monkeypatch.setattr(app_module, "DATA_DIR", str(tmp_path))
+    with sqlite3.connect(os.path.join(str(tmp_path), "connectathon.db")) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT, slug TEXT,
+                token TEXT, first_pass INTEGER DEFAULT 0, created_at TEXT);
+            CREATE TABLE submissions (id INTEGER PRIMARY KEY, team_id INTEGER,
+                ts TEXT, pass INTEGER, errors INTEGER, warnings INTEGER,
+                infos INTEGER, score INTEGER, sections INTEGER, resources INTEGER,
+                doc_type TEXT, filename TEXT);
+            CREATE TABLE renderings (id INTEGER PRIMARY KEY, consumer_id INTEGER
+                NOT NULL REFERENCES teams(id), submission_id INTEGER NOT NULL
+                REFERENCES submissions(id), ts TEXT NOT NULL, note TEXT NOT NULL
+                DEFAULT '', filename TEXT NOT NULL, mime TEXT NOT NULL);
+            INSERT INTO teams VALUES (1, 'Old', 'old', 'tok', 0, '2026-01-01');
+            INSERT INTO submissions VALUES
+                (1, 1, '2026-01-01', 1, 0, 0, 0, 60, 1, 5, 'eps', 'a.json');
+            INSERT INTO renderings VALUES
+                (3, 1, 1, '2026-01-01', 'kept', 'a.png', 'image/png');
+            -- one whose submission has gone must not stop the service starting
+            INSERT INTO renderings VALUES
+                (5, 1, 9, '2026-01-02', 'orphan', 'b.png', 'image/png');
+            """
+        )
+    app_module.init_db()
+    app_module.init_db()      # and a second start leaves the rebuilt table alone
+    with app_module.connect() as conn:
+        assert "AUTOINCREMENT" in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'renderings'").fetchone()[0]
+        assert [tuple(r) for r in conn.execute(
+            "SELECT * FROM renderings ORDER BY id")] == [
+            (3, 1, 1, "2026-01-01", "kept", "a.png", "image/png"),
+            (5, 1, 9, "2026-01-02", "orphan", "b.png", "image/png"),
+        ]
+        conn.execute("DELETE FROM renderings WHERE id = 5")
+        cur = conn.execute(
+            "INSERT INTO renderings (consumer_id, submission_id, ts, filename, "
+            "mime) VALUES (1, 1, '2026-01-03', 'c.png', 'image/png')")
+        assert cur.lastrowid == 6
+
+
 def test_renderings_are_readable_without_a_token(client, monkeypatch):
     """The wall is for everyone in the room to read, participant or not."""
     tok_p, tok_c = interop_setup(client, monkeypatch)
@@ -3852,6 +4734,102 @@ def test_renderings_are_readable_without_a_token(client, monkeypatch):
         assert client.get("/fhir/DocumentReference", headers=headers).status_code == 200
         assert client.get("/fhir/Binary/%s" % sid,
                           headers=headers).status_code == 200
+
+
+def test_everything_the_page_hides_can_actually_be_hidden(client):
+    """An author `display:` rule outranks the UA sheet's [hidden] rule, so
+    el.hidden = true does nothing to an element whose class sets one - the
+    screenshot gallery could not be folded away, and Withdraw stayed beside
+    Save note. Every class the page hides that way needs its own [hidden]."""
+    text = client.get("/").text
+    css = text[text.index("<style>"):text.index("</style>")]
+    hidden = set()
+    for m in re.finditer(r'class=\\?"([\w\- ]+)\\?"[^>]*?\bhidden\b', text):
+        hidden.update(m.group(1).split())
+    for m in re.finditer(r'querySelector\("\.([\w-]+)"\)\.hidden\s*=', text):
+        hidden.add(m.group(1))
+    assert {"shots", "shot-own", "menu-wrap"} <= hidden   # the scan finds them
+    displayed = set()
+    for selectors, body in re.findall(r"(?m)^([^{}@/]+)\{([^}]*)\}", css):
+        if re.search(r"display:\s*(?!none)", body):
+            displayed.update(s.strip()[1:] for s in selectors.split(",")
+                             if re.fullmatch(r"\.[\w-]+", s.strip()))
+    for cls in sorted(hidden & displayed):
+        assert re.search(r"\.%s\[hidden\]\s*\{\s*display:\s*none" % re.escape(cls),
+                         css), cls
+
+
+CURLS_HARNESS = r"""
+const out = {};
+const $ = (sel) => (out[sel] = out[sel] || {});
+const origin = "http://localhost:8095";
+interopCurls();
+console.log(out["#curl-exchange"].textContent);
+"""
+
+
+@pytest.mark.skipif(any(shutil.which(t) is None
+                        for t in ("node", "bash", "jq", "base64")),
+                    reason="needs node, bash, jq and coreutils base64")
+def test_the_documented_screenshot_uploads_take_a_real_screenshot(
+        client, monkeypatch, tmp_path):
+    """Linux caps a single command-line argument at 128KiB. A command that
+    pastes the base64 image into one fails with "Argument list too long" for
+    anything bigger than a thumbnail, so both the tab's example and the
+    README's are run here, as written, on an image over that cap."""
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    doc_id, = [e["id"] for e in param_entries(client.get("/fhir/$exchange"))]
+    js = page_script(client)
+    parts = [js[js.index("const ENDPOINT_DESCRIPTION_EXT"):
+                js.index("function interopCurls(")]]
+    start = js.index("function interopCurls(")
+    parts.append(js[start:js.index("\n}", start) + 2])
+    proc = subprocess.run(["node", "-e", "\n".join(parts) + CURLS_HARNESS],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+
+    def block(text, first, after):
+        """The lines from the comment `first` up to the comment `after`."""
+        start = text.index(first)
+        return text[start:text.index(after, start)]
+
+    tab = block(proc.stdout, "# publish a screenshot",
+                "# every screenshot of one document")
+    readme_path = os.path.join(os.path.dirname(app_module.__file__), "README.md")
+    with open(readme_path, encoding="utf-8") as fh:
+        readme = block(fh.read(), "# publish a screenshot of a partner's document",
+                       "# every screenshot, or just")
+
+    image = png_bytes() + b"\x00" * 200_000
+    (tmp_path / "shot.png").write_bytes(image)
+    # A real executable rather than a shell function: the limit is enforced
+    # when the shell execs a program, which a function would never reach. It
+    # keeps its arguments too: a body on stdin is only sent if curl is told so.
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "curl").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$@" > "$BODY_OUT.args"\ncat > "$BODY_OUT"\n')
+    (bindir / "curl").chmod(0o755)
+    for name, snippet in (("tab", tab), ("README", readme)):
+        script = "set -eo pipefail\n" + snippet.replace("TOKEN", tok_c) \
+            .replace("PARTNER_SLUG", "producer").replace("COMPANY_SLUG", "producer") \
+            .replace("Bundle/ID", "Bundle/%s" % doc_id)
+        body_out = tmp_path / ("%s.json" % name)
+        run = subprocess.run(
+            ["bash", "-c", script], cwd=tmp_path, capture_output=True, text=True,
+            timeout=60, env=dict(os.environ, BODY_OUT=str(body_out),
+                                 PATH="%s:%s" % (bindir, os.environ["PATH"])))
+        assert run.returncode == 0, (name, run.stderr)
+        args = (tmp_path / ("%s.json.args" % name)).read_text().split("\n")
+        assert "--data-binary" in args and "@-" in args, (name, args)
+        res = client.post("/fhir/DocumentReference",
+                          content=body_out.read_bytes(),
+                          headers={"X-Team-Token": tok_c,
+                                   "Content-Type": "application/fhir+json"})
+        assert res.status_code == 201, (name, res.text)
+        assert res.json()["description"] == "Allergies came through empty"
+        assert client.get(res.json()["content"][0]["attachment"]["url"]).content \
+            == image
 
 
 # ------------------------------------------------------------ endpoints
@@ -3951,7 +4929,8 @@ def test_endpoints_are_searched_by_company_and_kind(client):
         bundle = client.get("/fhir/Endpoint" + query).json()
         assert bundle["type"] == "searchset"
         return [(e["resource"]["managingOrganization"]["display"],
-                 e["resource"]["connectionType"]["code"]) for e in bundle["entry"]]
+                 e["resource"]["connectionType"]["code"])
+                for e in bundle.get("entry", [])]
 
     # by company name, then oldest first
     assert found() == [("Alpha", "hl7-fhir-rest"), ("Alpha", "web-page"),
@@ -3965,6 +4944,79 @@ def test_endpoints_are_searched_by_company_and_kind(client):
     assert found("?organization=alpha&connection-type="
                  "http://terminology.hl7.org/CodeSystem/endpoint-connection-type"
                  "|hl7-fhir-rest") == [("Alpha", "hl7-fhir-rest")]
+    # a repeat is ANDed - nobody is both companies - whichever comes first
+    assert found("?organization=alpha&organization=beta") == []
+    assert found("?organization=beta&organization=alpha") == []
+    assert found("?connection-type=web-page&organization=alpha,beta"
+                 "&organization=beta") == [("Beta", "web-page")]
+
+
+def test_an_unsupported_modifier_or_chain_is_refused_not_ignored(client):
+    """Ignored, `name:text=fab` answered with every company there is."""
+    register(client, "Fabrikam")
+    register(client, "Litware")
+    for path in ("/fhir/Organization?name:text=fab",
+                 "/fhir/Organization?name:missing=true",
+                 "/fhir/Endpoint?organization:missing=true",
+                 "/fhir/Endpoint?organization.name=x",
+                 "/fhir/DocumentReference?author:missing=true"):
+        res = client.get(path)
+        assert res.status_code == 400, path
+        assert diagnostics(res).startswith("Search parameter `"), path
+    assert diagnostics(client.get("/fhir/Organization?name:text=fab")) == (
+        "Search parameter `name:text` is not supported here; this search "
+        "takes name, name:contains, name:exact")
+
+
+def test_an_unknown_search_parameter_is_passed_over_and_the_self_link_says_so(
+        client):
+    register(client, "Fabrikam")
+    register(client, "Litware")
+    body = client.get("/fhir/Organization?_id=litware&name:contains=a").json()
+    assert body["total"] == 2           # _id is not a search this server has
+    assert body["link"] == [{"relation": "self", "url":
+                             "http://testserver/fhir/Organization?name:contains=a"}]
+    # nothing applied is no query at all, and a blank value is not applied
+    assert client.get("/fhir/Endpoint?bogus=1&organization=").json()["link"][0][
+        "url"] == "http://testserver/fhir/Endpoint"
+    # a client that asks for strict handling gets the refusal instead
+    res = client.get("/fhir/Organization?_id=litware",
+                     headers={"Prefer": "handling=strict"})
+    assert res.status_code == 400
+    assert "`_id`" in diagnostics(res)
+    assert client.get("/fhir/Organization?name=lit", headers={
+        "Prefer": "handling=strict"}).json()["total"] == 1
+    # one preference among others, in any case, is still asked for
+    assert client.get("/fhir/Organization?_id=litware", headers={
+        "Prefer": "return=minimal, Handling=Strict"}).status_code == 400
+    # but a preference that only starts the same way is not
+    assert client.get("/fhir/Organization?_id=litware", headers={
+        "Prefer": "handling=strictish"}).status_code == 200
+
+
+def test_screenshots_are_searched_with_repeats_anded_and_commas_ored(
+        client, monkeypatch):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    tok_d = register(client, "Third")
+    submit(client, tok_d, outcome(), monkeypatch, body=CLINICAL_BODY)
+    add_shot(client, tok_c, "producer")
+    add_shot(client, tok_c, "third")
+    add_shot(client, tok_d, "producer")
+
+    def found(query):
+        return sorted((custodian_of(s), author_of(s))
+                      for s in shots(client.get("/fhir/DocumentReference?" + query)))
+
+    assert found("custodian=producer&custodian=third") == []
+    assert found("custodian=producer,Organization/third&author=consumer") == [
+        ("producer", "consumer"), ("third", "consumer")]
+    assert found("author=consumer&author=third") == []
+    doc = param_entries(client.get("/fhir/$exchange"))
+    producer_doc = next(d["id"] for d in doc if d["organizationSlug"] == "producer")
+    assert found("related=Bundle/%d" % producer_doc) == [
+        ("producer", "consumer"), ("producer", "third")]
+    assert found("related=%d,andrea-cross-border" % producer_doc) \
+        == found("related=%d" % producer_doc)
 
 
 def test_an_endpoint_is_changed_only_by_the_company_advertising_it(client):
@@ -4014,8 +5066,15 @@ def test_a_put_whose_body_names_another_endpoint_is_refused(client):
     first = advertise(client, tok, endpoint("https://one.example.org")).json()["id"]
     second = advertise(client, tok, endpoint("https://two.example.org")).json()["id"]
     res = advertise(client, tok, endpoint("https://new.example.org", id=second), first)
-    assert res.status_code == 400 and "URL's" in diagnostics(res)
+    assert res.status_code == 400
+    assert diagnostics(res) == "The body's id is \"%s\" but the URL's is \"%s\"" % (second, first)
     assert client.get("/fhir/Endpoint/" + first).json()["address"] == "https://one.example.org"
+    # a number is the wrong type, not a different id - the same digits must
+    # not be reported as a mismatch
+    for wrong_type in (int(first), float(first), True):
+        res = advertise(client, tok, endpoint("https://new.example.org", id=wrong_type), first)
+        assert res.status_code == 400, wrong_type
+        assert diagnostics(res) == "The body's id must be a JSON string, as every FHIR id is"
     # the matching id is fine
     assert advertise(client, tok, endpoint("https://new.example.org", id=first),
                      first).status_code == 200
@@ -4146,6 +5205,9 @@ def test_reset_knows_every_table_the_service_creates(tmp_path, monkeypatch):
     (lambda b: b.update(description="Ask for a token"), DESC_EXT),
     # credentials for the address do not belong on a public list
     (lambda b: b.update(header=["Authorization: Bearer s3cret"]), "public"),
+    (lambda b: b.update(address="https://alice:s3cret@a.example.org/r4"), "public"),
+    (lambda b: b.update(address="https://alice@a.example.org/r4"), "public"),
+    (lambda b: b.update(address="https://@a.example.org/r4"), "public"),
     (lambda b: b.update(extension=[{"url": DESC_EXT, "valueMarkdown": "x"}]),
      "one valueString"),
     (lambda b: b.update(extension=[{"url": DESC_EXT, "valueString": "a"},
@@ -4172,11 +5234,24 @@ def test_an_endpoint_this_server_would_mislabel_is_refused(client, mutate, fragm
             == "https://kept.example.org"
 
 
+def test_an_at_sign_after_the_host_is_not_a_credential(client):
+    tok = register(client, "Mastodon Fans")
+    for address in ("https://a.example.org/@team", "https://a.example.org/r4?who=a@b"):
+        res = advertise(client, tok, endpoint(address))
+        assert res.status_code == 201, address
+        assert res.json()["address"] == address
+
+
 def test_a_company_advertises_only_so_many_endpoints(client):
     tok = register(client, "Busy")
     for _ in range(app_module.MAX_ENDPOINTS):
         assert advertise(client, tok, endpoint()).status_code == 201
-    assert advertise(client, tok, endpoint()).status_code == 422
+    res = advertise(client, tok, endpoint())
+    assert res.status_code == 422
+    # the page shows this as it comes, so it speaks of its Edit and Remove
+    # buttons rather than of HTTP verbs
+    assert diagnostics(res) == ("A company can list %d addresses - remove one, "
+                                "or edit one of them instead" % app_module.MAX_ENDPOINTS)
     assert advertise(client, register(client, "Other"), endpoint()).status_code == 201
 
 
@@ -4223,6 +5298,35 @@ def test_whoami_names_the_company_behind_a_token(client):
     assert org["active"] is True
     assert client.get("/fhir/Organization/$me").status_code == 401
     assert client.get("/fhir/Organization/$me", headers={"X-Team-Token": "nope"}).status_code == 401
+
+
+def test_a_401_says_what_was_wrong_with_the_credential_sent(client):
+    """An unset $TOKEN in the documented curl sends a bare "Bearer"; that is
+    not a missing X-Team-Token header. Every 401 carries the challenge."""
+    tok = register(client, "Alpha")
+    cases = [
+        ({}, "No company token - send `Authorization: Bearer TOKEN`", "Bearer"),
+        ({"Authorization": "Bearer"},
+         "The Authorization header has no token after `Bearer`", "Bearer"),
+        ({"Authorization": "Bearer   "},
+         "The Authorization header has no token after `Bearer`", "Bearer"),
+        ({"Authorization": "Basic abc"},
+         "The Authorization header must be `Bearer TOKEN`", "Bearer"),
+        ({"Authorization": "Bearer nope"}, "Invalid company token",
+         'Bearer error="invalid_token"'),
+        ({"X-Team-Token": "nope"}, "Invalid company token",
+         'Bearer error="invalid_token"'),
+    ]
+    for headers, message, challenge in cases:
+        res = client.get("/fhir/Organization/$me", headers=headers)
+        assert res.status_code == 401, headers
+        assert diagnostics(res) == message, headers
+        assert res.headers["WWW-Authenticate"] == challenge, headers
+    # the scheme is case-insensitive, and X-Team-Token still wins over a
+    # header some proxy in front of the server may have added
+    for headers in ({"Authorization": "bearer " + tok},
+                    {"X-Team-Token": tok, "Authorization": "Basic abc"}):
+        assert client.get("/fhir/Organization/$me", headers=headers).status_code == 200
 
 
 def test_the_interop_tab_offers_screenshots(client):
@@ -4451,6 +5555,116 @@ def test_a_single_finding_is_asked_about_in_the_singular(client):
     assert "The 2 errors:\n\n1. " in got["prompt"]
 
 
+@needs_node
+def test_the_register_curl_carries_a_code_when_registration_is_gated(client, monkeypatch):
+    """The page's example, run through the page's own builder, is a request
+    the server accepts - with and without a registration code."""
+    js = page_script(client)
+    start = js.index("function setRegisterCurl(")
+    builder = js[start:js.index("\n}", start) + 2]
+    harness = builder + r"""
+const node = {};
+const $ = () => node;
+const origin = "http://x";
+setRegisterCurl(false); const open = node.textContent;
+setRegisterCurl(true); console.log(JSON.stringify([open, node.textContent]));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    open_curl, gated_curl = json.loads(proc.stdout)
+
+    def body(curl):
+        return json.loads(re.search(r"-d '(.*)'$", curl).group(1))
+
+    assert client.post("/fhir/$register", json=body(open_curl)).status_code == 200
+    gated = body(gated_curl)
+    monkeypatch.setattr(app_module, "REGISTER_CODE", "REGISTRATION_CODE")
+    gated["parameter"][0]["valueString"] = "Gated Co"
+    assert client.post("/fhir/$register", json=gated).status_code == 200
+    # and the page switches to it whenever it learns registration is gated
+    assert js.count("setRegisterCurl(true)") == 2
+
+
+def page_handler(js, selector, event="click"):
+    """The source of the page's own `$(selector)` listener, ready to register
+    against a stubbed `$`."""
+    start = js.index('$("%s").addEventListener("%s"' % (selector, event))
+    return js[start:js.index("\n});\n", start) + 5]
+
+
+@needs_node
+def test_a_double_click_on_register_sends_one_registration(client):
+    """The register handler run in node against a stubbed page: a second
+    click while the first is in flight finds the button disabled, as a browser
+    would, and so sends nothing. A failed request frees it again."""
+    js = page_script(client)
+    harness = r"""
+const els = {};
+function $(sel) {
+  return els[sel] || (els[sel] = { value: sel === "#reg-name" ? "Acme" : "",
+    style: {}, hidden: true, disabled: false, textContent: "",
+    addEventListener(ev, fn) { this.handler = fn; } });
+}
+""" + page_handler(js, "#reg-btn") + r"""
+const btn = $("#reg-btn");
+const click = () => btn.disabled ? null : btn.handler();
+let calls = 0, settle;
+globalThis.fetch = () => { calls++; return new Promise((r) => { settle = r; }); };
+const detailText = () => "taken";
+(async () => {
+  const first = click();
+  click();
+  const during = [calls, btn.disabled];
+  settle({ ok: false, status: 409, json: async () => ({}) });
+  await first;
+  console.log(JSON.stringify([during, btn.disabled]));
+})();
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [[1, True], False]
+
+
+@needs_node
+def test_the_new_token_box_goes_once_the_field_holds_another_token(client):
+    """Registering shows the new token to save. Pasting a different company's
+    token, or clearing the field, must not leave it on show as if it were the
+    one in use."""
+    js = page_script(client)
+    start = js.index("function showCompanyCard(")
+    harness = js[start:js.index("\n}", start) + 2] + r"""
+const els = {};
+function $(sel) {
+  return els[sel] || (els[sel] = { value: "", style: {}, hidden: false,
+    textContent: "", parentNode: {} });
+}
+let me = { name: "Alpha" }, meState = "ok";
+const shown = [];
+for (const field of ["tB", "tA", ""]) {
+  $("#token-value").textContent = "tB";
+  $("#token-box").style.display = "block";
+  $("#token").value = field;
+  if (!field) me = null;
+  showCompanyCard(false);
+  shown.push($("#token-box").style.display);
+}
+console.log(JSON.stringify(shown));
+"""
+    proc = subprocess.run(["node", "-e", harness], capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == ["block", "none", "none"]
+
+
+def test_register_another_company_starts_from_a_clean_form(client):
+    """An error left from an earlier attempt - a double click's 409, say -
+    is not shown on a form the participant has only just opened."""
+    js = page_script(client)
+    assert '$("#reg-error").style.display = "none";' in page_handler(js, "#reg-another")
+
+
 def test_page_ids_are_unique(client):
     """$() is querySelector, so of two elements sharing an id only the first is
     ever reached. The EHDS document table and the submit tab's embedded view
@@ -4503,6 +5717,67 @@ def test_the_banner_shows_this_bundles_points_not_the_best_ones(client):
     assert '+ \'<span class="score">\' + mine + " pts"' in text
     assert "(score !== mine ? '<span class=\"company\"> · company ' + score" in text
     assert '+ (score ? " " + standing : "")' in text             # standing on hover
+
+
+def test_a_refused_file_takes_the_previous_bundle_with_it(client):
+    """Picking a file over the limit left the last bundle in the box, and
+    Validate sent and scored that one under the new file's name."""
+    text = client.get("/").text
+    handler = text.split('$("#file").addEventListener("change"', 1)[1]
+    handler = handler[:handler.index("\n});")]
+    refuse = handler[handler.index("const refuse = "):]
+    refuse = refuse[:refuse.index("};")]
+    assert 'ev.target.value = ""' in refuse and '$("#bundle").value = ""' in refuse
+    # both refusals - too big, and unreadable - go through it
+    assert handler.count("refuse(") == 2
+    assert "return refuse(" in handler and 'refuse("Could not read the file: "' in handler
+
+
+@needs_node
+def test_a_file_just_over_the_limit_is_not_said_to_be_the_limit(client):
+    """Both sizes were rounded to tenths alike, so anything up to about 50 KB
+    over 5 MB was refused as "5.0 MB; the limit is 5 MB"."""
+    js = page_script(client)
+    start = js.index("function tooBigMessage(")
+    fn = js[start:js.index("\n}", start) + 2]
+    limit = 5 * 1048576
+    cases = [[limit + 1, limit], [5249983, limit], [5450745, limit],
+             [limit + 1048576 // 2 + 1, limit + 1048576 // 2]]
+    proc = subprocess.run(
+        ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
+         ".readFileSync(0, 'utf8')).map(([s, l]) => tooBigMessage(s, l))));"],
+        input=json.dumps(cases), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == [
+        "That file is 5.1 MB; the limit is 5 MB.",
+        "That file is 5.1 MB; the limit is 5 MB.",
+        "That file is 5.2 MB; the limit is 5 MB.",
+        "That file is 5.6 MB; the limit is 5.5 MB.",
+    ]
+
+
+@needs_node
+def test_a_token_fetch_cannot_carry_still_reaches_the_server(client):
+    """A token pasted with smart quotes made fetch throw before sending, and
+    Validate reported a "Network error" while the note under the field said
+    the token was wrong. Every authenticated call goes through bearer()."""
+    js = page_script(client)
+    start = js.index("function bearer(")
+    fn = js[start:js.index("\n}", start) + 2]
+    tokens = ["da79f71088e8db8c", "“da79f71088e8db8c”", "da79éf71", "☃",
+              "da79\ud800f71"]                     # a lone surrogate: escaping threw on it
+    proc = subprocess.run(
+        ["node", "-e", fn + "console.log(JSON.stringify(JSON.parse(require('fs')"
+         ".readFileSync(0, 'utf8')).map((t) => new Headers({ Authorization: bearer(t) })"
+         ".get('Authorization'))));"],
+        input=json.dumps(tokens), capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr          # Headers throws as fetch did
+    sent = json.loads(proc.stdout)
+    assert sent[0] == "Bearer da79f71088e8db8c"        # a real token goes as it is
+    assert sent[1] == "Bearer ?da79f71088e8db8c?"
+    assert all(s.isascii() for s in sent)
+    # no call builds the header any other way
+    assert js.count('"Bearer " +') == 1 and js.count("bearer(") >= 8
 
 
 
@@ -5291,6 +6566,195 @@ def test_naming_a_profile_settles_the_category(client, monkeypatch):
     assert res.headers["X-Document-Type"] == "imaging"
 
 
+MPD_REQUEST = "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationRequest-eu-mpd"
+MPD_DISPENSE = "http://hl7.eu/fhir/mpd/StructureDefinition/MedicationDispense-eu-mpd"
+
+
+# What Matchbox really says about a bundle with nothing wrong in it.
+MATCHBOX_PASSED = {"resourceType": "OperationOutcome", "issue": [
+    {"severity": "information", "code": "informational",
+     "diagnostics": "No fatal or error issues detected, the validation has passed"}]}
+
+
+def mpd_collection(*resources):
+    return json.dumps({"resourceType": "Bundle", "type": "collection",
+                       "entry": [{"resource": r} for r in resources]})
+
+
+@pytest.mark.parametrize("path,body", [
+    # Forced into MPD by naming its profile, which is base Bundle.
+    ("/fhir/Bundle/$validate?profile=http://hl7.org/fhir/StructureDefinition/Bundle",
+     mpd_collection()),
+    # Read as MPD from a bare MedicationRequest, which then only meets base R4.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest", "status": "active"})),
+    # One order claimed, the other not: the second was never checked either.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST]}},
+                    {"resourceType": "MedicationDispense"})),
+    # Claimed at a version the validator does not have: Matchbox only warns
+    # that the profile "has not been checked", so this is no claim either.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|9.9.9"]}})),
+    # A bare major is not resolved either: Matchbox reports `|1` as "could
+    # not be found", although the loaded package is 1.0.0.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|1"]}})),
+    # A major.minor counts only when it is the loaded 1.0.0's.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|1.1"]}})),
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest",
+                     "meta": {"profile": [MPD_REQUEST + "|9.9"]}})),
+    # Claims a profile, but not an MPD one: base R4 is all it is held to.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "MedicationRequest", "meta": {"profile": [
+         "http://hl7.org/fhir/StructureDefinition/MedicationRequest"]}})),
+    # Only a Medication claims MPD: there is no prescription or dispense at all.
+    ("/fhir/Bundle/$validate",
+     mpd_collection({"resourceType": "Medication", "meta": {"profile": [
+         "http://hl7.eu/fhir/mpd/StructureDefinition/Medication-eu-mpd"]}})),
+])
+def test_an_mpd_bonus_needs_its_orders_checked_against_mpd(client, monkeypatch,
+                                                          path, body):
+    """MPD is validated against base Bundle, and Matchbox applies an MPD
+    profile only to an entry that claims one. An order with no claim meets base
+    R4 alone, so a clean outcome from Matchbox says nothing about MPD - and
+    without this check leaving the claim out was easier than making it."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, MATCHBOX_PASSED)
+    res = client.post(path, content=body, headers={"X-Team-Token": token})
+    assert res.status_code == 200
+    assert res.headers["X-Document-Type"] == "mpd"
+    assert res.headers["X-Pass"] == "false"
+    assert res.headers["X-Score"] == "0"
+    assert res.headers["X-Secondary-Categories"] == "0"
+    issues = res.json()["issue"]
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert errors and all("MPD" in i["diagnostics"] for i in errors)
+    # Matchbox's "the validation has passed" would contradict the verdict.
+    assert "validation has passed" not in json.dumps(issues)
+    board = {r["organization"]: r for r in param_entries(client.get("/fhir/$leaderboard"))}
+    assert board["Alpha"]["score"] == 0
+    assert part_list(board["Alpha"], "secondaryCategories") == []
+
+
+def test_an_unclaimed_order_is_named_where_it_sits(client, monkeypatch):
+    """The finding points at the entry and names the profile to claim, so the
+    page can put it on the right line and the fix is in the message."""
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(warnings=1), monkeypatch,
+                 body=mpd_collection(
+                     {"resourceType": "MedicationRequest",
+                      "meta": {"profile": [MPD_REQUEST]}},
+                     {"resourceType": "MedicationDispense"}))
+    errors = [i for i in res.json()["issue"] if i["severity"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["expression"] == ["Bundle.entry[1].resource"]
+    assert MPD_DISPENSE in errors[0]["diagnostics"]
+    # Matchbox's own findings are kept alongside.
+    assert any(i["severity"] == "warning" for i in res.json()["issue"])
+
+
+def test_an_mpd_bundle_whose_orders_all_claim_mpd_still_earns_the_bonus(client,
+                                                                        monkeypatch):
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch, body=mpd_collection(
+        {"resourceType": "MedicationRequest",
+         "meta": {"profile": [MPD_REQUEST + "|1.0.0"]}},
+        {"resourceType": "MedicationDispense", "meta": {"profile": [MPD_DISPENSE]}},
+        {"resourceType": "Patient"}))
+    assert res.headers["X-Pass"] == "true"
+    assert res.headers["X-Score"] == str(app_module.SECONDARY_CATEGORY_POINTS)
+
+
+def test_an_mpd_claim_at_major_minor_counts_as_checked(client, monkeypatch):
+    """Matchbox resolves `|1.0` to the loaded 1.0.0 profile and checks it in
+    full, so the order was held to the guide and must not be failed as
+    unchecked."""
+    consume_first_pass(client, monkeypatch)
+    token = register(client, "Alpha")
+    res = submit(client, token, outcome(), monkeypatch, body=mpd_collection(
+        {"resourceType": "MedicationRequest",
+         "meta": {"profile": [MPD_REQUEST + "|1.0"]}}))
+    assert res.headers["X-Pass"] == "true"
+    assert not [i for i in res.json()["issue"] if i["severity"] == "error"]
+
+
+def test_the_mpd_claim_check_leaves_other_categories_alone():
+    """The orders the check requires are MPD's, so a lab report carrying a
+    bare MedicationRequest is not its business."""
+    oc = outcome()
+    body = doc_bundle(comp_type="11502-2", resources=("MedicationRequest",))
+    for doc_id in ("eps", "laboratory", "imaging"):
+        doc = app_module.DOCUMENTS_BY_ID[doc_id]
+        assert app_module.require_entry_profile_claims(oc, body, doc) is oc
+    # Even one that comes to be detected by its entries' profiles: the order
+    # requirement is MPD's, not something `entry_profiles` brings along.
+    imaging = dict(app_module.DOCUMENTS_BY_ID["imaging"], entry_profiles=[
+        "http://example.org/StructureDefinition/ImagingStudy-x"])
+    body = doc_bundle(comp_type="18748-4", resources=("ImagingStudy",))
+    assert app_module.require_entry_profile_claims(oc, body, imaging) is oc
+
+
+def test_naming_a_versioned_profile_settles_the_category_too(client, monkeypatch):
+    """A canonical pinned to the version the validator has is still that
+    canonical."""
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]
+    token = register(client, "Alpha")
+    seen = {}
+
+    def capture(body, doc=None):
+        seen["doc"] = doc
+        return outcome()
+
+    monkeypatch.setattr(app_module, "validate_with_matchbox", capture)
+    res = client.post("/fhir/Bundle/$validate",
+                      params={"profile": lab["profile"] + "|2.1.0"},
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 200, res.text
+    assert res.headers["X-Document-Type"] == "laboratory"
+    # Matchbox is still asked for the profile it has, not the pinned string.
+    assert seen["doc"]["profile"] == lab["profile"]
+    # The version does not make an unscored profile acceptable.
+    res = client.post("/fhir/Bundle/$validate",
+                      params={"profile": "http://example.org/easy|" + lab["profile"]},
+                      content=BUNDLE, headers={"X-Team-Token": token})
+    assert res.status_code == 400
+
+
+def test_a_profile_pinned_to_a_version_the_validator_lacks_is_refused(
+        client, monkeypatch):
+    """Checking against the loaded version while the team named another would
+    pass or fail them on a guide they did not ask for, with nothing saying so."""
+    token = register(client, "Alpha")
+    set_outcome(monkeypatch, outcome())
+    lab = app_module.DOCUMENTS_BY_ID["laboratory"]
+    mpd = app_module.DOCUMENTS_BY_ID["mpd"]
+
+    def send(profile):
+        return client.post("/fhir/Bundle/$validate", params={"profile": profile},
+                           content=BUNDLE, headers={"X-Team-Token": token})
+
+    for pin in ("|1.0.0", "|9.9.9", "|garbage", "|2", "|"):
+        res = send(lab["profile"] + pin)
+        assert res.status_code == (200 if pin == "|" else 400), (pin, res.text)
+    assert "2.1.0" in diagnostics(send(lab["profile"] + "|9.9.9"))
+    # The loaded version, or its major.minor, still settles the category.
+    for pin in ("|2.1.0", "|2.1"):
+        res = send(lab["profile"] + pin)
+        assert res.headers["X-Document-Type"] == "laboratory", (pin, res.text)
+    # MPD's profile is base R4's Bundle, so its version is R4's.
+    assert send(mpd["profile"] + "|4.0.1").headers["X-Document-Type"] == "mpd"
+    assert send(mpd["profile"] + "|1.0.0").status_code == 400
+
+
 def test_a_profile_this_event_does_not_score_is_still_refused(client, monkeypatch):
     """Honouring an arbitrary profile would let a team pick one their bundle
     already satisfies and score full marks on it."""
@@ -5357,7 +6821,8 @@ def test_each_published_document_gets_its_own_card_and_screenshots(client, monke
         start = js.index(decl)
         parts.append(js[start:js.index(";\n", start) + 2])
     parts += [page_function(js, name) for name in (
-        "partnerRow", "shotCountLabel", "documentPath", "partnerCard", "uploadShot")]
+        "partnerRow", "shotCountLabel", "documentPath", "partnerCard", "bearer",
+        "uploadShot")]
     harness = r"""
 const entries = JSON.parse(require("fs").readFileSync(0, "utf8"));
 const cards = entries.map(partnerRow).map(partnerCard);
@@ -5389,8 +6854,8 @@ uploadShot(lab).then(() => console.log(JSON.stringify({cards, sent})));
     eps_card, lab_card = out["cards"]
     assert "Producer</strong> \u00b7 European Patient Summary" in eps_card
     assert "Producer</strong> \u00b7 Laboratory Report" in lab_card
-    assert "<code>GET /fhir/Organization/producer/$document</code>" in eps_card
-    assert "<code>GET /fhir/Organization/producer/$document?type=laboratory</code>" in lab_card
+    assert "<code class=\"co-name\">GET /fhir/Organization/producer/$document</code>" in eps_card
+    assert "<code class=\"co-name\">GET /fhir/Organization/producer/$document?type=laboratory</code>" in lab_card
     for card, doc_id in ((eps_card, by_type["eps"]), (lab_card, by_type["laboratory"])):
         for key in ("data-doc", "data-add", "data-form", "data-upload", "data-gallery",
                     "data-shots"):
@@ -5488,6 +6953,7 @@ const els = {"#cv-team": {value: "", addEventListener(t, f) { this.fire = f; }},
              "#cv-doc": {style: {display: "block"}}};
 const $ = (s) => els[s];
 const tabLink = {setAttribute(k, v) { this[k] = v; }};
+const location = {get hash() { return "#" + route; }};
 const document = {querySelector: () => tabLink};
 const historyStep = (step) => (a, b, h) => { calls.push([step, h]); route = h.slice(1); };
 const history = {pushState: historyStep("push"), replaceState: historyStep("replace")};
@@ -5505,6 +6971,7 @@ def cv_picker_change(client, route, pick):
                'console.log(JSON.stringify({calls, doc: els["#cv-doc"].style.display,'
                ' tab: tabLink.href, cvCurrent}));')
     src = "\n".join([CV_STUBS, page_function(js, "hideDoc"),
+                     page_function(js, "rememberClinicalRoute"),
                      js[start:js.index("\n});", start) + 4], harness])
     proc = subprocess.run(["node", "-e", src], input=json.dumps([route, pick]),
                           capture_output=True, text=True, timeout=60)
@@ -5965,6 +7432,24 @@ def test_requests_are_counted_by_route_template_and_by_who_sent_them(client):
     # A scanner's made-up path is one bucket, not a row per guess.
     assert ("GET", "(no route)", 404, "client", 1) in rows
     assert not [r for r in rows if "wp-login" in r[1]]
+
+
+def test_head_is_get_without_the_body_and_is_logged_as_head(client):
+    """FastAPI routes only the methods named, so HEAD on the front page used
+    to be a 405 to every uptime checker."""
+    for path in ("/", "/fhir/metadata", "/fhir/$status", "/favicon.svg"):
+        get, head = client.get(path), client.head(path)
+        assert head.status_code == 200, path
+        assert head.content == b"", path
+        assert head.headers["content-type"] == get.headers["content-type"], path
+        assert head.headers["content-length"] == get.headers["content-length"], path
+    # what GET would refuse, HEAD is refused the same way
+    assert client.head("/fhir/Bundle/999").status_code == 404
+    res = client.head("/fhir/$register")
+    assert res.status_code == 405 and res.headers["allow"] == "POST"
+    rows = usage(client, "SELECT method, route, status FROM hits "
+                         "WHERE route = '/fhir/metadata'")
+    assert rows == [("GET", "/fhir/metadata", 200), ("HEAD", "/fhir/metadata", 200)]
 
 
 def test_visitors_are_hashed_per_day_and_not_stored_as_addresses(client):
