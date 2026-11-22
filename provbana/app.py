@@ -7016,7 +7016,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   types</a>, against its own HL7 Europe guide. External code systems those
   guides do not themselves carry and that require a license (such as SNOMED CT,
   LOINC, WHO ATC) are not checked.</p>
-  <p class="colophon">Runs on <a href="https://github.com/vadi2/provbana"
+  <p class="colophon">Runs on <a href="https://github.com/vadi2/Provbana"
   target="_blank" rel="noopener">Provbana</a>, built by <a href="https://vadimperetok.in"
   target="_blank" rel="noopener">Vadim Peretokin</a>.</p>
 </footer>
