@@ -113,4 +113,20 @@ starts an empty stack beside the old one. For the Nordic box that means
 environment `deploy.sh` runs in, and `sudo touch /var/lib/cloud/provbana-ready` once on
 the box.
 
+## Archiving an event
+
+When the event is over, `provbana/archive.py` turns a backup snapshot into a static,
+read-only copy of the site for GitHub Pages or any static host, so the box can go:
+
+```bash
+cd provbana && .venv/bin/python archive.py --data <snapshot> --out <empty dir> --cname <host>
+```
+
+It keeps what anyone could read on the live site - the final leaderboard, the interop
+board with its screenshots, every submission in the clinical view and the worked
+examples - and drops registering, submitting, validating and uploading. The page says
+thank you at the top (`archive_note` under `[event]` rewords it). Push the folder to a
+repository with Pages enabled and point the hostname at it.
+[provbana/README.md](provbana/README.md#archiving) has the details.
+
 Released under the [MIT licence](LICENSE).

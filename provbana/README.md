@@ -370,6 +370,32 @@ A browser counts as one visitor and anything else that calls `/fhir` counts as a
 integration client. The split comes from `Sec-Fetch-Site`, which browsers send and API
 clients do not. Rows older than `USAGE_RETAIN_DAYS` (180) are pruned.
 
+## Archiving
+
+`archive.py` writes a static copy of a finished event: the page itself, rendered
+with `ARCHIVE` set, plus every answer it would ask the service for, as files
+beside it.
+
+```bash
+.venv/bin/python archive.py --data backups/<snapshot> --out ../site --cname hackathon.example.org
+```
+
+- `--data` is a data directory or a snapshot from `backup.py`. It is copied to a
+  temporary directory first, so the snapshot is never opened or migrated.
+- `--out` must be empty or new. It gets `index.html`, `data/` (the leaderboard,
+  exchange, samples, each company's submissions and each document's clinical view
+  as JSON), `files/bundles/<id>.json` and `files/screenshots/<n>.<ext>`, plus
+  `.nojekyll` and, with `--cname`, a `CNAME`.
+- No validator is needed - nothing in the archive validates.
+
+In archive mode the page wraps `fetch`: every read it makes is mapped to one of those
+files, at a path relative to the page so the same folder works from a domain root
+or a subfolder; every write is refused with a 403 before it reaches the network.
+The Submit tab, previews, screenshot uploads, endpoints, the curl examples and the
+leaderboard polling are hidden or switched off. Team tokens, the registration code
+and the advertised endpoints are never exported, and the script stops if a token
+turns up anywhere outside `files/`.
+
 ## Scoring
 
 Any error or fatal validation issue scores the submission **0**. A valid **patient
