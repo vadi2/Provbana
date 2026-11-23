@@ -6925,7 +6925,7 @@ def test_a_new_screenshot_updates_the_count_on_its_own_card(client, monkeypatch)
     assert post_shot(client, tok_c, context=related_to(lab)).status_code == 201
     exchange = client.get("/fhir/$exchange").json()
     js = page_script(client)
-    parts = [js[js.index("function paramValue("):js.index("function submissionRow(")]]
+    parts = ["const ARCHIVE = null;", js[js.index("function paramValue("):js.index("function submissionRow(")]]
     parts += [page_function(js, name) for name in (
         "partnerRow", "shotCountLabel", "refreshShotCount")]
     harness = r"""
@@ -8096,3 +8096,18 @@ def test_the_export_stops_if_a_token_turns_up(client, monkeypatch, tmp_path):
     site.write("data/oops.json", '{"token": "%s"}' % tok)
     with pytest.raises(SystemExit, match="data/oops.json"):
         archive._check_no_secrets(app_module, site)
+
+
+def test_the_export_can_leave_every_screenshot_out(client, monkeypatch, tmp_path):
+    _, tok_c = interop_setup(client, monkeypatch)
+    doc = exchange_by_type(client, "producer")["eps"]["id"]
+    assert post_shot(client, tok_c, context=related_to(doc)).status_code == 201
+
+    out = tmp_path / "site"
+    counts = archive.export_site(client, app_module, str(out), screenshots=False)
+    assert counts["screenshots"] == 0
+    assert not (out / "files" / "screenshots").exists()
+    refs = json.loads((out / ("data/screenshots/related-%d.json" % doc)).read_text())
+    assert refs["total"] == 0 and refs["entry"] == []
+    entry = param_entries(json.loads((out / "data/exchange.json").read_text()))[0]
+    assert (entry["renderings"], entry["renderingSystems"]) == (0, 0)

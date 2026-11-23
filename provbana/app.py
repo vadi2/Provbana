@@ -7002,9 +7002,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   scoring, and clinical view and 2) exchange them with other participants in
   the event.</p>
   <p class="muted archive-only" style="margin:0">During the event each company's
-  best valid document of each type was published here, and the others fetched
-  it, loaded it into their own systems and added screenshots of how it
-  rendered.</p>
+  best valid document of each type was published here for the others to fetch
+  and load into their own systems.</p>
   <div class="lanes live-only">
     <div class="lane">
       <span class="lane-n">Pathway 1 &middot; Validate</span>
@@ -9880,7 +9879,7 @@ $("#token").addEventListener("input", (ev) => syncToken(ev.target.value, "token"
 
 function shotCountLabel(n) {
   return n ? "Seen in " + n + " other system" + (n === 1 ? "" : "s")
-           : "No other system has shown this yet";
+           : ARCHIVE ? "No screenshots" : "No other system has shown this yet";
 }
 
 /* Only one number on one card changes when a screenshot lands or is withdrawn.

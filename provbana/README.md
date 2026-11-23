@@ -386,6 +386,8 @@ beside it.
   exchange, samples, each company's submissions and each document's clinical view
   as JSON), `files/bundles/<id>.json` and `files/screenshots/<n>.<ext>`, plus
   `.nojekyll` and, with `--cname`, a `CNAME`.
+- `--no-screenshots` leaves every interop screenshot out: the board keeps its
+  documents and shows none, as if nothing had been uploaded.
 - No validator is needed - nothing in the archive validates.
 
 In archive mode the page wraps `fetch`: every read it makes is mapped to one of those

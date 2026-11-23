@@ -1,14 +1,16 @@
 """Write a static, read-only copy of a finished event, for GitHub Pages.
 
     python archive.py --data <data dir or backup snapshot> --out <empty dir>
-                      [--cname hackathon.example.org]
+                      [--cname hackathon.example.org] [--no-screenshots]
 
 The page is the service's own, rendered with ARCHIVE set: it reads every
 answer it needs from files written here, beside it, and hides everything that
 writes - registering, submitting, previews, screenshots, endpoints. What it
 shows is exactly what anyone could read on the live site: the final
 leaderboard, every company's submissions in the clinical view, the published
-documents and their screenshots, and the worked examples.
+documents and their screenshots, and the worked examples. With
+--no-screenshots the interop board keeps its documents and shows no screenshots,
+as if none had been uploaded.
 
 It runs the current code over a copy of the data, never over the data itself
 (opening the database may migrate it), and needs no validator: nothing here
@@ -72,7 +74,8 @@ class Site:
         self.write(rel, text)
 
 
-def export_site(client, app, out: str, cname: str | None = None) -> dict:
+def export_site(client, app, out: str, cname: str | None = None,
+                screenshots: bool = True) -> dict:
     """Write the archive into `out` through `client`, a TestClient on `app`.
     Returns what it counted."""
     site = Site(client, out)
@@ -86,8 +89,15 @@ def export_site(client, app, out: str, cname: str | None = None) -> dict:
     if cname:
         site.write("CNAME", cname + "\n")
 
-    for name in ("documents", "leaderboard", "samples", "exchange"):
+    for name in ("documents", "leaderboard", "samples"):
         site.write_json("data/%s.json" % name, site.json("/fhir/$" + name))
+    exchange = site.json("/fhir/$exchange")
+    if not screenshots:
+        for entry in exchange.get("parameter", []):
+            for part in entry.get("part", []):
+                if part["name"] in ("renderings", "renderingSystems"):
+                    part["valueInteger"] = 0
+    site.write_json("data/exchange.json", exchange)
 
     def document(doc_id) -> None:
         doc_id = _safe(doc_id)
@@ -111,10 +121,12 @@ def export_site(client, app, out: str, cname: str | None = None) -> dict:
             document(sub["id"])
             submissions += 1
 
-    screenshots = 0
-    for doc in _entries(site.json("/fhir/$exchange")):
+    shots = 0
+    for doc in _entries(exchange):
         doc_id = _safe(doc["id"])
         refs = site.json("/fhir/DocumentReference?related=" + doc_id)
+        if not screenshots:
+            refs = {"resourceType": "Bundle", "type": "searchset", "total": 0, "entry": []}
         for entry in refs.get("entry", []):
             attachment = entry["resource"]["content"][0]["attachment"]
             image = site.get(attachment["url"], headers={"Accept": "image/*"})
@@ -122,12 +134,12 @@ def export_site(client, app, out: str, cname: str | None = None) -> dict:
             rel = "files/screenshots/%s.%s" % (_safe(attachment["url"].rsplit("/", 1)[1]), ext)
             site.write(rel, image.content)
             attachment["url"] = rel
-            screenshots += 1
+            shots += 1
         site.write_json("data/screenshots/related-%s.json" % doc_id, refs)
 
     _check_no_secrets(app, site)
     return {"companies": len(companies), "submissions": submissions,
-            "samples": len(samples), "screenshots": screenshots,
+            "samples": len(samples), "screenshots": shots,
             "files": len(site.written)}
 
 
@@ -153,6 +165,8 @@ def main(argv=None) -> int:
                     help="a data directory, or a backup snapshot of one")
     ap.add_argument("--out", required=True, help="an empty or new directory")
     ap.add_argument("--cname", help="the custom domain GitHub Pages serves it on")
+    ap.add_argument("--no-screenshots", action="store_true",
+                    help="leave every interop screenshot out")
     args = ap.parse_args(argv)
 
     if not os.path.isfile(os.path.join(args.data, "connectathon.db")):
@@ -171,7 +185,8 @@ def main(argv=None) -> int:
         import app
         from fastapi.testclient import TestClient
         with TestClient(app.app) as client:
-            counts = export_site(client, app, args.out, args.cname)
+            counts = export_site(client, app, args.out, args.cname,
+                                 screenshots=not args.no_screenshots)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print("%(companies)d companies, %(submissions)d submissions, %(samples)d samples, "
