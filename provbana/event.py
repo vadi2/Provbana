@@ -28,7 +28,7 @@ SCORING_DEFAULTS = {
     "secondary_category_points": 15,
 }
 
-EVENT_KEYS = {"name", "url", "when_where", "canonical_base"}
+EVENT_KEYS = {"name", "url", "when_where", "canonical_base", "archive_note"}
 SAMPLE_KEYS = {"id", "name", "tagline", "scenario", "horizon", "language",
                "scenario_name", "scenario_url"}
 # What an event may set on a document type. A catalogue type takes any of
@@ -93,6 +93,7 @@ def load(directory: str | None = None) -> dict:
         "url": _string("[event] url", ev.get("url")),
         "when_where": _string("[event] when_where", ev.get("when_where")),
         "canonical_base": _string("[event] canonical_base", ev.get("canonical_base")),
+        "archive_note": _string("[event] archive_note", ev.get("archive_note")),
     }
     if not event["canonical_base"]:
         site = os.environ.get("SITE_ADDRESS") or "localhost"

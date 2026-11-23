@@ -6863,13 +6863,13 @@ def test_each_published_document_gets_its_own_card_and_screenshots(client, monke
     entries = param_entries(client.get("/fhir/$exchange"))
     by_type = {e["documentType"]: e["id"] for e in entries}
     js = page_script(client)
-    parts = ["let me = null; const maxNote = 500;"]
+    parts = ["let me = null; const maxNote = 500; const ARCHIVE = null;"]
     for decl in ("const esc = ", "const EVENT_DOCS = ", "const PRIMARY_DOC = ",
                  "let DOC_LABELS = ", "const docLabel = "):
         start = js.index(decl)
         parts.append(js[start:js.index(";\n", start) + 2])
     parts += [page_function(js, name) for name in (
-        "partnerRow", "shotCountLabel", "documentPath", "partnerCard", "bearer",
+        "partnerRow", "shotCountLabel", "documentPath", "bundleHref", "partnerCard", "bearer",
         "uploadShot")]
     harness = r"""
 const entries = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -7974,3 +7974,125 @@ def test_the_shipped_event_folder_is_the_default():
     assert app_module.EVENT["event"]["name"] == "Nordic Hackathon 2026"
     assert [s["id"] for s in app_module.SAMPLES] == [
         "andrea-cross-border", "arne-complex-care", "ville-difficult-airway"]
+
+
+# ---------------------------------------------------------------- archive
+
+import archive  # noqa: E402
+
+ARCHIVE_HARNESS = r"""
+const fetched = [];
+globalThis.window = globalThis;
+globalThis.document = {documentElement: {classList: {add(c) { fetched.push("class:" + c); }},
+                                         dataset: {}}};
+window.addEventListener = () => {};
+window.fetch = async (url) => { fetched.push(url); return new Response("{}"); };
+""" + "/*HEAD*/" + r"""
+(async () => {
+  const urls = ["/fhir/$documents", "/fhir/$leaderboard", "/fhir/$samples", "/fhir/$exchange",
+    "/fhir/$submissions?organization=med-rave&count=1000", "/ui/documents/31",
+    "/ui/documents/arne-complex-care", "/fhir/DocumentReference?related=7",
+    "/fhir/$leaderboard?x=1", "/fhir/$submissions?organization=../x",
+    "/ui/documents/..%2Fsecret", "/fhir/DocumentReference?related=7%20or", "/fhir/Bundle/3"];
+  const paths = urls.map((u) => window.archivePath(u));
+  const status = async (p) => (await p).status;
+  const out = {
+    paths,
+    posted: await status(fetch("/fhir/Bundle/$validate", {method: "POST", body: "{}"})),
+    deleted: await status(fetch("/fhir/DocumentReference/1", {method: "DELETE"})),
+    reported: await status(fetch("/ui/error", {method: "POST"})),
+    missing: await status(fetch("/fhir/Organization/$me")),
+    matchbox: (await (await fetch("/fhir/$status")).json()).parameter[0].valueString,
+    endpoints: (await (await fetch("/fhir/Endpoint")).json()).total,
+  };
+  await fetch("/ui/documents/31");
+  out.fetched = fetched;
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+def head_script(page):
+    return re.search(r"<head>.*?<script>\n(.*?)\n</script>", page, re.S).group(1)
+
+
+@needs_node
+def test_the_archive_page_reads_files_and_refuses_every_write():
+    page = app_module.render_index(app_module.INDEX_HTML, archive=True)
+    proc = subprocess.run(["node", "-e", ARCHIVE_HARNESS.replace("/*HEAD*/", head_script(page))],
+                          capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stderr
+    got = json.loads(proc.stdout)
+    assert got["paths"] == [
+        "data/documents.json", "data/leaderboard.json", "data/samples.json",
+        "data/exchange.json", "data/submissions/med-rave.json", "data/documents/31.json",
+        "data/documents/arne-complex-care.json", "data/screenshots/related-7.json",
+        None, None, None, None, None]
+    assert (got["posted"], got["deleted"], got["reported"], got["missing"]) == (403, 403, 403, 404)
+    assert (got["matchbox"], got["endpoints"]) == ("up", 0)
+    # nothing but the one mapped read went out, and it went out relative
+    assert got["fetched"] == ["class:archive", "data/documents/31.json"]
+
+
+def test_the_live_page_is_not_an_archive(client):
+    page = client.get("/").text
+    assert "var ARCHIVE = null;" in page
+    assert 'href="/favicon.svg"' in page
+
+
+def test_the_archive_page_links_relative_and_thanks_the_participants():
+    page = app_module.render_index(app_module.INDEX_HTML, archive=True)
+    assert "var ARCHIVE = null;" not in page
+    assert 'href="./favicon.svg"' in page and 'href="/favicon.svg"' not in page
+    assert "Nordic Hackathon 2026 is over - thank you for participating!" in page
+
+
+def test_an_event_can_word_its_own_archive_note(monkeypatch):
+    event = copy.deepcopy(app_module.EVENT)
+    event["event"]["archive_note"] = "Tack </script> for coming!"
+    monkeypatch.setattr(app_module, "EVENT", event)
+    page = app_module.render_index(app_module.INDEX_HTML, archive=True)
+    assert "Tack &lt;/script&gt; for coming!" in page
+    assert '"note": "Tack <\\/script> for coming!"' in page
+
+
+def test_the_export_writes_everything_the_archive_page_reads(client, monkeypatch, tmp_path):
+    tok_p, tok_c = interop_setup(client, monkeypatch)
+    submit(client, tok_c, outcome(errors=1), monkeypatch)
+    doc = exchange_by_type(client, "producer")["eps"]["id"]
+    assert post_shot(client, tok_c, context=related_to(doc)).status_code == 201
+
+    out = tmp_path / "site"
+    counts = archive.export_site(client, app_module, str(out), "hackathon.example.org")
+    assert counts == {"companies": 2, "submissions": 2, "samples": 3, "screenshots": 1,
+                      "files": counts["files"]}
+    names = {str(p.relative_to(out)) for p in out.rglob("*") if p.is_file()}
+    assert {"index.html", "favicon.svg", ".nojekyll", "CNAME", "data/documents.json",
+            "data/leaderboard.json", "data/samples.json", "data/exchange.json",
+            "data/submissions/producer.json", "data/submissions/consumer.json",
+            "data/documents/%d.json" % doc, "files/bundles/%d.json" % doc,
+            "data/documents/arne-complex-care.json", "files/bundles/arne-complex-care.json",
+            "data/screenshots/related-%d.json" % doc} <= names
+    assert (out / "CNAME").read_text() == "hackathon.example.org\n"
+
+    # the screenshot is a file beside the page, and its reference says so
+    refs = json.loads((out / ("data/screenshots/related-%d.json" % doc)).read_text())
+    url = refs["entry"][0]["resource"]["content"][0]["attachment"]["url"]
+    assert url.startswith("files/screenshots/") and url.endswith(".png")
+    assert (out / url).read_bytes() == png_bytes()
+    assert json.loads((out / ("files/bundles/%d.json" % doc)).read_text())["resourceType"] == "Bundle"
+
+    page = (out / "index.html").read_text()
+    assert "var ARCHIVE = null;" not in page
+    for name in names - {n for n in names if n.startswith("files/")}:
+        text = (out / name).read_text(errors="replace")
+        assert tok_p not in text and tok_c not in text, name
+        assert "testserver" not in text, name
+
+
+def test_the_export_stops_if_a_token_turns_up(client, monkeypatch, tmp_path):
+    tok = register(client, "Leaky")
+    site = archive.Site(client, str(tmp_path))
+    site.write("data/oops.json", '{"token": "%s"}' % tok)
+    with pytest.raises(SystemExit, match="data/oops.json"):
+        archive._check_no_secrets(app_module, site)

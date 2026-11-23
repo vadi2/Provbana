@@ -9,6 +9,9 @@ when_where = "18-20 November in Kista"
 # The namespace of the identifiers the service mints (company ids, and the
 # canonical URL of its CapabilityStatement). Defaults to https://$SITE_ADDRESS/fhir.
 canonical_base = "https://nordichackathon2026.blogs.dsv.su.se/fhir"
+# What the static archive (provbana/archive.py) says at the top of the page.
+# Defaults to "The <name> is over - thank you for participating! ...".
+# archive_note = ""
 
 [documents]
 # The track: what the leaderboard ranks, and what a bundle that announces

@@ -5982,12 +5982,62 @@ INDEX_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <script>
+/* Null on the live service. In a static archive (archive.py) it holds the
+   thank-you note, and the page reads its data from files beside it. */
+var ARCHIVE = {{archive}};
 /* Runs before first paint so a stored choice never flashes the other theme. */
 (function () {
   try {
     var t = localStorage.getItem("theme");
     if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
   } catch (e) { /* site data blocked - fall back to the system theme */ }
+})();
+/* In an archive every read the page makes is answered from a file written by
+   archive.py, at a path relative to the page so it works from a subfolder as
+   well as from a domain root. Anything that would write is refused here,
+   before it reaches the network, as is the error reporter: nobody is
+   listening. */
+(function () {
+  if (!ARCHIVE) return;
+  document.documentElement.classList.add("archive");
+  var realFetch = window.fetch.bind(window);
+  var safe = /^[A-Za-z0-9-]+$/;
+  function answer(status, body) {
+    return Promise.resolve(new Response(JSON.stringify(body), {
+      status: status, headers: { "Content-Type": "application/json" } }));
+  }
+  function refused(status, text) {
+    return answer(status, { resourceType: "OperationOutcome", issue: [{
+      severity: "error", code: status === 404 ? "not-found" : "forbidden",
+      diagnostics: text }] });
+  }
+  var files = { "/fhir/$documents": "documents", "/fhir/$leaderboard": "leaderboard",
+    "/fhir/$samples": "samples", "/fhir/$exchange": "exchange" };
+  window.archivePath = function (url) {
+    var u = new URL(url, "http://archive.invalid");
+    var p = u.pathname, q = u.searchParams, m;
+    if (Object.prototype.hasOwnProperty.call(files, p) && !u.search) return "data/" + files[p] + ".json";
+    if (p === "/fhir/$submissions" && safe.test(q.get("organization") || ""))
+      return "data/submissions/" + q.get("organization") + ".json";
+    if ((m = /^\/ui\/documents\/([^/]+)$/.exec(p)) && safe.test(decodeURIComponent(m[1])))
+      return "data/documents/" + decodeURIComponent(m[1]) + ".json";
+    if (p === "/fhir/DocumentReference" && /^[0-9]+$/.test(q.get("related") || ""))
+      return "data/screenshots/related-" + q.get("related") + ".json";
+    return null;
+  };
+  window.fetch = function (input, init) {
+    var url = typeof input === "string" ? input : input.url;
+    var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+    if (method !== "GET") return refused(403, "This is a read-only archive of the event.");
+    var path = new URL(url, "http://archive.invalid").pathname;
+    if (path === "/fhir/$status")
+      return answer(200, { resourceType: "Parameters", parameter: [
+        { name: "matchbox", valueString: "up" }] });
+    if (path === "/fhir/Endpoint")
+      return answer(200, { resourceType: "Bundle", type: "searchset", total: 0, entry: [] });
+    var file = window.archivePath(url);
+    return file ? realFetch(file) : refused(404, "Not part of the archive.");
+  };
 })();
 /* Before the page's own script, and in a block of its own, so that a syntax
    error there is still caught here. The first few per page load go to the
@@ -5996,7 +6046,7 @@ INDEX_HTML = r"""<!doctype html>
   var sent = 0;
   function report(message, stack) {
     stack = String(stack || "");
-    if (sent >= 5 || /extension:\/\//.test(stack)) return;
+    if (ARCHIVE || sent >= 5 || /extension:\/\//.test(stack)) return;
     sent += 1;
     try {
       fetch("/ui/error", {
@@ -6019,7 +6069,7 @@ INDEX_HTML = r"""<!doctype html>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500&family=Manrope:wght@300;400;500;600;700&display=swap">
-<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="{{root}}favicon.svg" type="image/svg+xml">
 <title>{{event_name}}</title>
 <style>
 /* Provbana's palette, type scale and controls, taken from the site of the
@@ -6667,13 +6717,18 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 .shot-edit textarea { width: 100%; min-height: 62px; font-family: inherit;
   font-size: 0.84rem; }
 .shot-err { font-size: 0.82rem; color: var(--fail); }
+/* A static archive keeps everything there is to read and drops everything
+   that writes: the Submit tab, the API, sending to systems that are gone. */
+.archive-only { display: none; }
+.archive .archive-only { display: block; }
+.archive .live-only, .archive [data-tab="submit"], .archive #tab-submit { display: none !important; }
 </style>
 {{theme_link}}
 </head>
 <body>
 <header>
   <div class="head-row">
-    <p class="site-title"><a href="/">{{event_name}}</a></p>
+    <p class="site-title"><a href="{{root}}">{{event_name}}</a></p>
     <div class="head-nav">
       <nav class="tabs">
         <a class="tab-btn active" data-tab="leaderboard" href="#leaderboard" aria-current="page">Leaderboard</a>
@@ -6697,7 +6752,8 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   </div>
   <h1>{{event_name}}</h1>
   <div class="sub-row">
-    <p class="sub">Submit your {{primary_label}} (<span class="hint"
+    <p class="sub archive-only">{{archive_note}}</p>
+    <p class="sub live-only">Submit your {{primary_label}} (<span class="hint"
     title="HL7 Europe publishes its EHDS guides, the European Patient Summary among them, for FHIR R4 only - there is no R5 edition, and the EHDS implementing act that will settle a FHIR version for Europe is not due until March 2027. R4 is what EPS, IPS and MyHealth@EU build on today.">FHIR
     R4 Bundle</span>) and get
     it validated against the {{primary_guide}} profile.</p>
@@ -6710,7 +6766,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <section class="card">
   <div class="card-head">
-    <h2>Leaderboard<span class="live-dot" title="auto-refreshes every 5s"></span></h2>
+    <h2>Leaderboard<span class="live-dot live-only" title="auto-refreshes every 5s"></span></h2>
     <p class="practice-note" id="practice-note" hidden></p>
   </div>
   <div class="table-wrap">
@@ -6906,7 +6962,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   </section>
 </div>
 
-<details class="card">
+<details class="card live-only">
   <summary>Or use the API</summary>
   <p class="muted">Every endpoint is described in the
   <a href="/openapi.json" target="_blank" rel="noopener">OpenAPI spec</a>, which
@@ -6941,11 +6997,15 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
 
 <section class="card">
   <h2>Interop testing</h2>
-  <p class="muted" style="margin:0">There are two pathways to using this
+  <p class="muted live-only" style="margin:0">There are two pathways to using this
   platform and you should do both - 1) submit the document(s) for validation,
   scoring, and clinical view and 2) exchange them with other participants in
   the event.</p>
-  <div class="lanes">
+  <p class="muted archive-only" style="margin:0">During the event each company's
+  best valid document of each type was published here, and the others fetched
+  it, loaded it into their own systems and added screenshots of how it
+  rendered.</p>
+  <div class="lanes live-only">
     <div class="lane">
       <span class="lane-n">Pathway 1 &middot; Validate</span>
       <h3>Send it to Provbana</h3>
@@ -6974,7 +7034,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   <div id="io-partners"></div>
 </section>
 
-<section class="card" id="send-direct">
+<section class="card live-only" id="send-direct">
   <h2>Send to their system</h2>
   <p class="muted" style="margin:0">Some companies take documents straight
   into their own system - a FHIR server to POST to, or a page that says how to
@@ -6986,7 +7046,7 @@ p.muted code { background: var(--code-bg); border: 1px solid var(--border);
   tab</a>.</p>
 </section>
 
-<details class="card">
+<details class="card live-only">
   <summary>Or use the API</summary>
   <p class="muted">Every endpoint is described in the
   <a href="/openapi.json" target="_blank" rel="noopener">OpenAPI spec</a>, which
@@ -7228,11 +7288,14 @@ async function refreshLeaderboard() {
   } catch (e) { /* transient network error - retry on next tick */ }
 }
 refreshLeaderboard();
-/* A tab left open in the background need not poll; catch up when it returns. */
-setInterval(() => { if (!document.hidden) refreshLeaderboard(); }, 5000);
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refreshLeaderboard();
-});
+/* A tab left open in the background need not poll; catch up when it returns.
+   An archive's board never changes. */
+if (!ARCHIVE) {
+  setInterval(() => { if (!document.hidden) refreshLeaderboard(); }, 5000);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) refreshLeaderboard();
+  });
+}
 
 /* ---- routing ----
    The hash is this app's address bar: #<tab>[/<kind>/<id>/<view>]. Tabs are
@@ -7317,8 +7380,9 @@ function applyRoute(scroll) {
   const anchor = TABS.indexOf(parts[0]) < 0 && parts[0]
     ? document.getElementById(parts[0]) : null;
   const panel = anchor && anchor.closest(".tab-panel");
-  const tab = TABS.indexOf(parts[0]) >= 0 ? parts[0]
+  let tab = TABS.indexOf(parts[0]) >= 0 ? parts[0]
     : panel ? panel.id.replace(/^tab-/, "") : "leaderboard";
+  if (ARCHIVE && tab === "submit") tab = "leaderboard";
   showTab(tab);
   if (followed && !panel && from && from.id !== "tab-" + tab) window.scrollTo(0, 0);
   if (panel) {
@@ -7328,7 +7392,7 @@ function applyRoute(scroll) {
     pinnedUntil = Date.now() + PIN_MS;
   }
   if (tab !== "clinical") return;
-  if (!parts[1]) {
+  if (!parts[1] || (ARCHIVE && parts[1] === "preview")) {
     go("clinical/sample/" + DEFAULT_SAMPLE + "/" + CV_DEFAULT, true);
     return;
   }
@@ -8342,7 +8406,7 @@ async function initClinical() {
     sel.innerHTML = '<option value="' + SAMPLE_TEAM + '">Example documents</option>'
       + teams.map((t) =>
           '<option value="' + esc(t.team_slug) + '">' + esc(t.team) + "</option>").join("")
-      + '<option value="' + PREVIEW_TEAM + '">Preview your own file\u2026</option>';
+      + (ARCHIVE ? "" : '<option value="' + PREVIEW_TEAM + '">Preview your own file\u2026</option>');
     cvSubsByTeam = new Map();  // a fresh visit deserves fresh lists
     /* A #clinical/company route is an explicit request for that company, so it
        wins over whatever the picker happened to be showing; otherwise a company
@@ -9642,12 +9706,12 @@ function renderClinicalDoc(d) {
         ? " of " + esc(d.filename || "pasted JSON")
           + " &middot; not uploaded, validated or scored"
       : d.sample
-        ? ' &middot; <a href="/fhir/Bundle/' + esc(d.sample.id)
+        ? ' &middot; <a href="' + bundleHref(esc(d.sample.id))
           + '" download>download the FHIR bundle</a>'
         : " &middot; submitted " + new Date(d.ts).toLocaleString()
           + " &middot; " + (d.pass ? "valid" : "invalid") + ", score " + d.score
           + (d.errors ? ", " + plural(d.errors, "error") : "")
-          + ' &middot; <a href="/fhir/Bundle/' + d.id
+          + ' &middot; <a href="' + bundleHref(d.id)
           + '" download>download the FHIR bundle</a>')
     + (comp.date ? " &middot; document date " + esc(comp.date.split("T")[0])
         + ' <span class="cv-sub">(when it was assembled - not how current'
@@ -9834,6 +9898,12 @@ async function refreshShotCount(docId) {
   } catch (e) { /* the count is decoration; the gallery below it is the truth */ }
 }
 
+/* Where a document's raw bundle is downloaded from: the service's own Bundle
+   endpoint, or the copy archive.py wrote beside the page. */
+function bundleHref(id) {
+  return (ARCHIVE ? "files/bundles/" + id + ".json" : "/fhir/Bundle/" + id);
+}
+
 /* The patient summary is what $document hands out with no type, so its line
    stays the short one every team already has in their scripts. */
 function documentPath(p) {
@@ -9849,11 +9919,12 @@ function partnerCard(p) {
   return '<div class="io-partner" data-slug="' + esc(p.team_slug)
     + '" data-doc="' + id + '">'
     + '<strong class="co-name">' + esc(p.team) + "</strong> \u00b7 " + esc(docLabel(p.doc_type))
-    + '<p class="muted" style="margin:6px 0 0"><code class="co-name">GET '
-    + esc(documentPath(p)) + "</code> \u00b7 Document #" + id
+    + '<p class="muted" style="margin:6px 0 0">'
+    + (ARCHIVE ? "" : '<code class="co-name">GET ' + esc(documentPath(p)) + "</code> \u00b7 ")
+    + "Document #" + id
     + " \u00b7 " + p.sections + " sections \u00b7 " + p.resources + " resources \u00b7 "
     + '<a href="#clinical/submission/' + id + '">view document</a>'
-    + ' \u00b7 <a href="/fhir/Bundle/' + id
+    + ' \u00b7 <a href="' + bundleHref(id)
     + '" download>download the FHIR bundle</a></p>'
     + '<div class="io-actions">'
     + '<button class="ghost" data-shots="' + id + '">'
@@ -9861,12 +9932,13 @@ function partnerCard(p) {
     /* Your own document is the one card you cannot add to - a rendering is by
        definition somebody else reading it. Saying so here beats letting
        someone crop a screenshot first and refusing it afterwards. */
-    + (me && me.id === p.team_slug
+    + (ARCHIVE ? ""
+      : me && me.id === p.team_slug
         ? '<span class="muted">Your document - other companies add the screenshots.</span>'
         : '<button class="ghost" data-add="' + id + '">'
           + "I loaded this - add a screenshot</button>")
     + "</div>"
-    + (me && me.id === p.team_slug ? "" :
+    + (ARCHIVE || (me && me.id === p.team_slug) ? "" :
       '<div class="shot-form" hidden data-form="' + id + '">'
     + '<label for="shot-file-' + id + '">Screenshot (PNG, JPEG or WebP)</label>'
     + '<input type="file" accept="image/png,image/jpeg,image/webp" id="shot-file-'
@@ -9914,7 +9986,7 @@ let meState = "none";
 let meToken = "";
 let meAsked = 0;
 async function whoAmI() {
-  const token = $("#token").value.trim();
+  const token = ARCHIVE ? "" : $("#token").value.trim();
   const ask = ++meAsked;
   let next = null, state = "none";
   if (token) {
@@ -10524,12 +10596,21 @@ applyRoute(false);
 """
 
 
-def render_index(template: str) -> str:
+def archive_note() -> str:
+    return EVENT["event"].get("archive_note") or (
+        "The %s is over - thank you for participating! This is a read-only "
+        "archive of the final results." % EVENT["event"]["name"])
+
+
+def render_index(template: str, archive: bool = False) -> str:
     """INDEX_HTML with the event's name, primary document and links filled in.
 
-    Done once at import: none of it changes while the process runs.
+    Done once at import for the live service: none of it changes while the
+    process runs. archive.py renders it again with `archive` set, for the
+    static copy, whose links are relative to the page.
     """
     esc = html_mod.escape
+    root = "./" if archive else "/"
     ev = EVENT["event"]
     primary = PRIMARY_DOCUMENT
     version = primary["igs"][0].partition("#")[2] if primary["igs"] else ""
@@ -10554,8 +10635,12 @@ def render_index(template: str) -> str:
         # Inside a <script>: JSON is valid JS, and "</" is the one sequence
         # that could end the element early.
         "event_docs": json.dumps(docs, ensure_ascii=False).replace("</", "<\\/"),
-        "theme_link": ('<link rel="stylesheet" href="/theme.css">'
+        "theme_link": ('<link rel="stylesheet" href="%stheme.css">' % root
                        if os.path.isfile(THEME_CSS) else ""),
+        "root": root,
+        "archive": (json.dumps({"note": archive_note()}, ensure_ascii=False)
+                    .replace("</", "<\\/") if archive else "null"),
+        "archive_note": esc(archive_note()),
     }
     for key, value in values.items():
         template = template.replace("{{%s}}" % key, value)
