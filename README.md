@@ -106,13 +106,6 @@ patient summary's sections.
 and brings up `docker-compose.prod.yml`. `.env.example` lists what goes in `.env`;
 `SITE_ADDRESS` is required.
 
-A box first brought up before the rename keeps its old names through `.env`, or compose
-starts an empty stack beside the old one. For the Nordic box that means
-`PROJECT_NAME=hackathon2026` in its `.env`, `DEPLOY_USER=vadi`,
-`SSH_KEY=~/.ssh/id_ed25519_hackathon2026` and `DEST=/opt/hackathon2026` in the
-environment `deploy.sh` runs in, and `sudo touch /var/lib/cloud/provbana-ready` once on
-the box.
-
 ## Archiving an event
 
 When the event is over, `provbana/archive.py` turns a backup snapshot into a static,
